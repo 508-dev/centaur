@@ -19,6 +19,7 @@ from client import (
 )
 
 WORKFLOW_RUN_ID = "018f47a2-4b16-7c21-8c30-123456789abc"
+HISTORICAL_WORKFLOW_RUN_ID = "018f47a2-4b16-7c21-8c30-abcdefabcdef"
 
 
 class _FakeRecord:
@@ -261,6 +262,78 @@ class _FakeConnection:
         self.closed = True
 
 
+class _RetriedWorkflowConnection(_FakeConnection):
+    async def fetch(self, query: str, *args):
+        if "FROM centaur_readonly_workflow_runs" in query:
+            self.fetch_calls.append((query, args))
+            reference = args[0] if args else ""
+            if reference == HISTORICAL_WORKFLOW_RUN_ID:
+                return []
+            return [
+                {
+                    "queue_name": "centaur_workflows",
+                    "run_id": WORKFLOW_RUN_ID,
+                    "task_id": "task_1",
+                    "task_name": "workflow_task",
+                    "workflow_name": "sync_records",
+                    "harness_type": "codex",
+                    "state": "completed",
+                    "attempts": 2,
+                    "max_attempts": 3,
+                    "created_at": self.now,
+                    "first_started_at": self.now,
+                    "started_at": self.now,
+                    "completed_at": self.now,
+                    "failed_at": None,
+                    "available_at": None,
+                    "claimed": False,
+                    "cancelled_at": None,
+                }
+            ]
+        if "FROM session_executions" in query:
+            self.fetch_calls.append((query, args))
+            run_ids = set(args[0])
+            task_ids = set(args[1])
+            rows = []
+            if HISTORICAL_WORKFLOW_RUN_ID in run_ids:
+                rows.append(
+                    {
+                        "execution_id": "exe_failed_attempt",
+                        "thread_key": "discord:111:222:333",
+                        "status": "failed",
+                        "model": "gpt-test",
+                        "workflow_name": "sync_records",
+                        "workflow_task_id": "task_1",
+                        "workflow_run_id": HISTORICAL_WORKFLOW_RUN_ID,
+                        "workflow_context_phase": "agent_turn",
+                        "created_at": self.now,
+                        "started_at": self.now,
+                        "completed_at": self.now,
+                        "duration_seconds": 12.0,
+                    }
+                )
+            if WORKFLOW_RUN_ID in run_ids or "task_1" in task_ids:
+                rows.insert(
+                    0,
+                    {
+                        "execution_id": "exe_successful_retry",
+                        "thread_key": "discord:111:222:333",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "workflow_name": "sync_records",
+                        "workflow_task_id": "task_1",
+                        "workflow_run_id": WORKFLOW_RUN_ID,
+                        "workflow_context_phase": "agent_turn",
+                        "created_at": self.now,
+                        "started_at": self.now,
+                        "completed_at": self.now,
+                        "duration_seconds": 10.0,
+                    },
+                )
+            return rows
+        return await super().fetch(query, *args)
+
+
 def test_parse_slack_permalink_prefers_thread_ts_query() -> None:
     result = parse_slack_reference(
         "Investigate https://example.slack.com/archives/C123/p1777910338403889"
@@ -371,6 +444,37 @@ def test_diagnose_workflow_run_uses_sanitized_readonly_view(monkeypatch) -> None
     assert "FROM centaur_readonly_workflow_runs" in all_queries
     assert "SELECT *" not in all_queries
     assert fake.execute_calls == []
+    assert fake.closed is True
+
+
+def test_diagnose_historical_attempt_recovers_latest_retry_state(monkeypatch) -> None:
+    fake = _RetriedWorkflowConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+
+    result = CentaurInvestigatorClient("postgresql://example").diagnose(
+        HISTORICAL_WORKFLOW_RUN_ID,
+        include_observability=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["analysis"]["outcome"] == "completed"
+    assert result["workflow_run_ids"] == [
+        WORKFLOW_RUN_ID,
+        HISTORICAL_WORKFLOW_RUN_ID,
+    ]
+    assert {row["execution_id"] for row in result["postgres"]["session_executions"]["rows"]} == {
+        "exe_failed_attempt",
+        "exe_successful_retry",
+    }
+
+    all_queries = "\n".join(query for query, _args in fake.fetch_calls)
+    assert "WHERE task_id = ANY" in all_queries
+    assert "ORDER BY event_id DESC" in all_queries
+    assert "ORDER BY event_id ASC" not in all_queries
     assert fake.closed is True
 
 

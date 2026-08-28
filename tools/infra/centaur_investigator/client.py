@@ -420,6 +420,42 @@ class CentaurInvestigatorClient:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
+    async def _workflow_executions(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        run_ids: list[str],
+        task_ids: list[str],
+        limit: int,
+    ) -> dict[str, Any]:
+        return await self._safe_fetch(
+            conn,
+            "workflow_session_executions",
+            """
+            SELECT
+                execution_id,
+                thread_key,
+                status,
+                metadata ->> 'model' AS model,
+                metadata ->> 'workflow_name' AS workflow_name,
+                metadata ->> 'workflow_task_id' AS workflow_task_id,
+                metadata ->> 'workflow_run_id' AS workflow_run_id,
+                metadata ->> 'workflow_context_phase' AS workflow_context_phase,
+                created_at,
+                started_at,
+                completed_at,
+                extract(epoch FROM completed_at - started_at) AS duration_seconds
+            FROM session_executions
+            WHERE metadata ->> 'workflow_run_id' = ANY($1::text[])
+               OR metadata ->> 'workflow_task_id' = ANY($2::text[])
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            run_ids,
+            task_ids,
+            limit,
+        )
+
     async def _workflow_run_state_async(
         self,
         reference: str,
@@ -478,37 +514,86 @@ class CentaurInvestigatorClient:
                 identifier,
                 limit,
             )
-            run_ids = _dedupe(
+            view_run_ids = _dedupe(
                 [
                     str(row.get("run_id"))
                     for row in workflow_runs.get("rows", [])
                     if row.get("run_id")
                 ]
             )
-            executions = await self._safe_fetch(
+            candidate_run_ids = _dedupe([identifier, *view_run_ids])
+            candidate_task_ids = [identifier]
+            executions = await self._workflow_executions(
                 conn,
-                "workflow_session_executions",
-                """
-                SELECT
-                    execution_id,
-                    thread_key,
-                    status,
-                    metadata ->> 'model' AS model,
-                    metadata ->> 'workflow_name' AS workflow_name,
-                    metadata ->> 'workflow_task_id' AS workflow_task_id,
-                    metadata ->> 'workflow_run_id' AS workflow_run_id,
-                    metadata ->> 'workflow_context_phase' AS workflow_context_phase,
-                    created_at,
-                    started_at,
-                    completed_at,
-                    extract(epoch FROM completed_at - started_at) AS duration_seconds
-                FROM session_executions
-                WHERE metadata ->> 'workflow_run_id' = ANY($1::text[])
-                ORDER BY created_at DESC
-                LIMIT $2
-                """,
-                run_ids,
-                limit,
+                run_ids=candidate_run_ids,
+                task_ids=candidate_task_ids,
+                limit=limit,
+            )
+            correlated_task_ids = _dedupe(
+                [
+                    str(row.get("workflow_task_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("workflow_task_id")
+                ]
+            )
+            if not workflow_runs.get("rows") and correlated_task_ids:
+                workflow_runs = await self._safe_fetch(
+                    conn,
+                    "centaur_readonly_workflow_runs_by_task",
+                    """
+                    SELECT
+                        queue_name,
+                        run_id,
+                        task_id,
+                        task_name,
+                        workflow_name,
+                        harness_type,
+                        state,
+                        attempts,
+                        max_attempts,
+                        created_at,
+                        first_started_at,
+                        started_at,
+                        completed_at,
+                        failed_at,
+                        available_at,
+                        claimed,
+                        cancelled_at
+                    FROM centaur_readonly_workflow_runs
+                    WHERE task_id = ANY($1::text[])
+                    ORDER BY created_at DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    correlated_task_ids,
+                    limit,
+                )
+                recovered_run_ids = _dedupe(
+                    [
+                        str(row.get("run_id"))
+                        for row in workflow_runs.get("rows", [])
+                        if row.get("run_id")
+                    ]
+                )
+                expanded_run_ids = _dedupe([*candidate_run_ids, *recovered_run_ids])
+                expanded_task_ids = _dedupe([*candidate_task_ids, *correlated_task_ids])
+                if expanded_run_ids != candidate_run_ids or expanded_task_ids != candidate_task_ids:
+                    executions = await self._workflow_executions(
+                        conn,
+                        run_ids=expanded_run_ids,
+                        task_ids=expanded_task_ids,
+                        limit=limit,
+                    )
+            run_ids = _dedupe(
+                [
+                    str(row.get("run_id"))
+                    for row in workflow_runs.get("rows", [])
+                    if row.get("run_id")
+                ]
+                + [
+                    str(row.get("workflow_run_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("workflow_run_id")
+                ]
             )
             execution_ids = _dedupe(
                 [
@@ -537,7 +622,7 @@ class CentaurInvestigatorClient:
                     created_at
                 FROM session_events
                 WHERE execution_id = ANY($1::text[])
-                ORDER BY event_id ASC
+                ORDER BY event_id DESC
                 LIMIT $2
                 """,
                 execution_ids,
@@ -819,7 +904,7 @@ class CentaurInvestigatorClient:
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
                OR (execution_id = ANY($3::text[]))
-            ORDER BY event_id ASC
+            ORDER BY event_id DESC
             LIMIT $4
             """,
             matched_thread_keys,
@@ -1193,6 +1278,27 @@ class CentaurInvestigatorClient:
         next_checks: list[str] = []
 
         if not rows:
+            execution_rows = executions.get("rows", [])
+            if execution_rows:
+                execution_states = sorted(
+                    {str(row.get("status")) for row in execution_rows if row.get("status")}
+                )
+                return {
+                    "outcome": str(execution_rows[0].get("status") or "observed").lower(),
+                    "summary": (
+                        "The current workflow queue view has no matching row, but found "
+                        f"{len(execution_rows)} correlated agent execution(s): "
+                        f"{', '.join(execution_states) or 'unknown status'}."
+                    ),
+                    "findings": [],
+                    "warnings": [
+                        "The referenced workflow attempt is no longer the task's latest queue row."
+                    ],
+                    "next_checks": [
+                        "Use the correlated task ID to inspect the latest retry state."
+                    ],
+                    "primary_source": "postgres_readonly_execution_metadata",
+                }
             return {
                 "outcome": "not_found",
                 "summary": "No workflow run or task matched the supplied reference.",
