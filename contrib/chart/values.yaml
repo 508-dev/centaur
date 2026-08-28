@@ -666,6 +666,14 @@ githubbot:
   # / draft status.
   autoMerge: true
   mergeMethod: squash
+  # Bound automated review/fix loops. One epoch includes the first broad review
+  # plus two repair-validation rounds. Material human changes start a new epoch;
+  # automation needs an explicitly approved reset once the current budget ends.
+  reviewMaxRoundsPerEpoch: 3
+  reviewMaxEpochs: 3
+  reviewMaterialChangeLines: 200
+  reviewMaterialChangeFiles: 8
+  reviewResetLabel: centaur-review-reset
   # Emit CI and review workflow events to api-rs.
   workflowEvents: false
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.

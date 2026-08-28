@@ -144,6 +144,16 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
+  /** Review passes allowed in one epoch (initial review plus validations). Default 3. */
+  reviewMaxRoundsPerEpoch?: number;
+  /** Material-change epochs allowed before human continuation is required. Default 3. */
+  reviewMaxEpochs?: number;
+  /** Cumulative changed runtime lines that make a review change material. Default 200. */
+  reviewMaterialChangeLines?: number;
+  /** Cumulative changed runtime files that make a review change material. Default 8. */
+  reviewMaterialChangeFiles?: number;
+  /** Write-authorized human label that explicitly starts another review epoch. */
+  reviewResetLabel?: string;
   /** Delay before confirming a settled-green rollup. Default 15000ms. */
   ciSettleConfirmMs?: number;
   /** Emit settled CI and submitted-review workflow events. Default false. */

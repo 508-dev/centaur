@@ -100,6 +100,16 @@ spec:
               value: {{ .Values.githubbot.autoMerge | quote }}
             - name: GITHUBBOT_MERGE_METHOD
               value: {{ .Values.githubbot.mergeMethod | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH
+              value: {{ .Values.githubbot.reviewMaxRoundsPerEpoch | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_EPOCHS
+              value: {{ .Values.githubbot.reviewMaxEpochs | quote }}
+            - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES
+              value: {{ .Values.githubbot.reviewMaterialChangeLines | quote }}
+            - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES
+              value: {{ .Values.githubbot.reviewMaterialChangeFiles | quote }}
+            - name: GITHUBBOT_REVIEW_RESET_LABEL
+              value: {{ .Values.githubbot.reviewResetLabel | quote }}
             - name: GITHUBBOT_WORKFLOW_EVENTS
               value: {{ .Values.githubbot.workflowEvents | quote }}
 {{- if .Values.githubbot.escalationHandle }}

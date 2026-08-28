@@ -117,6 +117,17 @@ const options: GithubbotOptions = {
   autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
   ciFixMaxAttempts: optionalNumberEnv("GITHUBBOT_CI_FIX_MAX_ATTEMPTS"),
+  reviewMaxRoundsPerEpoch: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH",
+  ),
+  reviewMaxEpochs: optionalNumberEnv("GITHUBBOT_REVIEW_MAX_EPOCHS"),
+  reviewMaterialChangeLines: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES",
+  ),
+  reviewMaterialChangeFiles: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES",
+  ),
+  reviewResetLabel: optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL"),
   workflowEvents: boolEnv("GITHUBBOT_WORKFLOW_EVENTS", false),
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
   escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
