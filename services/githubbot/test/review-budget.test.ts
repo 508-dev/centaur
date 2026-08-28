@@ -115,6 +115,7 @@ describe("decideReviewAdmission", () => {
     maxRoundsPerEpoch: 3,
     maxTotalRoundsPerEpoch: 6,
     reviewerKey: DEFAULT_REVIEWER_KEY,
+    startsRepairTurn: true,
   };
 
   test("starts the first epoch and counts its broad review", () => {
@@ -330,6 +331,35 @@ describe("decideReviewAdmission", () => {
       resetEpoch: true,
       state: { epoch: 4, roundsUsed: 1 },
     });
+  });
+
+  test("keeps an approval-only reset mergeable at either one-round cap", () => {
+    for (const limits of [
+      { maxRoundsPerEpoch: 1, maxTotalRoundsPerEpoch: 6 },
+      { maxRoundsPerEpoch: 3, maxTotalRoundsPerEpoch: 1 },
+    ]) {
+      const result = decideReviewAdmission({
+        ...base,
+        ...limits,
+        headSha: "head-4",
+        manualReset: true,
+        startsRepairTurn: false,
+        state: epoch({
+          lastReviewedHeadSha: "head-3",
+          pausedHeadSha: "head-4",
+          pauseReason: "reviewer_round_budget_exhausted",
+          roundsUsed: 3,
+        }),
+      });
+
+      expect(result).toMatchObject({
+        decision: "allow",
+        resetEpoch: true,
+        state: { epoch: 2, roundsUsed: 1 },
+      });
+      expect(result.state).not.toHaveProperty("pausedHeadSha");
+      expect(result.state).not.toHaveProperty("pauseReason");
+    }
   });
 
   test("pauses when significance or authorship cannot be established", () => {

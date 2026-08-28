@@ -449,6 +449,7 @@ describe("bounded review epochs", () => {
     comments?: string[];
     headSha?: string;
     merges?: { count: number };
+    maxRoundsPerEpoch?: number;
     maxTotalRoundsPerEpoch?: number;
     permission?: string;
     removedLabels?: string[];
@@ -530,6 +531,7 @@ describe("bounded review epochs", () => {
         escalationHandle: "maintainer",
         fetch: () => Promise.resolve(new Response("no", { status: 400 })),
         logger: quietLogger,
+        reviewMaxRoundsPerEpoch: input?.maxRoundsPerEpoch,
         reviewMaxTotalRoundsPerEpoch: input?.maxTotalRoundsPerEpoch,
       },
       state: input?.state ?? makeState(),
@@ -1361,18 +1363,27 @@ describe("bounded review epochs", () => {
     expect(comments[0]).toContain("reviewer_round_budget_exhausted");
   });
 
-  test("retries the human-handoff comment after a transient post failure", async () => {
+  test("retries a failed handoff on descendants without duplicate comments", async () => {
     const comments: string[] = [];
-    const state = makeState();
-    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
       anchorHeadSha: "head-1",
       automationPendingFromHeadSha: "head-1",
       epoch: 1,
       lastReviewedHeadSha: "head-1",
-      roundsUsed: 3,
+      reviewerRoundsUsed: { "github-user:101": 2 },
+      roundsUsed: 2,
       version: 1,
     });
-    const ctx = budgetCtx({ comments, headSha: "head-2", state });
+    const pauseClaimKeys: string[] = [];
+    const state = {
+      ...durableState,
+      async setIfNotExists(key: string, value: unknown) {
+        if (key.includes(":review-paused:")) pauseClaimKeys.push(key);
+        return durableState.setIfNotExists(key, value);
+      },
+    };
+    const ctx = budgetCtx({ comments, state });
     let attempts = 0;
     ctx.octokit.rest.issues.createComment = (async (request: {
       body: string;
@@ -1383,13 +1394,27 @@ describe("bounded review epochs", () => {
       return { data: {} };
     }) as unknown as typeof ctx.octokit.rest.issues.createComment;
 
-    await handleReviewEvent(ctx, submittedReview(12, "head-2"));
-    await handleReviewEvent(ctx, submittedReview(13, "head-2"));
+    await handleReviewEvent(ctx, submittedReview(20, "head-1"));
+    setHeadSha(ctx, "head-2");
+    await handleReviewEvent(
+      ctx,
+      submittedReview(21, "head-2", { id: 202, login: "second-reviewer" }),
+    );
+    setHeadSha(ctx, "head-3");
+    await handleReviewEvent(
+      ctx,
+      submittedReview(22, "head-3", { id: 303, login: "third-reviewer" }),
+    );
     await drainBackgroundWork(5_000);
 
     expect(attempts).toBe(2);
+    expect(pauseClaimKeys).toHaveLength(3);
+    expect(new Set(pauseClaimKeys).size).toBe(1);
     expect(comments).toHaveLength(1);
-    expect(comments[0]).toContain("round_budget_exhausted");
+    expect(comments[0]).toContain("reviewer_round_budget_exhausted");
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ pausedHeadSha: "head-1", roundsUsed: 5 });
   });
 
   test("does not consume a stale reset approval on an active epoch", async () => {
@@ -1503,7 +1528,7 @@ describe("bounded review epochs", () => {
     });
   });
 
-  test("consumes an authorized reset before merging an approved head", async () => {
+  test("keeps an approved reset mergeable at one-round caps", async () => {
     const merges = { count: 0 };
     const removedLabels: string[] = [];
     const state = makeState();
@@ -1519,6 +1544,8 @@ describe("bounded review epochs", () => {
     });
     const ctx = budgetCtx({
       headSha: "head-4",
+      maxRoundsPerEpoch: 1,
+      maxTotalRoundsPerEpoch: 1,
       merges,
       removedLabels,
       state,
@@ -1557,6 +1584,11 @@ describe("bounded review epochs", () => {
       epoch: 2,
       roundsUsed: 1,
     });
+    const budget = await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    );
+    expect(budget).not.toHaveProperty("pausedHeadSha");
+    expect(budget).not.toHaveProperty("pauseReason");
     expect(
       await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
     ).toBeUndefined();

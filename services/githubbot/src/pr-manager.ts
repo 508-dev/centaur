@@ -730,10 +730,7 @@ export async function handleReviewEvent(
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
     });
-    if (
-      admission.state.pausedHeadSha === effectiveHeadSha &&
-      admission.state.pauseReason
-    ) {
+    if (admission.state.pausedHeadSha && admission.state.pauseReason) {
       await escalateReviewBudget(
         ctx,
         repo.owner,
@@ -1046,6 +1043,7 @@ async function consumeApprovedReviewReset(
       ctx.options.reviewMaxTotalRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
     reviewerKey,
+    startsRepairTurn: false,
     state: loaded.state,
   });
   const state = {
@@ -1130,6 +1128,7 @@ async function admitReviewResponse(
       ctx.options.reviewMaxTotalRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
     reviewerKey,
+    startsRepairTurn: true,
     state: loaded.state,
   });
   const state = approval
@@ -1171,7 +1170,8 @@ async function escalateReviewBudget(
   admission: Extract<ReviewAdmission, { decision: "pause" }>,
   reviewerKey: string,
 ): Promise<void> {
-  const pauseClaim = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-paused:${owner}/${repo}#${pr.number}:${pr.headSha}:${admission.state.epoch}:${admission.reason}`;
+  const pausedHeadSha = admission.state.pausedHeadSha ?? pr.headSha;
+  const pauseClaim = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-paused:${owner}/${repo}#${pr.number}:${pausedHeadSha}:${admission.state.epoch}:${admission.reason}`;
   if (
     !(await retryingReviewClaim(
       ctx,

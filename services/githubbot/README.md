@@ -100,7 +100,10 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   `centaur-review-reset` label and re-requests review. The approval is pinned to the current head,
   consumed in the same durable write that advances the epoch, and the label is removed. Rejected
   reset labels are also removed so a later authorized human can retry the documented flow. Create
-  that label in each managed repository before use.
+  that label in each managed repository before use. An approval-only reset may merge even when a
+  round cap is one; unlike a commented or changes-requested review, it does not start a repair turn
+  that needs a final-round handoff. Handoff notices are keyed to the original paused head, so a
+  descendant review retries a failed notice without duplicating one that already succeeded.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
@@ -136,9 +139,9 @@ running work isn't dropped (claims are taken before the work, so a dropped turn 
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both require the **single replica** the chart enforces (`replicaCount: 1`); increase sandbox
 runner and warm-pool capacity for concurrent work instead of scaling this webhook controller.
-Review delivery claims and accepted reset-approval writes that encounter a transient state-store
-error remain in process and retry with capped backoff; they are included in the same shutdown drain
-rather than being treated as completed work.
+Review delivery claims and accepted review-state reads, writes, and handoff claims that encounter a
+transient state-store error remain in process and retry with capped backoff; they are included in
+the same shutdown drain rather than being treated as completed work.
 
 ## Auth
 

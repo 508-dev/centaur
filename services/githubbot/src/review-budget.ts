@@ -68,6 +68,7 @@ type ReviewAdmissionInput = {
   maxRoundsPerEpoch: number;
   maxTotalRoundsPerEpoch: number;
   reviewerKey: string;
+  startsRepairTurn: boolean;
   state?: ReviewEpochState;
 };
 
@@ -233,7 +234,9 @@ function withFinalRoundHandoff(
   reviewerKey: string,
   maxRoundsPerEpoch: number,
   maxTotalRoundsPerEpoch: number,
+  startsRepairTurn: boolean,
 ): ReviewEpochState {
+  if (!startsRepairTurn) return state;
   if (state.roundsUsed >= maxTotalRoundsPerEpoch) {
     return paused(state, headSha, "aggregate_round_budget_exhausted");
   }
@@ -288,6 +291,7 @@ export function decideReviewAdmission(
         input.reviewerKey,
         input.maxRoundsPerEpoch,
         input.maxTotalRoundsPerEpoch,
+        input.startsRepairTurn,
       ),
     };
   }
@@ -303,6 +307,7 @@ export function decideReviewAdmission(
         input.reviewerKey,
         input.maxRoundsPerEpoch,
         input.maxTotalRoundsPerEpoch,
+        input.startsRepairTurn,
       ),
     };
   }
@@ -319,6 +324,7 @@ export function decideReviewAdmission(
         input.reviewerKey,
         input.maxRoundsPerEpoch,
         input.maxTotalRoundsPerEpoch,
+        input.startsRepairTurn,
       ),
     };
   }
@@ -352,6 +358,7 @@ export function decideReviewAdmission(
           input.reviewerKey,
           input.maxRoundsPerEpoch,
           input.maxTotalRoundsPerEpoch,
+          input.startsRepairTurn,
         ),
       };
     }
@@ -379,6 +386,7 @@ export function decideReviewAdmission(
         input.reviewerKey,
         input.maxRoundsPerEpoch,
         input.maxTotalRoundsPerEpoch,
+        input.startsRepairTurn,
       ),
     };
   }
@@ -396,6 +404,7 @@ export function decideReviewAdmission(
       input.reviewerKey,
       input.maxRoundsPerEpoch,
       input.maxTotalRoundsPerEpoch,
+      input.startsRepairTurn,
     ),
   };
 }
