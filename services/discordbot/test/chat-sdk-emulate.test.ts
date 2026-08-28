@@ -180,10 +180,8 @@ describe("discordbot", () => {
       JSON.stringify(JSON.parse(secondExecute.body.input_lines[0]!)),
     ).toContain("now execute with the latest");
 
-    // Reasoning synthesis moved server-side (live activity summaries): raw
-    // commentary/reasoning deltas no longer render as blurbs or anywhere
-    // else. Summaries arrive as session.activity_summary events instead —
-    // covered by the dedicated activity-summary test below.
+    // Raw commentary/reasoning deltas and synthesized activity summaries stay
+    // private; only final-answer text is eligible for Discord messages.
     expect(blurbPostsIn(threadId)).toEqual([]);
     const allPosts = botPostsIn(threadId).join("\n");
     expect(allPosts).not.toContain("Checking the command output");
@@ -690,7 +688,7 @@ describe("discordbot", () => {
     expect(hasReaction(threadId, mentionId, "PUT", "❌")).toBe(false);
   });
 
-  it("posts session activity summaries as subtext blurbs", async () => {
+  it("never posts session activity summaries", async () => {
     codexApi.autoRespond = false;
 
     const threadId = discordApi.nextId();
@@ -712,14 +710,10 @@ describe("discordbot", () => {
       execution_id: "exe-activity-summary",
       summary: firstSummary,
     });
-    // A consecutive repeat is dropped instead of posting a duplicate blurb.
     codexApi.emitSessionEvent(key, "session.activity_summary", {
       execution_id: "exe-activity-summary",
       summary: firstSummary,
     });
-    await waitFor(() =>
-      blurbPostsIn(threadId).some((content) => content.includes(firstSummary)),
-    );
     codexApi.emitSessionEvent(key, "session.activity_summary", {
       execution_id: "exe-activity-summary",
       summary: secondSummary,
@@ -753,22 +747,12 @@ describe("discordbot", () => {
     );
 
     await waitForSettle(threadId, mentionId);
-    // finish() flushes the second summary even inside the min-post-gap window.
-    const blurbs = blurbPostsIn(threadId);
-    expect(blurbs.join("\n")).toContain(firstSummary);
-    expect(blurbs.join("\n")).toContain(secondSummary);
-    expect(
-      blurbs.join("\n").split(`-# ${firstSummary}`),
-    ).toHaveLength(2);
-    for (const blurb of blurbs) {
-      for (const line of blurb.split("\n")) {
-        if (line.trim()) expect(line.startsWith("-# ")).toBe(true);
-      }
-    }
-    // Summaries stay in the subtext lane; the answer stays summary-free.
+    expect(blurbPostsIn(threadId)).toEqual([]);
+    const allPosts = botPostsIn(threadId).join("\n");
+    expect(allPosts).not.toContain(firstSummary);
+    expect(allPosts).not.toContain(secondSummary);
     const answers = answerPostsIn(threadId);
     expect(answers.join("\n")).toContain("Done with status.");
-    expect(answers.join("\n")).not.toContain(firstSummary);
     expect(hasReaction(threadId, mentionId, "PUT", "✅")).toBe(true);
   });
 
