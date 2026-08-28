@@ -139,8 +139,31 @@ deploy:
       local) ;;
       ghcr)
         # Keep the deploy consumer aligned with the fork-owned packages emitted
-        # by publish-images.yml. Other forks can override the owner explicitly.
-        ghcr_owner="${CENTAUR_GHCR_OWNER:-508-dev}"
+        # by publish-images.yml. An explicit owner wins; otherwise derive it
+        # from this checkout's GitHub origin and fail closed on unknown hosts.
+        ghcr_owner="${CENTAUR_GHCR_OWNER:-}"
+        if [[ -z "${ghcr_owner}" ]]; then
+          origin_url="$(git remote get-url origin 2>/dev/null || true)"
+          origin_url="${origin_url%.git}"
+          case "${origin_url}" in
+            git@github.com:*) repo_path="${origin_url#git@github.com:}" ;;
+            https://github.com/*) repo_path="${origin_url#https://github.com/}" ;;
+            ssh://git@github.com/*) repo_path="${origin_url#ssh://git@github.com/}" ;;
+            *)
+              echo "unable to derive GHCR owner from GitHub origin; set CENTAUR_GHCR_OWNER" >&2
+              exit 2
+              ;;
+          esac
+          [[ "${repo_path}" == */* ]] || {
+            echo "invalid GitHub origin; set CENTAUR_GHCR_OWNER" >&2
+            exit 2
+          }
+          ghcr_owner="${repo_path%%/*}"
+        fi
+        [[ "${ghcr_owner}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || {
+          echo "invalid CENTAUR_GHCR_OWNER" >&2
+          exit 2
+        }
         ghcr_namespace="ghcr.io/${ghcr_owner,,}/centaur"
         extra_args+=(
           --set apiRs.image.repository="${ghcr_namespace}/centaur-api-rs"
