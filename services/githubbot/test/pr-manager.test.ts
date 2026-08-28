@@ -922,7 +922,96 @@ describe("bounded review epochs", () => {
 
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
-    ).toMatchObject({ epoch: 4, roundsUsed: 2 });
+    ).toMatchObject({
+      consumedResetApprovalId: "one-shot-reset",
+      epoch: 4,
+      roundsUsed: 2,
+    });
+  });
+
+  test("preserves an approved reset when the budget write fails", async () => {
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    let failBudgetWrite = true;
+    const state = {
+      ...durableState,
+      async set(key: string, value: unknown) {
+        if (key.includes(":review-budget:") && failBudgetWrite) {
+          failBudgetWrite = false;
+          throw new Error("temporary budget write failure");
+        }
+        await durableState.set(key, value);
+      },
+    };
+    const merges = { count: 0 };
+    const removedLabels: string[] = [];
+    const ctx = budgetCtx({
+      headSha: "head-4",
+      merges,
+      removedLabels,
+      state,
+    });
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "reset-survives-budget-failure",
+    );
+    const review = JSON.stringify({
+      action: "submitted",
+      pull_request: { head: { sha: "head-4" }, number: 7 },
+      repository: { full_name: "base/repo" },
+      review: {
+        commit_id: "head-4",
+        id: 14,
+        state: "approved",
+        user: { login: "reviewer" },
+      },
+    });
+
+    await handleReviewEvent(ctx, review);
+
+    expect(merges.count).toBe(0);
+    expect(removedLabels).toEqual([]);
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
+    ).toMatchObject({ approvalId: "reset-survives-budget-failure" });
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      epoch: 1,
+      pausedHeadSha: "head-4",
+      roundsUsed: 3,
+    });
+
+    await handleReviewEvent(ctx, review);
+
+    expect(merges.count).toBe(1);
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
+    ).toBeUndefined();
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      consumedResetApprovalId: "reset-survives-budget-failure",
+      epoch: 2,
+      roundsUsed: 1,
+    });
   });
 
   test("retries the human-handoff comment after a transient post failure", async () => {
@@ -987,6 +1076,40 @@ describe("bounded review epochs", () => {
     expect(merges.count).toBe(0);
   });
 
+  test("keeps the handoff pause across a descendant automation head", async () => {
+    const merges = { count: 0 };
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    const ctx = budgetCtx({ headSha: "head-5", merges, state });
+
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "synchronize",
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+      }),
+      "descendant-head",
+    );
+
+    expect(merges.count).toBe(0);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+    });
+  });
+
   test("consumes an authorized reset before merging an approved head", async () => {
     const merges = { count: 0 };
     const removedLabels: string[] = [];
@@ -996,7 +1119,7 @@ describe("bounded review epochs", () => {
       automationPendingFromHeadSha: "head-3",
       epoch: 1,
       lastReviewedHeadSha: "head-3",
-      pausedHeadSha: "head-4",
+      pausedHeadSha: "head-3",
       pauseReason: "round_budget_exhausted",
       roundsUsed: 3,
       version: 1,

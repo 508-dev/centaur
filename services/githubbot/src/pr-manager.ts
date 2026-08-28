@@ -147,16 +147,6 @@ function reviewResetApprovalKey(
   return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-reset:${owner}/${repo}#${n}:${headSha}`;
 }
 
-function reviewResetConsumptionKey(
-  ctx: PrManagerContext,
-  owner: string,
-  repo: string,
-  n: number,
-  approvalId: string,
-): string {
-  return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-reset-consumed:${owner}/${repo}#${n}:${approvalId}`;
-}
-
 export function managementThreadKey(
   owner: string,
   repo: string,
@@ -215,6 +205,8 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
     candidate.roundsUsed > 0 &&
     (candidate.automationPendingFromHeadSha === undefined ||
       typeof candidate.automationPendingFromHeadSha === "string") &&
+    (candidate.consumedResetApprovalId === undefined ||
+      typeof candidate.consumedResetApprovalId === "string") &&
     (candidate.pausedHeadSha === undefined ||
       typeof candidate.pausedHeadSha === "string") &&
     (candidate.pauseReason === undefined ||
@@ -853,33 +845,28 @@ async function compareReviewChange(
   }
 }
 
-async function takeReviewResetApproval(
+async function pendingReviewResetApproval(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
-  prNumber: number,
-  headSha: string,
+  pr: PullRequestSummary,
+  state?: ReviewEpochState,
 ): Promise<ReviewResetApproval | undefined> {
   const approval = await loadReviewResetApproval(
     ctx,
     owner,
     repo,
-    prNumber,
-    headSha,
+    pr.number,
+    pr.headSha,
   );
   if (!approval) return undefined;
-  const claimed = await strictClaim(
-    ctx,
-    reviewResetConsumptionKey(
-      ctx,
-      owner,
-      repo,
-      prNumber,
-      approval.approvalId,
-    ),
-    `${owner}/${repo}#${prNumber}`,
-  );
-  return claimed ? approval : undefined;
+  if (state?.consumedResetApprovalId === approval.approvalId) {
+    // The budget write is the reset's durable commit point. Cleanup is only
+    // hygiene and may be retried if a prior delete or label removal failed.
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return undefined;
+  }
+  return approval;
 }
 
 async function cleanupReviewResetApproval(
@@ -922,43 +909,43 @@ async function consumeApprovedReviewReset(
 ): Promise<boolean> {
   const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
   if (!loaded.ok) return false;
-  const approval = await takeReviewResetApproval(
+  const approval = await pendingReviewResetApproval(
     ctx,
     owner,
     repo,
-    pr.number,
-    headSha,
+    pr,
+    loaded.state,
   );
   if (!approval) return true;
-  if (loaded.state) {
-    const admission = decideReviewAdmission({
-      actor: "human",
-      headSha,
-      manualReset: true,
-      maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
-      maxRoundsPerEpoch:
-        ctx.options.reviewMaxRoundsPerEpoch ??
-        DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
-      state: loaded.state,
-    });
-    const state = {
-      ...admission.state,
-      automationPendingFromHeadSha: undefined,
-    };
-    if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
-      await cleanupReviewResetApproval(ctx, owner, repo, pr);
-      return false;
-    }
-    traceLog(
-      ctx.options,
-      "githubbot_review_reset_consumed_by_approval",
-      makeTrace(
-        managementThreadKey(owner, repo, pr.number),
-        `review-approved-${headSha}`,
-      ),
-      { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
-    );
+  const admission = decideReviewAdmission({
+    actor: "human",
+    headSha,
+    manualReset: true,
+    maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+    maxRoundsPerEpoch:
+      ctx.options.reviewMaxRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    state: loaded.state,
+  });
+  const state = {
+    ...admission.state,
+    automationPendingFromHeadSha: undefined,
+    consumedResetApprovalId: approval.approvalId,
+  };
+  if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
+    // Leave the approval and visible label intact. A redelivery can retry the
+    // same reset because no durable budget state says it was consumed.
+    return false;
   }
+  traceLog(
+    ctx.options,
+    "githubbot_review_reset_consumed_by_approval",
+    makeTrace(
+      managementThreadKey(owner, repo, pr.number),
+      `review-approved-${headSha}`,
+    ),
+    { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
+  );
   await cleanupReviewResetApproval(ctx, owner, repo, pr);
   return true;
 }
@@ -972,12 +959,12 @@ async function admitReviewResponse(
 ): Promise<ReviewAdmission | null> {
   const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
   if (!loaded.ok) return null;
-  const approval = await takeReviewResetApproval(
+  const approval = await pendingReviewResetApproval(
     ctx,
     owner,
     repo,
-    pr.number,
-    headSha,
+    pr,
+    loaded.state,
   );
   const manualReset = approval !== undefined;
 
@@ -1023,10 +1010,12 @@ async function admitReviewResponse(
       DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
     state: loaded.state,
   });
-  if (!(await saveReviewBudget(ctx, owner, repo, pr.number, admission.state))) {
-    if (manualReset) {
-      await cleanupReviewResetApproval(ctx, owner, repo, pr);
-    }
+  const state = approval
+    ? { ...admission.state, consumedResetApprovalId: approval.approvalId }
+    : admission.state;
+  if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
+    // The approval remains pending because its consumption marker is committed
+    // atomically with the budget transition above, not in a separate key.
     return null;
   }
   if (admission.decision === "allow" && manualReset) {
@@ -1043,14 +1032,14 @@ async function admitReviewResponse(
       assessment: admission.assessment?.kind,
       assessment_reasons: admission.assessment?.reasons,
       decision: admission.decision,
-      epoch: admission.state.epoch,
+      epoch: state.epoch,
       head_sha: headSha,
       reset_epoch:
         admission.decision === "allow" ? admission.resetEpoch : undefined,
-      rounds_used: admission.state.roundsUsed,
+      rounds_used: state.roundsUsed,
     },
   );
-  return admission;
+  return { ...admission, state };
 }
 
 async function escalateReviewBudget(
@@ -1210,13 +1199,14 @@ async function tryMergeLocked(
   if (!pr || !owns(ctx, pr)) return;
   const reviewBudget = await loadReviewBudget(ctx, owner, repo, number);
   if (!reviewBudget.ok) return;
-  if (reviewBudget.state?.pausedHeadSha === pr.headSha) {
+  if (reviewBudget.state?.pausedHeadSha) {
     traceLog(
       ctx.options,
       "githubbot_merge_review_budget_paused",
       makeTrace(managementThreadKey(owner, repo, number), `merge-${pr.headSha}`),
       {
         epoch: reviewBudget.state.epoch,
+        pause_started_at_head_sha: reviewBudget.state.pausedHeadSha,
         pause_reason: reviewBudget.state.pauseReason,
         pr: `${owner}/${repo}#${number}`,
       },

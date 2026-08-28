@@ -23,6 +23,7 @@ export type ReviewChangeAssessment = {
 export type ReviewEpochState = {
   anchorHeadSha: string;
   automationPendingFromHeadSha?: string;
+  consumedResetApprovalId?: string;
   epoch: number;
   lastReviewedHeadSha: string;
   pausedHeadSha?: string;
