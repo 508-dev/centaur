@@ -129,6 +129,8 @@ running work isn't dropped (claims are taken before the work, so a dropped turn 
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both require the **single replica** the chart enforces (`replicaCount: 1`); increase sandbox
 runner and warm-pool capacity for concurrent work instead of scaling this webhook controller.
+Review delivery claims that encounter a transient state-store error remain in process and retry with
+capped backoff; they are included in the same shutdown drain rather than being treated as duplicates.
 
 ## Auth
 

@@ -561,6 +561,32 @@ describe("bounded review epochs", () => {
     expect(comments[0]).toContain("centaur-review-reset");
   });
 
+  test("retries a transient durable review-claim failure", async () => {
+    const durableState = makeState();
+    let reviewClaimAttempts = 0;
+    const state = {
+      ...durableState,
+      async setIfNotExists(key: string, value: unknown) {
+        if (key.includes(":review-handled:")) {
+          reviewClaimAttempts += 1;
+          if (reviewClaimAttempts === 1) {
+            throw new Error("temporary Postgres interruption");
+          }
+        }
+        return durableState.setIfNotExists(key, value);
+      },
+    };
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(ctx, submittedReview(5, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(reviewClaimAttempts).toBe(2);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ epoch: 1, roundsUsed: 1 });
+  });
+
   test("starts a new epoch for a material human-authored change", async () => {
     const state = makeState();
     const ctx = budgetCtx({
@@ -737,6 +763,68 @@ describe("bounded review epochs", () => {
     expect(
       await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
     ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
+  });
+
+  test("serializes an in-flight reset label ahead of concurrent review admission", async () => {
+    const removedLabels: string[] = [];
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    const ctx = budgetCtx({ headSha: "head-4", removedLabels, state });
+    let permissionStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      permissionStarted = resolve;
+    });
+    let releasePermission!: () => void;
+    const permissionGate = new Promise<void>((resolve) => {
+      releasePermission = resolve;
+    });
+    ctx.octokit.rest.repos.getCollaboratorPermissionLevel = (async () => {
+      permissionStarted();
+      await permissionGate;
+      return { data: { permission: "write" } };
+    }) as unknown as typeof ctx.octokit.rest.repos.getCollaboratorPermissionLevel;
+
+    const label = handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "concurrent-reset",
+    );
+    await started;
+    const review = handleReviewEvent(ctx, submittedReview(7, "head-4"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ pausedHeadSha: "head-4", roundsUsed: 3 });
+
+    releasePermission();
+    await Promise.all([label, review]);
+    await drainBackgroundWork(5_000);
+
+    const budget = await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    );
+    expect(budget).toMatchObject({
+      anchorHeadSha: "head-4",
+      epoch: 2,
+      roundsUsed: 1,
+    });
+    expect(budget).not.toHaveProperty("pausedHeadSha");
     expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 

@@ -56,6 +56,7 @@ export type PrManagerContext = {
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+const REVIEW_CLAIM_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -322,6 +323,36 @@ async function strictClaim(
   }
 }
 
+async function retryingReviewClaim(
+  ctx: PrManagerContext,
+  key: string,
+  pr: string,
+): Promise<boolean> {
+  let failureCount = 0;
+  for (;;) {
+    try {
+      return await ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS);
+    } catch (error) {
+      const delayMs =
+        REVIEW_CLAIM_RETRY_DELAYS_MS[
+          Math.min(failureCount, REVIEW_CLAIM_RETRY_DELAYS_MS.length - 1)
+        ] ?? 30_000;
+      failureCount += 1;
+      logger(ctx).warn("githubbot_review_claim_retry", {
+        attempt: failureCount,
+        error: errorMessage(error),
+        pr,
+        retry_in_ms: delayMs,
+      });
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        await Promise.resolve();
+      }
+    }
+  }
+}
+
 async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
   try {
     return await ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS);
@@ -474,21 +505,33 @@ export async function handlePullRequestEvent(
   if (number === undefined) return;
   if (action === "closed") return; // nothing to drive once closed/merged.
 
-  const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
-  if (!pr || !owns(ctx, pr)) return;
+  const labelNode = payload.label;
+  const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
+  const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
   if (
     action === "labeled" &&
-    (await maybeRecordReviewResetApproval(
-      ctx,
-      repo.owner,
-      repo.repo,
-      pr,
-      payload,
-      deliveryId,
-    ))
+    label?.toLowerCase() === resetLabel.toLowerCase()
   ) {
+    // Enter the per-PR queue before fetching the PR or checking the labeler's
+    // permission. A review webhook delivered concurrently after this label
+    // event must not overtake the durable reset approval.
+    await runExclusive(reviewBudgetLockKey(repo.owner, repo.repo, number), async () => {
+      const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
+      if (!pr || !owns(ctx, pr)) return;
+      await maybeRecordReviewResetApproval(
+        ctx,
+        repo.owner,
+        repo.repo,
+        pr,
+        payload,
+        deliveryId,
+      );
+    });
     return;
   }
+
+  const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
+  if (!pr || !owns(ctx, pr)) return;
   // Being assigned the PR is the explicit signal to take it over: evaluate CI now
   // (forcing past the human-commit back-off — the assignment is a human handing
   // it to us) so an already-red or already-green PR is acted on immediately,
@@ -548,7 +591,7 @@ export async function handleReviewEvent(
 
   const reviewClaimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-handled:${repo.owner}/${repo.repo}#${number}:${reviewId}`;
   if (
-    !(await strictClaim(
+    !(await retryingReviewClaim(
       ctx,
       reviewClaimKey,
       `${repo.owner}/${repo.repo}#${number}`,
