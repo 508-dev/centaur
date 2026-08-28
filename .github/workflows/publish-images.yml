@@ -31,9 +31,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # Keep forks self-contained: the repository token may publish packages only
-  # under its own owner, and image source labels should identify this checkout.
-  IMAGE_NAMESPACE: ${{ github.repository_owner }}/centaur
+  # Build jobs derive a lowercase image namespace from the repository owner so
+  # forks stay self-contained and always produce valid Docker references.
   IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
@@ -109,10 +108,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Derive platform slug
+      - name: Derive build variables
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAMESPACE=${REPOSITORY_OWNER,,}/centaur" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -150,6 +152,8 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
       - name: Export digest
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -186,6 +190,11 @@ jobs:
           - image: centaur-teamsbot
 
     steps:
+      - name: Derive image namespace
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "IMAGE_NAMESPACE=${REPOSITORY_OWNER,,}/centaur" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
