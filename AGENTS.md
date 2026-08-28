@@ -151,6 +151,13 @@ scoped access.
 - For reviews, report concrete findings in severity order with file and line
   references. Passing tests do not prove protocol, authorization, or recovery
   correctness. Do not edit unless asked to resolve findings.
+- Before reporting a finding, establish a reachable path under the repository's
+  enforced types, schema, authorization, and deployment contracts, then state
+  the material impact and supporting evidence. Do not make speculative states,
+  optional hardening, style preferences, or adjacent redesign blocking.
+- On follow-up reviews, validate prior fixes and inspect the changed risk surface
+  plus regressions introduced by those fixes. Do not restart a broad review or
+  resurrect a resolved/rejected root cause without new contradictory evidence.
 - For incidents, distinguish durable state, observed logs/metrics, live runtime
   state, deployed version/configuration, and user-visible outcome. State what is
   verified versus inferred.

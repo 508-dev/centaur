@@ -210,6 +210,11 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
         handleBodyMention(prManagerCtx, eventType, rawBody) ?? undefined,
       ]),
     );
+    // Retain accepted lifecycle work process-wide as well as in the request
+    // execution context. In particular, a review whose durable claim store is
+    // temporarily unavailable keeps retrying and participates in shutdown
+    // draining instead of being acknowledged and silently forgotten.
+    backgroundWaitUntil(handled);
     waitUntil(c, handled);
     return new globalThis.Response("ok", { status: 200 });
   };
@@ -509,7 +514,11 @@ function routeLifecycleEvent(
         state: input.state,
       });
     }
-    return handlePullRequestEvent(input.prManagerCtx, rawBody);
+    return handlePullRequestEvent(
+      input.prManagerCtx,
+      rawBody,
+      input.deliveryId,
+    );
   }
   if (eventType === "pull_request_review") {
     return handleReviewEvent(input.prManagerCtx, rawBody);

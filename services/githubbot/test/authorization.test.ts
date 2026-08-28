@@ -4,10 +4,13 @@ import {
   DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS,
   isCommentAuthorAllowed,
   isRepositoryAllowed,
+  isReviewAuthorAllowed,
   requireRepositoryAllowlist,
   repositoryFullNameFromRaw,
   resolveAllowedAuthorAssociations,
   resolveRepositoryAllowlist,
+  resolveReviewAuthorAllowlist,
+  reviewAuthorFromRaw,
 } from "../src/authorization";
 
 function raw(association: unknown): unknown {
@@ -78,6 +81,53 @@ describe("isCommentAuthorAllowed", () => {
     const opts = { allowedAuthorAssociations: ["contributor"] };
     expect(isCommentAuthorAllowed(raw("CONTRIBUTOR"), opts)).toBe(true);
     expect(isCommentAuthorAllowed(raw("MEMBER"), opts)).toBe(false);
+  });
+});
+
+describe("submitted review authorization", () => {
+  const review = (association: unknown, login: unknown): unknown => ({
+    review: { author_association: association, user: { login } },
+  });
+
+  test("reads the signed review author identity", () => {
+    expect(reviewAuthorFromRaw(review("MEMBER", "alice"))).toEqual({
+      association: "MEMBER",
+      login: "alice",
+    });
+    expect(reviewAuthorFromRaw({ review: {} })).toEqual({
+      association: undefined,
+      login: undefined,
+    });
+    expect(reviewAuthorFromRaw(null)).toBeUndefined();
+  });
+
+  test("allows collaborators but denies public users by default", () => {
+    for (const association of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+      expect(isReviewAuthorAllowed(review(association, "alice"), {})).toBe(
+        true,
+      );
+    }
+    for (const association of ["CONTRIBUTOR", "NONE", undefined]) {
+      expect(isReviewAuthorAllowed(review(association, "outsider"), {})).toBe(
+        false,
+      );
+    }
+    expect(isReviewAuthorAllowed(review("MEMBER", undefined), {})).toBe(false);
+  });
+
+  test("allows exact reviewer-bot logins without allowing every outsider", () => {
+    const options = {
+      reviewAuthorAllowlist: [" CodeRabbitAI[bot] ", "*", "owner/repo"],
+    };
+    expect(
+      resolveReviewAuthorAllowlist(options.reviewAuthorAllowlist),
+    ).toEqual(["coderabbitai[bot]"]);
+    expect(
+      isReviewAuthorAllowed(review("NONE", "coderabbitai[bot]"), options),
+    ).toBe(true);
+    expect(isReviewAuthorAllowed(review("NONE", "random-user"), options)).toBe(
+      false,
+    );
   });
 });
 

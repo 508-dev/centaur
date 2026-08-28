@@ -21,6 +21,10 @@ export const DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS = [
   "COLLABORATOR",
 ] as const;
 
+const TRUSTED_REVIEW_AUTHOR_ASSOCIATIONS = new Set<string>(
+  DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS,
+);
+
 const ALLOW_ALL = "*";
 
 /** Pull the canonical owner/repository name out of a GitHub webhook payload. */
@@ -81,6 +85,63 @@ export function authorAssociationFromRaw(raw: unknown): string | undefined {
   if (!comment || typeof comment !== "object") return undefined;
   const value = (comment as { author_association?: unknown }).author_association;
   return typeof value === "string" ? value : undefined;
+}
+
+/** Pull the author identity out of a submitted-review webhook payload. */
+export function reviewAuthorFromRaw(raw: unknown):
+  | { association?: string; login?: string }
+  | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const review = (raw as { review?: unknown }).review;
+  if (!review || typeof review !== "object") return undefined;
+  const association = (review as { author_association?: unknown })
+    .author_association;
+  const user = (review as { user?: unknown }).user;
+  const login =
+    user && typeof user === "object"
+      ? (user as { login?: unknown }).login
+      : undefined;
+  return {
+    association: typeof association === "string" ? association : undefined,
+    login: typeof login === "string" ? login : undefined,
+  };
+}
+
+/** Normalize exact trusted reviewer-bot logins; wildcards fail closed. */
+export function resolveReviewAuthorAllowlist(
+  configured: readonly string[] | undefined,
+): string[] {
+  return (configured ?? [])
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(
+      (entry) =>
+        Boolean(entry) &&
+        !entry.includes("*") &&
+        !entry.includes("/") &&
+        !/\s/.test(entry),
+    );
+}
+
+/**
+ * Whether a submitted review may drive an owned-PR management turn. Public
+ * users fail closed; installed reviewer bots with association NONE require an
+ * exact configured login instead of widening the association policy.
+ */
+export function isReviewAuthorAllowed(
+  raw: unknown,
+  options: Pick<GithubbotOptions, "reviewAuthorAllowlist">,
+): boolean {
+  const author = reviewAuthorFromRaw(raw);
+  if (!author?.login) return false;
+  if (
+    author.association &&
+    TRUSTED_REVIEW_AUTHOR_ASSOCIATIONS.has(author.association.toUpperCase())
+  ) {
+    return true;
+  }
+  return resolveReviewAuthorAllowlist(options.reviewAuthorAllowlist).includes(
+    author.login.toLowerCase(),
+  );
 }
 
 /** Normalize the configured allowlist, defaulting when unset or empty. */
