@@ -92,7 +92,8 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   epoch until the PR-wide epoch cap; automated changes consume the current epoch and cannot award
   themselves a reset. Once exhausted, auto-merge remains paused across descendant heads until a
   reviewed, authorized transition clears the handoff; an already-running repair cannot push around
-  the pause. To continue, a non-bot collaborator with write/admin permission adds the
+  the pause. Only while that handoff pause is active, a non-bot collaborator with write/admin
+  permission can continue by adding the
   `centaur-review-reset` label and re-requests review. The approval is pinned to the current head,
   consumed in the same durable write that advances the epoch, and the label is removed. Create that
   label in each managed repository before use.
@@ -131,8 +132,9 @@ running work isn't dropped (claims are taken before the work, so a dropped turn 
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both require the **single replica** the chart enforces (`replicaCount: 1`); increase sandbox
 runner and warm-pool capacity for concurrent work instead of scaling this webhook controller.
-Review delivery claims that encounter a transient state-store error remain in process and retry with
-capped backoff; they are included in the same shutdown drain rather than being treated as duplicates.
+Review delivery claims and accepted reset-approval writes that encounter a transient state-store
+error remain in process and retry with capped backoff; they are included in the same shutdown drain
+rather than being treated as completed work.
 
 ## Auth
 

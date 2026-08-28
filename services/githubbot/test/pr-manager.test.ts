@@ -730,6 +730,8 @@ describe("bounded review epochs", () => {
       automationPendingFromHeadSha: "head-3",
       epoch: 3,
       lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "automation_material_change_requires_reset",
       roundsUsed: 3,
       version: 1,
     });
@@ -828,6 +830,95 @@ describe("bounded review epochs", () => {
     expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 
+  test("retries a transient reset-approval write before admitting review", async () => {
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    let approvalWriteAttempts = 0;
+    const state = {
+      ...durableState,
+      async set(key: string, value: unknown) {
+        if (key.includes(":review-reset:")) {
+          approvalWriteAttempts += 1;
+          if (approvalWriteAttempts === 1) {
+            throw new Error("temporary approval write failure");
+          }
+        }
+        await durableState.set(key, value);
+      },
+    };
+    const ctx = budgetCtx({ headSha: "head-4", state });
+
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "retry-reset-save",
+    );
+    await handleReviewEvent(ctx, submittedReview(15, "head-4"));
+    await drainBackgroundWork(5_000);
+
+    expect(approvalWriteAttempts).toBe(2);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      consumedResetApprovalId: "retry-reset-save",
+      epoch: 2,
+      roundsUsed: 1,
+    });
+  });
+
+  test("rejects a reset label while the review epoch is active", async () => {
+    const removedLabels: string[] = [];
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      roundsUsed: 1,
+      version: 1,
+    });
+    const ctx = budgetCtx({ removedLabels, state });
+
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "early-reset",
+    );
+    await handleReviewEvent(ctx, submittedReview(16, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-1"),
+    ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
+    const budget = await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    );
+    expect(budget).toMatchObject({ epoch: 1, roundsUsed: 2 });
+    expect(budget).not.toHaveProperty("consumedResetApprovalId");
+  });
+
   test("rejects reset labels added by the managed bot", async () => {
     const state = makeState();
     const ctx = budgetCtx({ headSha: "head-4", state });
@@ -900,6 +991,8 @@ describe("bounded review epochs", () => {
       automationPendingFromHeadSha: "head-3",
       epoch: 3,
       lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
       roundsUsed: 3,
       version: 1,
     });
@@ -1043,6 +1136,52 @@ describe("bounded review epochs", () => {
     expect(attempts).toBe(2);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("round_budget_exhausted");
+  });
+
+  test("does not consume a stale reset approval on an active epoch", async () => {
+    const merges = { count: 0 };
+    const removedLabels: string[] = [];
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      roundsUsed: 1,
+      version: 1,
+    });
+    await state.set("centaur-githubbot:review-reset:base/repo#7:head-1", {
+      approvalId: "legacy-early-reset",
+      approvedBy: "alice",
+      headSha: "head-1",
+    });
+    const ctx = budgetCtx({ merges, removedLabels, state });
+
+    await handleReviewEvent(
+      ctx,
+      JSON.stringify({
+        action: "submitted",
+        pull_request: { head: { sha: "head-1" }, number: 7 },
+        repository: { full_name: "base/repo" },
+        review: {
+          commit_id: "head-1",
+          id: 17,
+          state: "approved",
+          user: { login: "reviewer" },
+        },
+      }),
+    );
+
+    expect(merges.count).toBe(1);
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-1"),
+    ).toBeUndefined();
+    const budget = await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    );
+    expect(budget).toMatchObject({ epoch: 1, roundsUsed: 1 });
+    expect(budget).not.toHaveProperty("consumedResetApprovalId");
   });
 
   test("keeps deterministic auto-merge paused for an exhausted review head", async () => {

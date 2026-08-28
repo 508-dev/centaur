@@ -56,7 +56,7 @@ export type PrManagerContext = {
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
-const REVIEW_CLAIM_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
+const REVIEW_STATE_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -315,22 +315,23 @@ async function strictClaim(
   }
 }
 
-async function retryingReviewClaim(
+async function retryingReviewStateOperation<T>(
   ctx: PrManagerContext,
-  key: string,
+  event: string,
   pr: string,
-): Promise<boolean> {
+  operation: () => Promise<T>,
+): Promise<T> {
   let failureCount = 0;
   for (;;) {
     try {
-      return await ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS);
+      return await operation();
     } catch (error) {
       const delayMs =
-        REVIEW_CLAIM_RETRY_DELAYS_MS[
-          Math.min(failureCount, REVIEW_CLAIM_RETRY_DELAYS_MS.length - 1)
+        REVIEW_STATE_RETRY_DELAYS_MS[
+          Math.min(failureCount, REVIEW_STATE_RETRY_DELAYS_MS.length - 1)
         ] ?? 30_000;
       failureCount += 1;
-      logger(ctx).warn("githubbot_review_claim_retry", {
+      logger(ctx).warn(event, {
         attempt: failureCount,
         error: errorMessage(error),
         pr,
@@ -343,6 +344,19 @@ async function retryingReviewClaim(
       }
     }
   }
+}
+
+async function retryingReviewClaim(
+  ctx: PrManagerContext,
+  key: string,
+  pr: string,
+): Promise<boolean> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_claim_retry",
+    pr,
+    () => ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS),
+  );
 }
 
 async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
@@ -729,32 +743,44 @@ async function maybeRecordReviewResetApproval(
     return true;
   }
 
-  try {
-    await ctx.state.set(
-      reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
-      {
-        approvalId: deliveryId,
-        approvedBy: sender,
-        headSha: pr.headSha,
-      } satisfies ReviewResetApproval,
-      CLAIM_TTL_MS,
-    );
-    traceLog(
-      ctx.options,
-      "githubbot_review_reset_approved",
-      makeTrace(
-        managementThreadKey(owner, repo, pr.number),
-        `review-reset-${pr.headSha}`,
-      ),
-      { approved_by: sender, head_sha: pr.headSha },
-    );
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_reset_save_failed", {
-      error: errorMessage(error),
+  const budget = await loadReviewBudget(ctx, owner, repo, pr.number);
+  if (!budget.ok) return true;
+  if (!budget.state?.pausedHeadSha) {
+    logger(ctx).warn("githubbot_review_reset_denied", {
       pr: `${owner}/${repo}#${pr.number}`,
+      reason: "review_budget_not_paused",
       sender,
     });
+    // Do not leave a visible reset label that was never accepted. Deleting an
+    // old approval also prevents an early label from becoming usable later.
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
   }
+
+  await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_save_retry",
+    `${owner}/${repo}#${pr.number}`,
+    () =>
+      ctx.state.set(
+        reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
+        {
+          approvalId: deliveryId,
+          approvedBy: sender,
+          headSha: pr.headSha,
+        } satisfies ReviewResetApproval,
+        CLAIM_TTL_MS,
+      ),
+  );
+  traceLog(
+    ctx.options,
+    "githubbot_review_reset_approved",
+    makeTrace(
+      managementThreadKey(owner, repo, pr.number),
+      `review-reset-${pr.headSha}`,
+    ),
+    { approved_by: sender, head_sha: pr.headSha },
+  );
   return true;
 }
 
@@ -863,6 +889,14 @@ async function pendingReviewResetApproval(
   if (state?.consumedResetApprovalId === approval.approvalId) {
     // The budget write is the reset's durable commit point. Cleanup is only
     // hygiene and may be retried if a prior delete or label removal failed.
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return undefined;
+  }
+  if (!state?.pausedHeadSha) {
+    logger(ctx).warn("githubbot_review_reset_ignored", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "review_budget_not_paused",
+    });
     await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return undefined;
   }
