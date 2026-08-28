@@ -138,16 +138,20 @@ deploy:
     case "{{source}}" in
       local) ;;
       ghcr)
+        # Keep the deploy consumer aligned with the fork-owned packages emitted
+        # by publish-images.yml. Other forks can override the owner explicitly.
+        ghcr_owner="${CENTAUR_GHCR_OWNER:-508-dev}"
+        ghcr_namespace="ghcr.io/${ghcr_owner,,}/centaur"
         extra_args+=(
-          --set apiRs.image.repository=ghcr.io/paradigmxyz/centaur/centaur-api-rs
-          --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur/centaur-iron-proxy
-          --set slackbotv2.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbotv2
-          --set linearbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-linearbot
-          --set discordbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-discordbot
-          --set githubbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-githubbot
-          --set teamsbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-teamsbot
-          --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur/centaur-agent
-          --set console.image.repository=ghcr.io/paradigmxyz/centaur/centaur-console
+          --set apiRs.image.repository="${ghcr_namespace}/centaur-api-rs"
+          --set ironProxy.image.repository="${ghcr_namespace}/centaur-iron-proxy"
+          --set slackbotv2.image.repository="${ghcr_namespace}/centaur-slackbotv2"
+          --set linearbot.image.repository="${ghcr_namespace}/centaur-linearbot"
+          --set discordbot.image.repository="${ghcr_namespace}/centaur-discordbot"
+          --set githubbot.image.repository="${ghcr_namespace}/centaur-githubbot"
+          --set teamsbot.image.repository="${ghcr_namespace}/centaur-teamsbot"
+          --set sandbox.image.repository="${ghcr_namespace}/centaur-agent"
+          --set console.image.repository="${ghcr_namespace}/centaur-console"
         )
         ;;
       *) echo "unknown source: {{source}} (expected local or ghcr)" >&2; exit 2 ;;
