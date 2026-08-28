@@ -1,4 +1,4 @@
-"""CLI for Centaur readonly thread investigations."""
+"""CLI for sanitized, read-only Centaur self-diagnosis."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ load_dotenv()
 
 app = typer.Typer(
     name="centaur-investigator",
-    help="Investigate Centaur threads and sessions from readonly Postgres.",
+    help="Diagnose Centaur workflows, threads, and sessions from read-only state.",
 )
 
 
@@ -89,6 +89,71 @@ def _print_investigation(result: dict[str, Any]) -> None:
                 str(row.get("completed_at") or ""),
             )
         console.print(table)
+
+
+def _print_diagnosis(result: dict[str, Any]) -> None:
+    if result.get("kind") != "workflow_run":
+        _print_investigation(result)
+        return
+
+    analysis = result.get("analysis") or {}
+    console.print(f"[bold]Workflow reference:[/] {result.get('reference')}")
+    console.print(f"[bold]Outcome:[/] {analysis.get('outcome') or 'unknown'}")
+    console.print(analysis.get("summary") or "No summary.")
+    for warning in analysis.get("warnings") or []:
+        console.print(f"[yellow]warning:[/] {warning}")
+    for check in analysis.get("next_checks") or []:
+        console.print(f"[cyan]next check:[/] {check}")
+
+    rows = (result.get("postgres") or {}).get("workflow_runs", {}).get("rows", [])
+    if rows:
+        table = Table(title="Workflow runs")
+        table.add_column("Run", style="cyan", max_width=38)
+        table.add_column("Workflow", max_width=28)
+        table.add_column("State", style="green", max_width=14)
+        table.add_column("Attempts", max_width=10)
+        for row in rows[:10]:
+            table.add_row(
+                str(row.get("run_id") or ""),
+                str(row.get("workflow_name") or row.get("task_name") or ""),
+                str(row.get("state") or ""),
+                f"{row.get('attempts') or 0}/{row.get('max_attempts') or 0}",
+            )
+        console.print(table)
+
+
+@app.command("diagnose")
+def diagnose(
+    reference: str | None = typer.Argument(
+        None,
+        help=(
+            "Thread key or workflow run/task ID. Omit to diagnose the current "
+            "CENTAUR_THREAD_KEY session."
+        ),
+    ),
+    limit: int = typer.Option(25, "--limit", "-n", help="Max rows per source."),
+    observability: bool = typer.Option(
+        True,
+        "--observability/--no-observability",
+        help="Query aggregate vlogs/vmetrics metadata.",
+    ),
+    window_hours: int = typer.Option(24, "--window-hours", help="Observability lookback."),
+    logs_limit: int = typer.Option(100, "--logs-limit", help="Max aggregate log values."),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Diagnose the current session or an explicit workflow/thread reference."""
+    result = CentaurInvestigatorClient().diagnose(
+        reference,
+        limit=limit,
+        include_observability=observability,
+        window_hours=window_hours,
+        logs_limit=logs_limit,
+    )
+    _require_ok(result)
+    if json_output:
+        _print_json(result)
+        return
+    _print_diagnosis(result)
 
 
 @app.command("investigate")

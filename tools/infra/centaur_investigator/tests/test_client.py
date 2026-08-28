@@ -11,11 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import client as centaur_client
 from client import (
     CentaurInvestigatorClient,
+    _current_thread_key,
     _database_url_with_name,
-    _record_to_dict,
     _postgres_database_name,
+    _record_to_dict,
     parse_slack_reference,
 )
+
+WORKFLOW_RUN_ID = "018f47a2-4b16-7c21-8c30-123456789abc"
 
 
 class _FakeRecord:
@@ -75,6 +78,12 @@ def test_postgres_database_name_uses_default_for_blank_override(monkeypatch) -> 
     monkeypatch.setenv("CENTAUR_INVESTIGATOR_POSTGRES_DATABASE", " ")
 
     assert _postgres_database_name() == "ai_v2"
+
+
+def test_current_thread_key_uses_session_scoped_environment(monkeypatch) -> None:
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "  discord:111:222:333  ")
+
+    assert _current_thread_key() == "discord:111:222:333"
 
 
 class _FakeConnection:
@@ -144,10 +153,39 @@ class _FakeConnection:
                     "thread_key": "slack:C123:1777910337.403889",
                     "status": "completed",
                     "model": "gpt-test",
+                    "workflow_name": "sync_records",
+                    "workflow_task_id": "task_1",
+                    "workflow_run_id": WORKFLOW_RUN_ID,
+                    "workflow_context_phase": "agent_turn",
                     "created_at": self.now,
                     "started_at": self.now,
                     "completed_at": self.now,
                     "duration_seconds": 42.0,
+                }
+            ]
+        if "FROM centaur_readonly_workflow_runs" in query:
+            reference = args[0] if args else ""
+            if isinstance(reference, list) and not reference:
+                return []
+            return [
+                {
+                    "queue_name": "centaur_workflows",
+                    "run_id": WORKFLOW_RUN_ID,
+                    "task_id": "task_1",
+                    "task_name": "workflow_task",
+                    "workflow_name": "sync_records",
+                    "harness_type": "codex",
+                    "state": "failed",
+                    "attempts": 3,
+                    "max_attempts": 3,
+                    "created_at": self.now,
+                    "first_started_at": self.now,
+                    "started_at": self.now,
+                    "completed_at": None,
+                    "failed_at": self.now,
+                    "available_at": None,
+                    "claimed": False,
+                    "cancelled_at": None,
                 }
             ]
         if "FROM session_messages" in query:
@@ -277,16 +315,72 @@ def test_investigation_queries_readonly_tables_without_message_context(monkeypat
     assert fake.closed is True
 
     all_queries = "\n".join(query for query, _args in fake.fetch_calls + fake.fetchrow_calls)
-    assert "centaur_readonly_" not in all_queries
     assert "SELECT *" not in all_queries
     assert "FROM sessions" in all_queries
     assert "FROM session_messages" in all_queries
     assert "FROM slack_sync_messages" in all_queries
+    assert "FROM centaur_readonly_workflow_runs" in all_queries
 
     assert "raw_payload" not in str(result)
     assert "url_private" not in str(result)
     assert "content_bytes" not in str(result)
     assert "secret user message" not in str(result)
+
+
+def test_diagnose_defaults_to_current_discord_thread(monkeypatch) -> None:
+    fake = _FakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:111:222:333")
+
+    result = CentaurInvestigatorClient("postgresql://example").diagnose(include_observability=False)
+
+    assert result["status"] == "ok"
+    assert result["parsed"]["thread_key"] == "discord:111:222:333"
+    assert result["postgres"]["role"] == "centaur_readonly"
+    assert result["postgres"]["workflow_runs"]["rows"][0]["run_id"] == WORKFLOW_RUN_ID
+    assert fake.closed is True
+
+
+def test_diagnose_workflow_run_uses_sanitized_readonly_view(monkeypatch) -> None:
+    fake = _FakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+
+    result = CentaurInvestigatorClient("postgresql://example").diagnose(
+        f"diagnose workflow {WORKFLOW_RUN_ID}",
+        include_observability=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["kind"] == "workflow_run"
+    assert result["analysis"]["outcome"] == "failed"
+    assert result["postgres"]["role"] == "centaur_readonly"
+    assert result["workflow_run_ids"] == [WORKFLOW_RUN_ID]
+    assert "failure_reason" not in str(result)
+    assert "raw_payload" not in str(result)
+    assert "secret user message" not in str(result)
+
+    all_queries = "\n".join(query for query, _args in fake.fetch_calls)
+    assert "FROM centaur_readonly_workflow_runs" in all_queries
+    assert "SELECT *" not in all_queries
+    assert fake.execute_calls == []
+    assert fake.closed is True
+
+
+def test_diagnose_without_reference_or_current_thread_fails_closed(monkeypatch) -> None:
+    monkeypatch.delenv("CENTAUR_THREAD_KEY", raising=False)
+
+    result = CentaurInvestigatorClient("postgresql://example").diagnose()
+
+    assert result["status"] == "error"
+    assert "CENTAUR_THREAD_KEY" in result["error"]
 
 
 def test_observability_never_requests_raw_log_context(monkeypatch) -> None:

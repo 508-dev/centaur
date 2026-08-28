@@ -1,4 +1,4 @@
-"""Centaur readonly PostgreSQL investigation helper."""
+"""Sanitized, read-only Centaur workflow and session diagnostics."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from centaur_sdk import secret
 
 CENTAUR_POSTGRES_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 CENTAUR_INVESTIGATOR_DATABASE_ENV = "CENTAUR_INVESTIGATOR_POSTGRES_DATABASE"
+CENTAUR_THREAD_KEY_ENV = "CENTAUR_THREAD_KEY"
 DEFAULT_POSTGRES_DATABASE = "ai_v2"
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
@@ -33,6 +34,11 @@ _SLACK_THREAD_KEY_RE = re.compile(
 )
 _CHANNEL_TS_RE = re.compile(r"\b(?P<channel>[CDG][A-Z0-9]+):(?P<thread_ts>\d{10}\.\d{1,6})\b")
 _KEY_SOURCE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*:")
+_NAMESPACED_THREAD_KEY_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_.-]*:[^\s<>|]+\b")
+_WORKFLOW_RUN_ID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 
 
 def _clamp(value: int, *, minimum: int, maximum: int) -> int:
@@ -61,6 +67,11 @@ def _postgres_database_name() -> str:
     return value.strip() or DEFAULT_POSTGRES_DATABASE
 
 
+def _current_thread_key() -> str:
+    """Return the session-scoped key injected into the current sandbox."""
+    return os.getenv(CENTAUR_THREAD_KEY_ENV, "").strip()  # noqa: TID251
+
+
 def _isoformat(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -81,7 +92,8 @@ def _serialize(value: Any) -> Any:
 def _record_to_dict(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return {key: _serialize(value) for key, value in row.items()}
-    return {key: _serialize(row[key]) for key in row.keys()}
+    # asyncpg.Record iteration yields values, so explicitly iterate its column names.
+    return {key: _serialize(row[key]) for key in row.keys()}  # noqa: SIM118
 
 
 def _connection_role(connection: dict[str, Any]) -> str | None:
@@ -297,7 +309,7 @@ def _safe_load_module(module_name: str, path: Path) -> Any | None:
 
 
 class CentaurInvestigatorClient:
-    """Investigate Centaur state through readonly Postgres access."""
+    """Diagnose Centaur state through read-only Postgres access."""
 
     def __init__(self, database_url: str | None = None) -> None:
         self._database_url = (database_url or _scoped_database_url()).strip()
@@ -408,6 +420,195 @@ class CentaurInvestigatorClient:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
+    async def _workflow_run_state_async(
+        self,
+        reference: str,
+        *,
+        limit: int,
+        include_observability: bool,
+        window_hours: int,
+        logs_limit: int,
+    ) -> dict[str, Any]:
+        identifier = reference.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
+            return {
+                "status": "error",
+                "error": "workflow reference must be a run_id or task_id",
+            }
+
+        conn = await self._connect()
+        try:
+            connection = await self._safe_fetchrow(
+                conn,
+                "connection_role",
+                """
+                SELECT
+                    session_user,
+                    current_user,
+                    current_setting('role', true) AS active_role
+                """,
+            )
+            workflow_runs = await self._safe_fetch(
+                conn,
+                "centaur_readonly_workflow_runs",
+                """
+                SELECT
+                    queue_name,
+                    run_id,
+                    task_id,
+                    task_name,
+                    workflow_name,
+                    harness_type,
+                    state,
+                    attempts,
+                    max_attempts,
+                    created_at,
+                    first_started_at,
+                    started_at,
+                    completed_at,
+                    failed_at,
+                    available_at,
+                    claimed,
+                    cancelled_at
+                FROM centaur_readonly_workflow_runs
+                WHERE run_id = $1 OR task_id = $1
+                ORDER BY created_at DESC NULLS LAST
+                LIMIT $2
+                """,
+                identifier,
+                limit,
+            )
+            run_ids = _dedupe(
+                [
+                    str(row.get("run_id"))
+                    for row in workflow_runs.get("rows", [])
+                    if row.get("run_id")
+                ]
+            )
+            executions = await self._safe_fetch(
+                conn,
+                "workflow_session_executions",
+                """
+                SELECT
+                    execution_id,
+                    thread_key,
+                    status,
+                    metadata ->> 'model' AS model,
+                    metadata ->> 'workflow_name' AS workflow_name,
+                    metadata ->> 'workflow_task_id' AS workflow_task_id,
+                    metadata ->> 'workflow_run_id' AS workflow_run_id,
+                    metadata ->> 'workflow_context_phase' AS workflow_context_phase,
+                    created_at,
+                    started_at,
+                    completed_at,
+                    extract(epoch FROM completed_at - started_at) AS duration_seconds
+                FROM session_executions
+                WHERE metadata ->> 'workflow_run_id' = ANY($1::text[])
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                run_ids,
+                limit,
+            )
+            execution_ids = _dedupe(
+                [
+                    str(row.get("execution_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("execution_id")
+                ]
+            )
+            events = await self._safe_fetch(
+                conn,
+                "workflow_session_events",
+                """
+                SELECT
+                    event_id,
+                    thread_key,
+                    execution_id,
+                    event_type,
+                    payload ->> 'type' AS payload_type,
+                    payload ->> 'subtype' AS payload_subtype,
+                    payload ->> 'status' AS status,
+                    payload ->> 'terminal_reason' AS terminal_reason,
+                    payload ? 'error' AS has_error,
+                    CASE
+                        WHEN payload ? 'error' THEN octet_length(payload ->> 'error')
+                    END AS error_length,
+                    created_at
+                FROM session_events
+                WHERE execution_id = ANY($1::text[])
+                ORDER BY event_id ASC
+                LIMIT $2
+                """,
+                execution_ids,
+                limit * 4,
+            )
+        finally:
+            await conn.close()
+
+        thread_keys = _dedupe(
+            [
+                str(row.get("thread_key"))
+                for row in executions.get("rows", [])
+                if row.get("thread_key")
+            ]
+        )
+        result = {
+            "status": "ok",
+            "kind": "workflow_run",
+            "reference": identifier,
+            "workflow_run_ids": run_ids,
+            "thread_keys": thread_keys,
+            "execution_ids": execution_ids,
+            "analysis": self._summarize_workflow_run(
+                workflow_runs=workflow_runs,
+                executions=executions,
+                events=events,
+            ),
+            "postgres": {
+                "status": "ok",
+                "role": _connection_role(connection),
+                "connection": connection,
+                "workflow_runs": workflow_runs,
+                "session_executions": executions,
+                "session_events": events,
+            },
+            "privacy_note": (
+                "Workflow diagnostics include lifecycle metadata and bounded event shape only. "
+                "Raw prompts, reasoning, tool output, failure text, and secrets are not queried."
+            ),
+        }
+        if include_observability:
+            result["observability"] = self._observability(
+                thread_keys=thread_keys,
+                execution_ids=execution_ids,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+        return result
+
+    def workflow_run_state(
+        self,
+        reference: str,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Inspect a workflow run/task using sanitized read-only state."""
+        try:
+            return asyncio.run(
+                self._workflow_run_state_async(
+                    reference,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_LIMIT),
+                    include_observability=include_observability,
+                    window_hours=_clamp(window_hours, minimum=1, maximum=MAX_WINDOW_HOURS),
+                    logs_limit=_clamp(logs_limit, minimum=1, maximum=MAX_LOG_LIMIT),
+                )
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
     async def _collect_state(
         self,
         conn: asyncpg.Connection,
@@ -480,6 +681,10 @@ class CentaurInvestigatorClient:
                 metadata ->> 'source' AS source,
                 metadata ->> 'platform' AS platform,
                 metadata ->> 'action' AS action,
+                metadata ->> 'workflow_name' AS workflow_name,
+                metadata ->> 'workflow_task_id' AS workflow_task_id,
+                metadata ->> 'workflow_run_id' AS workflow_run_id,
+                metadata ->> 'workflow_context_phase' AS workflow_context_phase,
                 CASE
                     WHEN metadata ->> 'idle_timeout_ms' ~ '^[0-9]+$'
                     THEN (metadata ->> 'idle_timeout_ms')::bigint
@@ -505,6 +710,43 @@ class CentaurInvestigatorClient:
         )
         execution_ids = _dedupe(
             [str(row.get("execution_id")) for row in executions["rows"] if row.get("execution_id")]
+        )
+        workflow_run_ids = _dedupe(
+            [
+                str(row.get("workflow_run_id"))
+                for row in executions["rows"]
+                if row.get("workflow_run_id")
+            ]
+        )
+        workflow_runs = await self._safe_fetch(
+            conn,
+            "centaur_readonly_workflow_runs",
+            """
+            SELECT
+                queue_name,
+                run_id,
+                task_id,
+                task_name,
+                workflow_name,
+                harness_type,
+                state,
+                attempts,
+                max_attempts,
+                created_at,
+                first_started_at,
+                started_at,
+                completed_at,
+                failed_at,
+                available_at,
+                claimed,
+                cancelled_at
+            FROM centaur_readonly_workflow_runs
+            WHERE run_id = ANY($1::text[])
+            ORDER BY created_at DESC NULLS LAST
+            LIMIT $2
+            """,
+            workflow_run_ids,
+            limit,
         )
 
         messages = await self._safe_fetch(
@@ -913,6 +1155,7 @@ class CentaurInvestigatorClient:
                 executions=executions,
                 messages=messages,
                 events=events,
+                workflow_runs=workflow_runs,
                 legacy_runtime=legacy_runtime,
                 legacy_executions=legacy_executions,
                 sandbox_sessions=sandbox_sessions,
@@ -927,6 +1170,7 @@ class CentaurInvestigatorClient:
                 "session_executions": executions,
                 "session_messages": messages,
                 "session_events": events,
+                "workflow_runs": workflow_runs,
                 "legacy_agent_runtime_assignments": legacy_runtime,
                 "legacy_agent_execution_requests": legacy_executions,
                 "legacy_sandbox_sessions": sandbox_sessions,
@@ -937,6 +1181,98 @@ class CentaurInvestigatorClient:
         return result
 
     @staticmethod
+    def _summarize_workflow_run(
+        *,
+        workflow_runs: dict[str, Any],
+        executions: dict[str, Any],
+        events: dict[str, Any],
+    ) -> dict[str, Any]:
+        rows = workflow_runs.get("rows", [])
+        findings: list[str] = []
+        warnings: list[str] = []
+        next_checks: list[str] = []
+
+        if not rows:
+            return {
+                "outcome": "not_found",
+                "summary": "No workflow run or task matched the supplied reference.",
+                "findings": [],
+                "warnings": ["The read-only workflow view returned no matching row."],
+                "next_checks": ["Verify the workflow run_id or task_id and retry."],
+                "primary_source": "postgres_readonly_workflow_view",
+            }
+
+        latest = rows[0]
+        state = str(latest.get("state") or "unknown").lower()
+        if latest.get("cancelled_at") or state == "cancelled":
+            outcome = "cancelled"
+        elif latest.get("failed_at") or state == "failed":
+            outcome = "failed"
+        elif latest.get("completed_at") or state == "completed":
+            outcome = "completed"
+        elif latest.get("claimed") or latest.get("started_at") or latest.get("first_started_at"):
+            outcome = "running"
+        elif state in {"pending", "queued", "ready", "scheduled"}:
+            outcome = "queued"
+        else:
+            outcome = state
+
+        findings.append(
+            "Workflow "
+            f"{latest.get('workflow_name') or latest.get('task_name') or 'unknown'} "
+            f"is {outcome} in {latest.get('queue_name') or 'an unknown queue'}."
+        )
+        findings.append(
+            f"Run {latest.get('run_id') or 'not assigned'} / task {latest.get('task_id')} "
+            f"has attempted {latest.get('attempts') or 0} of {latest.get('max_attempts') or 0} times."
+        )
+
+        execution_rows = executions.get("rows", [])
+        if execution_rows:
+            execution_states = sorted(
+                {str(row.get("status")) for row in execution_rows if row.get("status")}
+            )
+            findings.append(
+                f"Found {len(execution_rows)} correlated agent execution(s): "
+                f"{', '.join(execution_states) or 'unknown status'}."
+            )
+
+        event_rows = events.get("rows", [])
+        event_errors = [row for row in event_rows if row.get("has_error")]
+        if event_rows:
+            findings.append(f"Found {len(event_rows)} sanitized correlated event(s).")
+        if event_errors:
+            warnings.append(f"{len(event_errors)} correlated event(s) carry an error field.")
+
+        if outcome == "failed":
+            warnings.append("The workflow reached a failed terminal state.")
+            next_checks.append(
+                "Use the correlated execution IDs and event types in Console or approved logs; "
+                "raw failure text is intentionally excluded from this tool."
+            )
+        elif outcome == "queued":
+            next_checks.append(
+                "Check whether the queue has an available worker and whether sandbox capacity is full."
+            )
+        elif outcome == "running":
+            next_checks.append(
+                "Compare last activity with the workflow deadline before treating the run as stalled."
+            )
+        elif outcome == "cancelled":
+            next_checks.append(
+                "Confirm the cancellation was expected before retrying the workflow."
+            )
+
+        return {
+            "outcome": outcome,
+            "summary": " ".join(findings),
+            "findings": findings,
+            "warnings": warnings,
+            "next_checks": next_checks,
+            "primary_source": "postgres_readonly_workflow_view",
+        }
+
+    @staticmethod
     def _summarize(
         *,
         parsed: dict[str, Any],
@@ -944,6 +1280,7 @@ class CentaurInvestigatorClient:
         executions: dict[str, Any],
         messages: dict[str, Any],
         events: dict[str, Any],
+        workflow_runs: dict[str, Any],
         legacy_runtime: dict[str, Any],
         legacy_executions: dict[str, Any],
         sandbox_sessions: dict[str, Any],
@@ -987,6 +1324,22 @@ class CentaurInvestigatorClient:
             findings.append(f"Found {len(events['rows'])} sanitized session event row(s).")
         if event_errors:
             warnings.append(f"{len(event_errors)} session event row(s) indicate an error payload.")
+
+        if workflow_runs.get("rows"):
+            states = sorted(
+                {str(row.get("state")) for row in workflow_runs["rows"] if row.get("state")}
+            )
+            findings.append(
+                f"Found {len(workflow_runs['rows'])} related workflow run row(s): "
+                f"{', '.join(states) or 'unknown state'}."
+            )
+            failed_workflows = [
+                row
+                for row in workflow_runs["rows"]
+                if row.get("failed_at") or str(row.get("state") or "").lower() == "failed"
+            ]
+            if failed_workflows:
+                warnings.append(f"{len(failed_workflows)} related workflow run(s) failed.")
 
         if messages.get("rows"):
             roles = sorted({str(row.get("role")) for row in messages["rows"] if row.get("role")})
@@ -1127,6 +1480,59 @@ class CentaurInvestigatorClient:
         return {
             "status": "error",
             "error": "query must contain a Slack permalink or Centaur thread_key",
+        }
+
+    def diagnose(
+        self,
+        reference: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Diagnose the current session, a thread key, or a workflow run/task.
+
+        When ``reference`` is omitted (or is ``current``/``this``), the tool
+        uses the session-scoped ``CENTAUR_THREAD_KEY`` injected by Centaur.
+        Results contain only sanitized lifecycle metadata and bounded aggregate
+        observability; raw prompts, reasoning, tool output, and secrets are not
+        queried.
+        """
+        value = (reference or "").strip()
+        if value.lower() in {"", "current", "this", "this workflow", "current workflow"}:
+            value = _current_thread_key()
+            if not value:
+                return {
+                    "status": "error",
+                    "error": (
+                        "no reference was supplied and CENTAUR_THREAD_KEY is unavailable; "
+                        "provide a thread_key, workflow run_id, or task_id"
+                    ),
+                }
+
+        thread_key = _NAMESPACED_THREAD_KEY_RE.search(value)
+        if thread_key:
+            return self.session_state(
+                thread_key.group(0),
+                limit=limit,
+                include_observability=include_observability,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+
+        workflow_reference = _WORKFLOW_RUN_ID_RE.search(value)
+        if workflow_reference:
+            return self.workflow_run_state(
+                workflow_reference.group(0),
+                limit=limit,
+                include_observability=include_observability,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+
+        return {
+            "status": "error",
+            "error": "reference must contain a Centaur thread_key or workflow run_id/task_id",
         }
 
     async def _search_sessions_async(
