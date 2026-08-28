@@ -677,6 +677,9 @@ githubbot:
   reviewMaxEpochs: 3
   reviewMaterialChangeLines: 200
   reviewMaterialChangeFiles: 8
+  # Exact, comma-separated GitHub logins for trusted reviewer bots whose
+  # author_association is NONE. Wildcards are rejected.
+  reviewAuthorAllowlist: ""
   reviewResetLabel: centaur-review-reset
   # Emit CI and review workflow events to api-rs.
   workflowEvents: false

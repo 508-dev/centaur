@@ -130,6 +130,7 @@ const options: GithubbotOptions = {
   reviewMaterialChangeFiles: optionalNumberEnv(
     "GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES",
   ),
+  reviewAuthorAllowlist: listEnv("GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST"),
   reviewResetLabel: optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL"),
   workflowEvents: boolEnv("GITHUBBOT_WORKFLOW_EVENTS", false),
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),

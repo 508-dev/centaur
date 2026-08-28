@@ -1,5 +1,6 @@
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
+import { isReviewAuthorAllowed } from "./authorization";
 import { backgroundWaitUntil, runExclusive } from "./context";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import {
@@ -368,7 +369,7 @@ async function retryingReviewBudgetSave(
       ctx.state.set(
         reviewBudgetKey(ctx, owner, repo, n),
         state,
-        STATE_TTL_MS,
+        state.pausedHeadSha ? undefined : STATE_TTL_MS,
       ),
   );
 }
@@ -622,6 +623,16 @@ export async function handleReviewEvent(
   const reviewer = stringValue(reviewerNode?.login);
   const reviewerKey = reviewBudgetReviewerKey(reviewerNode);
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
+  // Submitted reviews on public repositories are not collaborator-only by
+  // default. Gate before workflow emission, claims, or write-capable turns.
+  if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
+  if (!isReviewAuthorAllowed(payload, ctx.options)) {
+    logger(ctx).warn("githubbot_review_author_denied", {
+      pr: `${repo.owner}/${repo.repo}#${number}`,
+      reviewer,
+    });
+    return;
+  }
 
   // A review is tied to review.commit_id. The PR head can advance before this
   // webhook is handled, so a live PR lookup would correlate the review to the
@@ -645,8 +656,6 @@ export async function handleReviewEvent(
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
-  // Never act on the bot's own review (it shouldn't review its own PRs anyway).
-  if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
 
   const reviewClaimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-handled:${repo.owner}/${repo.repo}#${number}:${reviewId}`;
   if (
@@ -666,7 +675,7 @@ export async function handleReviewEvent(
       !(await runExclusive(
         reviewBudgetLockKey(repo.owner, repo.repo, number),
         () =>
-          consumeApprovedReviewReset(
+          recordApprovedReview(
             ctx,
             repo.owner,
             repo.repo,
@@ -1013,7 +1022,7 @@ async function cleanupReviewResetApproval(
   }
 }
 
-async function consumeApprovedReviewReset(
+async function recordApprovedReview(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
@@ -1030,7 +1039,26 @@ async function consumeApprovedReviewReset(
     pr,
     loaded.state,
   );
-  if (!approval) return true;
+  if (!approval) {
+    if (loaded.state && loaded.state.lastReviewedHeadSha !== headSha) {
+      const state = {
+        ...loaded.state,
+        automationPendingFromHeadSha: undefined,
+        lastReviewedHeadSha: headSha,
+      };
+      await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
+      traceLog(
+        ctx.options,
+        "githubbot_review_approved_head_recorded",
+        makeTrace(
+          managementThreadKey(owner, repo, pr.number),
+          `review-approved-${headSha}`,
+        ),
+        { epoch: state.epoch, head_sha: headSha },
+      );
+    }
+    return true;
+  }
   const admission = decideReviewAdmission({
     actor: "human",
     headSha,

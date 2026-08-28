@@ -207,7 +207,12 @@ describe("PR management webhooks", () => {
         action: "submitted",
         repository: { full_name: "base/repo" },
         pull_request: { number: 7 },
-        review: { id: 123, state: "approved", user: { login: "reviewer" } },
+        review: {
+          author_association: "COLLABORATOR",
+          id: 123,
+          state: "approved",
+          user: { login: "reviewer" },
+        },
       }),
     );
 
@@ -282,7 +287,12 @@ const approvedReview = (reviewId: number) =>
     action: "submitted",
     repository: { full_name: "base/repo" },
     pull_request: { number: 7 },
-    review: { id: reviewId, state: "approved", user: { login: "reviewer" } },
+    review: {
+      author_association: "COLLABORATOR",
+      id: reviewId,
+      state: "approved",
+      user: { login: "reviewer" },
+    },
   });
 
 const quietLogger = { debug() {}, warn() {}, error() {}, info() {} };
@@ -430,12 +440,14 @@ describe("bounded review epochs", () => {
       id: 101,
       login: "reviewer",
     },
+    authorAssociation = "COLLABORATOR",
   ) =>
     JSON.stringify({
       action: "submitted",
       repository: { full_name: "base/repo" },
       pull_request: { head: { sha: headSha }, number: 7 },
       review: {
+        author_association: authorAssociation,
         commit_id: headSha,
         id: reviewId,
         state: "commented",
@@ -453,6 +465,7 @@ describe("bounded review epochs", () => {
     maxTotalRoundsPerEpoch?: number;
     permission?: string;
     removedLabels?: string[];
+    reviewAuthorAllowlist?: string[];
     state?: ReturnType<typeof makeState>;
   }): PrManagerContext {
     let headSha = input?.headSha ?? "head-1";
@@ -533,6 +546,7 @@ describe("bounded review epochs", () => {
         logger: quietLogger,
         reviewMaxRoundsPerEpoch: input?.maxRoundsPerEpoch,
         reviewMaxTotalRoundsPerEpoch: input?.maxTotalRoundsPerEpoch,
+        reviewAuthorAllowlist: input?.reviewAuthorAllowlist,
       },
       state: input?.state ?? makeState(),
       userName: "centaur-bot",
@@ -550,6 +564,57 @@ describe("bounded review epochs", () => {
       headSha,
     );
   }
+
+  test("denies an untrusted public reviewer before claiming work", async () => {
+    const durableState = makeState();
+    let claimAttempts = 0;
+    const state = {
+      ...durableState,
+      async setIfNotExists(key: string, value: unknown) {
+        claimAttempts += 1;
+        return durableState.setIfNotExists(key, value);
+      },
+    };
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(
+      ctx,
+      submittedReview(
+        30,
+        "head-1",
+        { id: 999, login: "public-user" },
+        "NONE",
+      ),
+    );
+
+    expect(claimAttempts).toBe(0);
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toBeUndefined();
+  });
+
+  test("admits an exact allowlisted reviewer bot", async () => {
+    const state = makeState();
+    const ctx = budgetCtx({
+      reviewAuthorAllowlist: ["trusted-reviewer[bot]"],
+      state,
+    });
+
+    await handleReviewEvent(
+      ctx,
+      submittedReview(
+        31,
+        "head-1",
+        { id: 998, login: "trusted-reviewer[bot]" },
+        "NONE",
+      ),
+    );
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ roundsUsed: 1 });
+  });
 
   test("admits the final review round but pauses merge before its descendant", async () => {
     const comments: string[] = [];
@@ -587,6 +652,36 @@ describe("bounded review epochs", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("round_budget_exhausted");
     expect(comments[0]).toContain("centaur-review-reset");
+  });
+
+  test("stores an active handoff pause without expiration", async () => {
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      reviewerRoundsUsed: { "github-user:101": 2 },
+      roundsUsed: 2,
+      version: 1,
+    });
+    const budgetTtls: Array<number | undefined> = [];
+    const state = {
+      ...durableState,
+      async set(key: string, value: unknown, ttlMs?: number) {
+        if (key.includes(":review-budget:")) budgetTtls.push(ttlMs);
+        await durableState.set(key, value);
+      },
+    };
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(ctx, submittedReview(32, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(budgetTtls).toEqual([undefined]);
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ pausedHeadSha: "head-1" });
   });
 
   test("separates reviewer budgets while enforcing the epoch aggregate cap", async () => {
@@ -813,6 +908,85 @@ describe("bounded review epochs", () => {
     }) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
 
     await handleReviewEvent(ctx, submittedReview(8, "head-3"));
+    await drainBackgroundWork(5_000);
+
+    expect(compared).toEqual(["head-1...head-3", "head-2...head-3"]);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
+  });
+
+  test("records an approved repair head before later authorship checks", async () => {
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      reviewerRoundsUsed: { "github-user:101": 1 },
+      roundsUsed: 1,
+      version: 1,
+    });
+    const ctx = budgetCtx({ headSha: "head-2", state });
+    const compared: string[] = [];
+    ctx.octokit.rest.repos.compareCommitsWithBasehead = (async (request: {
+      basehead: string;
+    }) => {
+      compared.push(request.basehead);
+      const latestRange = request.basehead === "head-2...head-3";
+      const humanCommit = {
+        author: { login: "alice", type: "User" },
+        commit: { message: "material human revision" },
+      };
+      return {
+        data: {
+          commits: latestRange
+            ? [humanCommit]
+            : [
+                {
+                  author: { login: "centaur-bot", type: "Bot" },
+                  commit: {
+                    message: "review fix\n\nCentaur-Automation: true",
+                  },
+                },
+                humanCommit,
+              ],
+          files: [
+            {
+              additions: 5,
+              changes: 5,
+              deletions: 0,
+              filename: "src/authorization.ts",
+              status: "modified",
+            },
+          ],
+          status: "ahead",
+          total_commits: latestRange ? 1 : 2,
+        },
+      };
+    }) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
+
+    await handleReviewEvent(
+      ctx,
+      JSON.stringify({
+        action: "submitted",
+        pull_request: { head: { sha: "head-2" }, number: 7 },
+        repository: { full_name: "base/repo" },
+        review: {
+          author_association: "COLLABORATOR",
+          commit_id: "head-2",
+          id: 33,
+          state: "approved",
+          user: { id: 101, login: "reviewer" },
+        },
+      }),
+    );
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ lastReviewedHeadSha: "head-2" });
+
+    setHeadSha(ctx, "head-3");
+    await handleReviewEvent(ctx, submittedReview(34, "head-3"));
     await drainBackgroundWork(5_000);
 
     expect(compared).toEqual(["head-1...head-3", "head-2...head-3"]);
@@ -1305,6 +1479,7 @@ describe("bounded review epochs", () => {
       pull_request: { head: { sha: "head-4" }, number: 7 },
       repository: { full_name: "base/repo" },
       review: {
+        author_association: "COLLABORATOR",
         commit_id: "head-4",
         id: 14,
         state: "approved",
@@ -1443,6 +1618,7 @@ describe("bounded review epochs", () => {
         pull_request: { head: { sha: "head-1" }, number: 7 },
         repository: { full_name: "base/repo" },
         review: {
+          author_association: "COLLABORATOR",
           commit_id: "head-1",
           id: 17,
           state: "approved",
@@ -1484,6 +1660,7 @@ describe("bounded review epochs", () => {
         pull_request: { head: { sha: "head-4" }, number: 7 },
         repository: { full_name: "base/repo" },
         review: {
+          author_association: "COLLABORATOR",
           commit_id: "head-4",
           id: 9,
           state: "approved",
@@ -1568,6 +1745,7 @@ describe("bounded review epochs", () => {
         pull_request: { head: { sha: "head-4" }, number: 7 },
         repository: { full_name: "base/repo" },
         review: {
+          author_association: "COLLABORATOR",
           commit_id: "head-4",
           id: 10,
           state: "approved",
@@ -1907,6 +2085,28 @@ describe("workflow event emission", () => {
     expect(emits.length).toBe(0);
   });
 
+  test("does not emit a workflow event for an untrusted public review", async () => {
+    const emits: EmitCall[] = [];
+    await handleReviewEvent(
+      emitCtx(emits),
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: {
+          author_association: "NONE",
+          commit_id: "reviewed-public",
+          id: 122,
+          state: "commented",
+          user: { login: "public-user" },
+        },
+      }),
+    );
+    await drainBackgroundWork(1_000);
+
+    expect(emits).toEqual([]);
+  });
+
   test("emits review-submitted keyed by PR, head sha, and reviewer", async () => {
     const emits: EmitCall[] = [];
     await handleReviewEvent(
@@ -1916,6 +2116,7 @@ describe("workflow event emission", () => {
         repository: { full_name: "base/repo" },
         pull_request: { number: 7 },
         review: {
+          author_association: "COLLABORATOR",
           commit_id: "reviewed456",
           id: 123,
           state: "commented",
@@ -1939,7 +2140,13 @@ describe("workflow event emission", () => {
         action: "submitted",
         repository: { full_name: "base/repo" },
         pull_request: { number: 7 },
-        review: { commit_id: "abc123", id, state: "commented", user: { login } },
+        review: {
+          author_association: "COLLABORATOR",
+          commit_id: "abc123",
+          id,
+          state: "commented",
+          user: { login },
+        },
       });
     const ctx = emitCtx(emits);
     await handleReviewEvent(ctx, submittedReview(125, "human-reviewer"));
@@ -1966,6 +2173,7 @@ describe("workflow event emission", () => {
         repository: { full_name: "base/repo" },
         pull_request: { number: 7 },
         review: {
+          author_association: "COLLABORATOR",
           commit_id: "abc123",
           id: 127,
           state: "commented",
@@ -2054,6 +2262,7 @@ describe("management turn reaction ack", () => {
       repository: { full_name: "base/repo" },
       pull_request: { number: 7 },
       review: {
+        author_association: "COLLABORATOR",
         id: 55,
         node_id: nodeId,
         state,

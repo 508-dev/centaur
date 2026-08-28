@@ -113,6 +113,10 @@ spec:
               value: {{ .Values.githubbot.reviewMaterialChangeLines | quote }}
             - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES
               value: {{ .Values.githubbot.reviewMaterialChangeFiles | quote }}
+{{- if .Values.githubbot.reviewAuthorAllowlist }}
+            - name: GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST
+              value: {{ .Values.githubbot.reviewAuthorAllowlist | quote }}
+{{- end }}
             - name: GITHUBBOT_REVIEW_RESET_LABEL
               value: {{ .Values.githubbot.reviewResetLabel | quote }}
             - name: GITHUBBOT_WORKFLOW_EVENTS

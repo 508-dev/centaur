@@ -154,6 +154,8 @@ export type GithubbotOptions = {
   reviewMaterialChangeLines?: number;
   /** Cumulative changed runtime files that make a review change material. Default 8. */
   reviewMaterialChangeFiles?: number;
+  /** Exact GitHub logins for trusted reviewer bots whose association is NONE. */
+  reviewAuthorAllowlist?: readonly string[];
   /** Write-authorized human label that explicitly starts another review epoch. */
   reviewResetLabel?: string;
   /** Delay before confirming a settled-green rollup. Default 15000ms. */

@@ -81,7 +81,10 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   turn that reads all the feedback, validates each finding against reachable code
   and enforced contracts, makes one minimal coherent commit, replies on each thread, resolves what
   it addressed, and re-requests review only when code changed. Finding validation is prompt-level;
-  the loop limit and epoch transitions below are deterministic controller decisions.
+  the loop limit and epoch transitions below are deterministic controller decisions. Review authors
+  must currently be an owner, organization member, or repository collaborator. Reviewer bots whose
+  GitHub association is `NONE` require an exact login in `GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST`;
+  wildcards are rejected.
 - **Bound review loops.** Each reviewer is limited to three rounds per epoch by default: the first
   broad review plus two repair-validation rounds. Reviewer budgets use the stable GitHub user ID
   when available (with a normalized-login fallback), so one review bot cannot consume another's
@@ -97,13 +100,16 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   authorized transition clears the handoff; an already-running repair cannot push around the pause.
   Only while that handoff pause is active, a non-bot collaborator with write/admin
   permission can continue by adding the
-  `centaur-review-reset` label and re-requests review. The approval is pinned to the current head,
+  `centaur-review-reset` label and re-requesting review. The approval is pinned to the current head,
   consumed in the same durable write that advances the epoch, and the label is removed. Rejected
   reset labels are also removed so a later authorized human can retry the documented flow. Create
   that label in each managed repository before use. An approval-only reset may merge even when a
   round cap is one; unlike a commented or changes-requested review, it does not start a repair turn
   that needs a final-round handoff. Handoff notices are keyed to the original paused head, so a
   descendant review retries a failed notice without duplicating one that already succeeded.
+  Approved repair heads are recorded under the same per-PR lock even when draft, CI, or a hold
+  prevents immediate merge, preserving the correct authorship boundary for the next review. Active
+  handoff pauses are stored without expiry; ordinary in-progress budget state retains its 90-day TTL.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
@@ -193,6 +199,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_REVIEW_MAX_EPOCHS` | — | Material human-change epochs before explicit continuation is required. Default 3. |
 | `GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES` | — | Cumulative changed runtime lines that start a new epoch for a human change. Default 200. |
 | `GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES` | — | Cumulative changed runtime files that start a new epoch for a human change. Default 8. |
+| `GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST` | — | Comma-separated exact GitHub logins for trusted reviewer bots whose `author_association` is `NONE`. Empty by default; wildcards are rejected. Collaborator/organization/owner reviews are allowed without listing. |
 | `GITHUBBOT_REVIEW_RESET_LABEL` | — | One-shot, write-authorized human continuation label. Default `centaur-review-reset`. |
 | `GITHUBBOT_WORKFLOW_EVENTS` | — | Emit settled CI and submitted-review events to durable workflows. Default `false`. |
 | `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
