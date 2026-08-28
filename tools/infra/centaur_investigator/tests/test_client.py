@@ -103,10 +103,10 @@ class _FakeConnection:
         if "current_setting('role'" in query:
             return {
                 "session_user": "centaur",
-                "current_user": "centaur_readonly",
-                "active_role": "centaur_readonly",
+                "current_user": "centaur_diagnostics_reader",
+                "active_role": "centaur_diagnostics_reader",
             }
-        if "FROM slack_sync_channels" in query:
+        if "FROM centaur_diagnostics.slack_sync_channels" in query:
             return {
                 "channel_id": "C123",
                 "channel_name": "eng",
@@ -117,7 +117,7 @@ class _FakeConnection:
                 "last_seen_at": self.now,
                 "updated_at": self.now,
             }
-        if "FROM slack_sync_checkpoints" in query:
+        if "FROM centaur_diagnostics.slack_sync_checkpoints" in query:
             return {
                 "channel_id": "C123",
                 "watermark_ts": "1778000000.000000",
@@ -131,7 +131,7 @@ class _FakeConnection:
 
     async def fetch(self, query: str, *args):
         self.fetch_calls.append((query, args))
-        if "FROM sessions" in query and "BETWEEN" not in query:
+        if "FROM centaur_diagnostics.sessions" in query and "BETWEEN" not in query:
             return [
                 {
                     "thread_key": "slack:C123:1777910337.403889",
@@ -147,7 +147,7 @@ class _FakeConnection:
                     "updated_at": self.now,
                 }
             ]
-        if "FROM session_executions" in query:
+        if "FROM centaur_diagnostics.session_executions" in query:
             return [
                 {
                     "execution_id": "exe_1",
@@ -164,7 +164,7 @@ class _FakeConnection:
                     "duration_seconds": 42.0,
                 }
             ]
-        if "FROM centaur_readonly_workflow_runs" in query:
+        if "FROM centaur_diagnostics.workflow_runs" in query:
             reference = args[0] if args else ""
             if isinstance(reference, list) and not reference:
                 return []
@@ -189,7 +189,7 @@ class _FakeConnection:
                     "cancelled_at": None,
                 }
             ]
-        if "FROM session_messages" in query:
+        if "FROM centaur_diagnostics.session_messages" in query:
             return [
                 {
                     "message_id": "msg_1",
@@ -202,7 +202,7 @@ class _FakeConnection:
                     "created_at": self.now,
                 }
             ]
-        if "FROM session_events" in query:
+        if "FROM centaur_diagnostics.session_events" in query:
             return [
                 {
                     "event_id": 1,
@@ -215,7 +215,7 @@ class _FakeConnection:
                     "created_at": self.now,
                 }
             ]
-        if "FROM slack_sync_messages" in query:
+        if "FROM centaur_diagnostics.slack_sync_messages" in query:
             return [
                 {
                     "channel_id": "C123",
@@ -228,13 +228,12 @@ class _FakeConnection:
                     "updated_at": self.now,
                 }
             ]
-        if "FROM slack_sync_message_attachments" in query:
+        if "FROM centaur_diagnostics.slack_sync_message_attachments" in query:
             return [
                 {
                     "channel_id": "C123",
                     "message_ts": "1777910337.403889",
                     "slack_file_id": "F123",
-                    "name": "debug.log",
                     "mimetype": "text/plain",
                     "size_bytes": 100,
                     "download_status": "metadata_only",
@@ -242,19 +241,19 @@ class _FakeConnection:
                     "updated_at": self.now,
                 }
             ]
-        if "FROM slack_sync_backfill_jobs" in query:
+        if "FROM centaur_diagnostics.slack_sync_backfill_jobs" in query:
             return []
-        if "FROM slack_sync_runs" in query:
+        if "FROM centaur_diagnostics.slack_sync_runs" in query:
             return []
-        if "FROM sessions" in query and "BETWEEN" in query:
+        if "FROM centaur_diagnostics.sessions" in query and "BETWEEN" in query:
             return []
-        if "FROM agent_runtime_assignments" in query:
+        if "FROM centaur_diagnostics.agent_runtime_assignments" in query:
             raise RuntimeError("relation does not exist")
-        if "FROM agent_execution_requests" in query:
+        if "FROM centaur_diagnostics.agent_execution_requests" in query:
             raise RuntimeError("relation does not exist")
-        if "FROM sandbox_sessions" in query:
+        if "FROM centaur_diagnostics.sandbox_sessions" in query:
             raise RuntimeError("relation does not exist")
-        if "FROM thread_traces" in query:
+        if "FROM centaur_diagnostics.thread_traces" in query:
             raise RuntimeError("relation does not exist")
         return []
 
@@ -264,7 +263,7 @@ class _FakeConnection:
 
 class _RetriedWorkflowConnection(_FakeConnection):
     async def fetch(self, query: str, *args):
-        if "FROM centaur_readonly_workflow_runs" in query:
+        if "FROM centaur_diagnostics.workflow_runs" in query:
             self.fetch_calls.append((query, args))
             reference = args[0] if args else ""
             if reference == HISTORICAL_WORKFLOW_RUN_ID:
@@ -290,7 +289,7 @@ class _RetriedWorkflowConnection(_FakeConnection):
                     "cancelled_at": None,
                 }
             ]
-        if "FROM session_executions" in query:
+        if "FROM centaur_diagnostics.session_executions" in query:
             self.fetch_calls.append((query, args))
             run_ids = set(args[0])
             task_ids = set(args[1])
@@ -366,7 +365,7 @@ def test_parse_slack_thread_key_with_team() -> None:
     ]
 
 
-def test_investigation_queries_readonly_tables_without_message_context(monkeypatch) -> None:
+def test_investigation_queries_diagnostics_views_without_message_context(monkeypatch) -> None:
     fake = _FakeConnection()
 
     async def fake_connect(*args, **kwargs):
@@ -381,18 +380,25 @@ def test_investigation_queries_readonly_tables_without_message_context(monkeypat
 
     assert result["status"] == "ok"
     assert result["postgres"]["status"] == "ok"
-    assert result["postgres"]["role"] == "centaur_readonly"
-    assert result["postgres"]["connection"]["row"]["current_user"] == "centaur_readonly"
-    assert result["analysis"]["primary_source"] == "postgres_readonly_tables"
+    assert result["postgres"]["role"] == "centaur_diagnostics_reader"
+    assert (
+        result["postgres"]["connection"]["row"]["current_user"]
+        == "centaur_diagnostics_reader"
+    )
+    assert result["analysis"]["primary_source"] == "postgres_diagnostics_views"
     assert fake.execute_calls == []
     assert fake.closed is True
 
     all_queries = "\n".join(query for query, _args in fake.fetch_calls + fake.fetchrow_calls)
     assert "SELECT *" not in all_queries
-    assert "FROM sessions" in all_queries
-    assert "FROM session_messages" in all_queries
-    assert "FROM slack_sync_messages" in all_queries
-    assert "FROM centaur_readonly_workflow_runs" in all_queries
+    assert "FROM centaur_diagnostics.sessions" in all_queries
+    assert "FROM centaur_diagnostics.session_messages" in all_queries
+    assert "FROM centaur_diagnostics.slack_sync_messages" in all_queries
+    assert "FROM centaur_diagnostics.workflow_runs" in all_queries
+    assert "FROM public." not in all_queries
+    assert "metadata ->>" not in all_queries
+    assert "payload_json" not in all_queries
+    assert "jsonb_typeof(parts)" not in all_queries
 
     assert "raw_payload" not in str(result)
     assert "url_private" not in str(result)
@@ -413,12 +419,12 @@ def test_diagnose_defaults_to_current_discord_thread(monkeypatch) -> None:
 
     assert result["status"] == "ok"
     assert result["parsed"]["thread_key"] == "discord:111:222:333"
-    assert result["postgres"]["role"] == "centaur_readonly"
+    assert result["postgres"]["role"] == "centaur_diagnostics_reader"
     assert result["postgres"]["workflow_runs"]["rows"][0]["run_id"] == WORKFLOW_RUN_ID
     assert fake.closed is True
 
 
-def test_diagnose_workflow_run_uses_sanitized_readonly_view(monkeypatch) -> None:
+def test_diagnose_workflow_run_uses_sanitized_diagnostics_view(monkeypatch) -> None:
     fake = _FakeConnection()
 
     async def fake_connect(*args, **kwargs):
@@ -434,14 +440,15 @@ def test_diagnose_workflow_run_uses_sanitized_readonly_view(monkeypatch) -> None
     assert result["status"] == "ok"
     assert result["kind"] == "workflow_run"
     assert result["analysis"]["outcome"] == "failed"
-    assert result["postgres"]["role"] == "centaur_readonly"
+    assert result["postgres"]["role"] == "centaur_diagnostics_reader"
     assert result["workflow_run_ids"] == [WORKFLOW_RUN_ID]
     assert "failure_reason" not in str(result)
     assert "raw_payload" not in str(result)
     assert "secret user message" not in str(result)
 
     all_queries = "\n".join(query for query, _args in fake.fetch_calls)
-    assert "FROM centaur_readonly_workflow_runs" in all_queries
+    assert "FROM centaur_diagnostics.workflow_runs" in all_queries
+    assert "FROM public." not in all_queries
     assert "SELECT *" not in all_queries
     assert fake.execute_calls == []
     assert fake.closed is True
@@ -476,6 +483,34 @@ def test_diagnose_historical_attempt_recovers_latest_retry_state(monkeypatch) ->
     assert "ORDER BY event_id DESC" in all_queries
     assert "ORDER BY event_id ASC" not in all_queries
     assert fake.closed is True
+
+
+def test_workflow_summary_treats_pending_retry_with_history_as_queued() -> None:
+    historical_start = dt.datetime(2026, 6, 17, 11, 0, tzinfo=dt.UTC)
+    summary = CentaurInvestigatorClient._summarize_workflow_run(
+        workflow_runs={
+            "rows": [
+                {
+                    "queue_name": "centaur_workflows",
+                    "run_id": "retry_run",
+                    "task_id": "retry_task",
+                    "task_name": "workflow_task",
+                    "state": "pending",
+                    "attempts": 1,
+                    "max_attempts": 3,
+                    "first_started_at": historical_start.isoformat(),
+                    "started_at": None,
+                    "failed_at": historical_start.isoformat(),
+                    "claimed": False,
+                }
+            ]
+        },
+        executions={"rows": []},
+        events={"rows": []},
+    )
+
+    assert summary["outcome"] == "queued"
+    assert "available worker" in summary["next_checks"][0]
 
 
 def test_diagnose_without_reference_or_current_thread_fails_closed(monkeypatch) -> None:

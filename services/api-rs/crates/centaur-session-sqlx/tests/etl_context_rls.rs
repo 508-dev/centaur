@@ -84,6 +84,15 @@ async fn company_context_reader_role_has_narrow_security_surface() -> Result<(),
 }
 
 #[tokio::test]
+async fn centaur_diagnostics_reader_exposes_only_sanitized_views() -> Result<(), Box<dyn Error>> {
+    let Some(mut fixture) = RlsTestFixture::create().await? else {
+        return Ok(());
+    };
+    let result = assert_centaur_diagnostics_reader_security(&mut fixture.conn).await;
+    fixture.finish(result).await
+}
+
+#[tokio::test]
 async fn company_context_reader_preserves_scoped_search_behavior() -> Result<(), Box<dyn Error>> {
     let Some(mut fixture) = RlsTestFixture::create().await? else {
         return Ok(());
@@ -331,6 +340,140 @@ async fn assert_multiterm_granola_keyword_scope(
         vec!["granola:note:granola_note_other"]
     );
     Ok(())
+}
+
+async fn assert_centaur_diagnostics_reader_security(
+    conn: &mut PgConnection,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::raw_sql(
+        r#"
+        insert into sessions
+            (thread_key, harness_type, status, metadata)
+        values
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'codex',
+                'idle',
+                '{"source":"discord","platform":"discord","thread_id":"test-thread"}'
+            );
+
+        insert into session_messages
+            (message_id, thread_key, role, parts, metadata)
+        values
+            (
+                'msg_diagnostics',
+                'discord:test-guild:test-channel:test-thread',
+                'user',
+                '[{"type":"text","text":"diagnostic-secret"}]',
+                '{"source":"discord","platform":"discord","user_id":"test-user"}'
+            );
+
+        insert into session_executions
+            (execution_id, thread_key, status, metadata, error, started_at, completed_at)
+        values
+            (
+                'exe_diagnostics',
+                'discord:test-guild:test-channel:test-thread',
+                'failed',
+                '{"model":"test-model","workflow_name":"test-workflow"}',
+                'diagnostic-secret',
+                now() - interval '1 minute',
+                now()
+            );
+
+        insert into session_events
+            (thread_key, execution_id, event_type, payload)
+        values
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'exe_diagnostics',
+                'session.execution_failed',
+                '{"type":"result","status":"failed","error":"diagnostic-secret","terminal_reason":"diagnostic-secret"}'
+            );
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    conn.execute("set role centaur_diagnostics_reader").await?;
+
+    let current_user: String = sqlx::query_scalar("select current_user::text")
+        .fetch_one(&mut *conn)
+        .await?;
+    let message_shape: (i32, serde_json::Value) = sqlx::query_as(
+        "select part_count, part_types from centaur_diagnostics.session_messages \
+         where message_id = 'msg_diagnostics'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let execution_shape: (bool, Option<i32>) = sqlx::query_as(
+        "select has_error, error_length from centaur_diagnostics.session_executions \
+         where execution_id = 'exe_diagnostics'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let event_shape: (bool, Option<i32>, serde_json::Value) = sqlx::query_as(
+        "select has_error, error_length, payload_keys \
+         from centaur_diagnostics.session_events \
+         where execution_id = 'exe_diagnostics'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let broad_role_member: bool =
+        sqlx::query_scalar("select pg_has_role(current_user, 'centaur_readonly', 'member')")
+            .fetch_one(&mut *conn)
+            .await?;
+    let role_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, \
+         rolreplication, rolbypassrls from pg_roles where rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let raw_message = sqlx::query("select parts from public.session_messages limit 1")
+        .fetch_optional(&mut *conn)
+        .await;
+    let raw_event = sqlx::query("select payload from public.session_events limit 1")
+        .fetch_optional(&mut *conn)
+        .await;
+    let hidden_message_parts =
+        sqlx::query("select parts from centaur_diagnostics.session_messages limit 1")
+            .fetch_optional(&mut *conn)
+            .await;
+    let hidden_event_payload =
+        sqlx::query("select payload from centaur_diagnostics.session_events limit 1")
+            .fetch_optional(&mut *conn)
+            .await;
+
+    conn.execute("reset role").await?;
+
+    assert_eq!(current_user, "centaur_diagnostics_reader");
+    assert_eq!(message_shape.0, 1);
+    assert_eq!(message_shape.1, serde_json::json!(["text"]));
+    assert_eq!(execution_shape, (true, Some(17)));
+    assert!(event_shape.0);
+    assert_eq!(event_shape.1, Some(17));
+    assert_eq!(
+        event_shape.2,
+        serde_json::json!(["error", "status", "terminal_reason", "type"])
+    );
+    assert!(!broad_role_member);
+    assert_eq!(
+        role_attributes,
+        (false, false, false, false, false, false, false)
+    );
+    assert_database_error_code(raw_message, "42501");
+    assert_database_error_code(raw_event, "42501");
+    assert_database_error_code(hidden_message_parts, "42703");
+    assert_database_error_code(hidden_event_payload, "42703");
+    Ok(())
+}
+
+fn assert_database_error_code<T>(result: Result<T, sqlx::Error>, expected: &str) {
+    let Err(sqlx::Error::Database(error)) = result else {
+        panic!("expected database error with SQLSTATE {expected}");
+    };
+    assert_eq!(error.code().as_deref(), Some(expected));
 }
 
 fn test_database_url() -> Option<String> {
