@@ -11,3 +11,8 @@ patchedDependencies:
   '@chat-adapter/discord@4.31.0': patches/@chat-adapter__discord@4.31.0.patch
   '@chat-adapter/slack@4.31.0': patches/@chat-adapter__slack@4.31.0.patch
   '@chat-adapter/state-pg@4.31.0': patches/@chat-adapter__state-pg@4.31.0.patch
+
+overrides:
+  nanoid: 3.3.18
+  postcss: 8.5.18
+  undici: 6.28.0

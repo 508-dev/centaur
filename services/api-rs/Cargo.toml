@@ -38,8 +38,8 @@ anyhow = "1"
 async-trait = "0.1"
 absurd-sdk = { path = "crates/absurd-sdk" }
 axum = "0.8.9"
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
 bytes = { version = "1", features = ["serde"] }
 centaur-api-server = { path = "crates/centaur-api-server" }

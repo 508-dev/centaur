@@ -1102,6 +1102,17 @@ describe("discordbot", () => {
     ]);
     expect(answerPostsIn(threadId).join("\n")).toContain("Recovered request.");
 
+    await waitForAsync(async () => {
+      const state = await sharedState.get<Record<string, unknown>>(
+        `thread-state:${key}`,
+      );
+      return (
+        state?.activeExecution === false &&
+        typeof state.lastEventId === "number" &&
+        state.renderObligation === null
+      );
+    });
+
     const recoveredThreadState = await sharedState.get<Record<string, unknown>>(
       `thread-state:${key}`,
     );
@@ -2639,6 +2650,18 @@ async function waitFor(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
+}
+
+async function waitForAsync(
+  predicate: () => Promise<boolean>,
+  timeoutMs = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await sleep(10);
+  }
+  throw new Error("Timed out waiting for async condition");
 }
 
 async function sleep(ms: number): Promise<void> {
