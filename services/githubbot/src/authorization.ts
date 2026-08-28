@@ -23,6 +23,57 @@ export const DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS = [
 
 const ALLOW_ALL = "*";
 
+/** Pull the canonical owner/repository name out of a GitHub webhook payload. */
+export function repositoryFullNameFromRaw(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const repository = (raw as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return undefined;
+  const value = (repository as { full_name?: unknown }).full_name;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** Normalize an exact repository allowlist without supporting wildcards. */
+export function resolveRepositoryAllowlist(
+  configured: readonly string[] | undefined,
+): string[] {
+  return (configured ?? [])
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => {
+      const segments = entry.split("/");
+      return (
+        segments.length === 2 &&
+        segments.every(Boolean) &&
+        !entry.includes("*") &&
+        !/\s/.test(entry)
+      );
+    });
+}
+
+/** Normalize startup policy and reject an inert or wildcard-only allowlist. */
+export function requireRepositoryAllowlist(
+  configured: readonly string[] | undefined,
+): string[] {
+  const repositories = resolveRepositoryAllowlist(configured);
+  if (!repositories.length) {
+    throw new Error(
+      "GITHUBBOT_REPOSITORY_ALLOWLIST must contain at least one exact owner/repository",
+    );
+  }
+  return repositories;
+}
+
+/** Whether a webhook targets an explicitly configured repository. */
+export function isRepositoryAllowed(
+  raw: unknown,
+  options: Pick<GithubbotOptions, "repositoryAllowlist">,
+): boolean {
+  const repository = repositoryFullNameFromRaw(raw)?.toLowerCase();
+  if (!repository) return false;
+  return resolveRepositoryAllowlist(options.repositoryAllowlist).includes(
+    repository,
+  );
+}
+
 /** Pull `author_association` out of the adapter's raw comment message. */
 export function authorAssociationFromRaw(raw: unknown): string | undefined {
   if (!raw || typeof raw !== "object") return undefined;

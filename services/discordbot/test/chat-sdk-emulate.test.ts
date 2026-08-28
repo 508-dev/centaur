@@ -49,6 +49,7 @@ const USER_ID = "100000000000000001";
 const TRIGGER_BOT_ID = "400000000000000001";
 const GUILD_ID = "200000000000000001";
 const CHANNEL_ID = "300000000000000001";
+const TRIGGER_ROLE_ID = "500000000000000001";
 const PUBLIC_KEY = "a".repeat(64);
 
 let discordApi: FakeDiscordApi;
@@ -1300,7 +1301,7 @@ describe("discordbot", () => {
     ).toBe(false);
   });
 
-  it("keeps fail-closed guild and trigger-bot allowlist behavior", async () => {
+  it("keeps fail-closed guild, channel, role, and trigger-bot behavior", async () => {
     // A mention from a non-allowlisted guild is dropped before any mutation.
     await dispatchMessage({
       channelId: CHANNEL_ID,
@@ -1313,6 +1314,31 @@ describe("discordbot", () => {
       discordApi.calls.some((call) => call.path.endsWith("/threads")),
     ).toBe(false);
     expect(codexApi.creates).toHaveLength(0);
+    expect(codexApi.executes).toHaveLength(0);
+
+    // A human without an allowlisted role is rejected before thread creation.
+    await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> without the required role`,
+      mention: true,
+      roleIds: [],
+    });
+    await sleep(50);
+    expect(
+      discordApi.calls.some((call) => call.path.endsWith("/threads")),
+    ).toBe(false);
+    expect(codexApi.executes).toHaveLength(0);
+
+    // A role-authorized human in another channel is also rejected pre-thread.
+    await dispatchMessage({
+      channelId: "300000000000000099",
+      content: `<@${APP_ID}> from another channel`,
+      mention: true,
+    });
+    await sleep(50);
+    expect(
+      discordApi.calls.some((call) => call.path.endsWith("/threads")),
+    ).toBe(false);
     expect(codexApi.executes).toHaveLength(0);
 
     // A bot-authored mention is ignored unless the bot is allowlisted.
@@ -1343,6 +1369,18 @@ describe("discordbot", () => {
     });
     await waitForSettle(allowedThreadId, allowedBotMentionId);
     expect(codexApi.executes).toHaveLength(1);
+
+    // Follow-ups are re-authorized; removing the human role blocks new context
+    // even inside an already-active thread.
+    const appendCount = codexApi.appends.length;
+    await dispatchMessage({
+      channelId: allowedThreadId,
+      content: "unauthorized follow-up",
+      roleIds: [],
+      thread: { id: allowedThreadId, parentId: CHANNEL_ID },
+    });
+    await sleep(50);
+    expect(codexApi.appends).toHaveLength(appendCount);
   });
 });
 
@@ -1353,10 +1391,12 @@ function createTestBot(overrides: Partial<DiscordbotOptions> = {}): Discordbot {
     applicationId: APP_ID,
     botToken: BOT_TOKEN,
     discordApiUrl: discordApi.url,
+    channelAllowlist: [CHANNEL_ID],
     guildAllowlist: [GUILD_ID],
     publicKey: PUBLIC_KEY,
     recoverRenderObligationsOnStart: false,
     state: createMemoryState(),
+    triggerRoleAllowlist: [TRIGGER_ROLE_ID],
     ...overrides,
   });
 }
@@ -1379,6 +1419,7 @@ async function dispatchMessage(input: {
   content: string;
   guildId?: string;
   mention?: boolean;
+  roleIds?: string[];
   thread?: { id: string; parentId: string };
 }): Promise<string> {
   const raw = discordApi.seedRawMessage(input.channelId, {
@@ -1394,6 +1435,7 @@ async function dispatchMessage(input: {
   const data: Record<string, unknown> = {
     ...raw,
     guild_id: input.guildId ?? GUILD_ID,
+    member: { roles: input.roleIds ?? [TRIGGER_ROLE_ID] },
     mention_roles: [],
     mentions: input.mention ? [{ id: APP_ID }] : [],
     ...(input.thread

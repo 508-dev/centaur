@@ -97,6 +97,11 @@ export type DiscordbotOptions = {
   botToken: string;
   discordApiUrl?: string;
   fetch?: DiscordbotFetch;
+  /**
+   * Parent channel ids allowed to start or continue agent turns. Empty or
+   * unset is fail-closed so a guild-wide bot cannot be activated accidentally.
+   */
+  channelAllowlist?: readonly string[];
   guildAllowlist?: readonly string[];
   idleTimeoutMs?: number;
   /** Liveness probe for `/health`; reflects the Gateway connection state. */
@@ -119,6 +124,11 @@ export type DiscordbotOptions = {
    * whose messages may trigger/append despite being bot-authored.
    */
   triggerBotAllowlist?: readonly string[];
+  /**
+   * Discord role ids allowed to start or continue human-authored turns.
+   * Numeric ids are used instead of mutable role names.
+   */
+  triggerRoleAllowlist?: readonly string[];
   userName?: string;
 };
 

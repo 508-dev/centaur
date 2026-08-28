@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
 
@@ -129,6 +130,9 @@ const options: GithubbotOptions = {
   reviewPrompt,
   issuePrompt,
   managementPrompt,
+  repositoryAllowlist: requireRepositoryAllowlist(
+    listEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
+  ),
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
   userName,

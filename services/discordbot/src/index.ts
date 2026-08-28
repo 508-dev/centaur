@@ -18,9 +18,10 @@ import {
 import { Hono } from "hono";
 import pg from "pg";
 import {
+  discordIngressDenialReason,
   isAllowedDiscordGuild,
   isAllowedDiscordMessage,
-  isGuildAllowlistEmpty,
+  isDiscordIngressAllowlistEmpty,
   parseDiscordThreadKey,
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
@@ -175,9 +176,9 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
 
-  if (isGuildAllowlistEmpty(options)) {
-    logger.warn("discordbot_guild_allowlist_empty_inert", {
-      hint: "Set DISCORDBOT_GUILD_ALLOWLIST; the bot ignores all messages until configured.",
+  if (isDiscordIngressAllowlistEmpty(options)) {
+    logger.warn("discordbot_ingress_allowlist_incomplete_inert", {
+      hint: "Set DISCORDBOT_GUILD_ALLOWLIST, DISCORDBOT_CHANNEL_ALLOWLIST, and DISCORDBOT_TRIGGER_ROLE_ALLOWLIST; human messages are ignored until all three are configured.",
     });
   }
 
@@ -190,12 +191,29 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     userName,
     logger,
     // Discord delta (patched adapter): gate mentions BEFORE the adapter
-    // creates a public thread — a mention rejected by the fail-closed guild
-    // allowlist must not mutate the server (no orphan threads in
-    // non-allowlisted guilds). The full message gate (isAllowedDiscordMessage)
-    // still runs in the handlers below.
-    shouldHandleMention: ({ guildId }) =>
-      isAllowedDiscordGuild(guildId, options),
+    // creates a public thread. The full gate still runs in the handlers below
+    // so every follow-up is re-authorized as well.
+    shouldHandleMention: ({
+      authorId,
+      authorIsBot,
+      channelId,
+      guildId,
+      roleIds,
+    }) => {
+      const denialReason = discordIngressDenialReason(
+        { authorIsBot, channelId, guildId, roleIds },
+        options,
+      );
+      if (denialReason) {
+        logger.warn("discordbot_mention_rejected_before_thread", {
+          channel_id: channelId,
+          guild_id: guildId,
+          reason: denialReason,
+          user_id: authorId,
+        });
+      }
+      return denialReason === undefined;
+    },
     // Discord delta (patched adapter): the gateway drops bot-authored
     // messages by default; forward only allowlisted trigger bots in
     // allowlisted guilds. The allowlist entry must be the id the message is
