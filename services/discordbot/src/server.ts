@@ -38,6 +38,7 @@ const options: DiscordbotOptions = {
   applicationId,
   botToken,
   publicKey,
+  channelAllowlist: optionalList("DISCORDBOT_CHANNEL_ALLOWLIST"),
   discordApiUrl: optionalEnv("DISCORD_API_URL"),
   guildAllowlist: optionalList("DISCORDBOT_GUILD_ALLOWLIST"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
@@ -51,6 +52,7 @@ const options: DiscordbotOptions = {
   postgresUrl,
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
   triggerBotAllowlist: optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST"),
+  triggerRoleAllowlist: optionalList("DISCORDBOT_TRIGGER_ROLE_ALLOWLIST"),
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),
   logger: consoleLogger,
 };

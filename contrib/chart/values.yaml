@@ -680,6 +680,9 @@ githubbot:
   # address-review) — the riskiest autonomous surface. Same delivery as the
   # review/issue prompts (ConfigMap + mounted file). Empty = built-in preamble only.
   managementPrompt: ""
+  # Exact, comma-separated owner/repository names whose signed webhooks may
+  # reach the bot. Required when enabled; wildcards are rejected.
+  repositoryAllowlist: ""
   # GitHub author_association values allowed to drive the comment-mention path.
   # Empty = the bot's safe default (OWNER, MEMBER, COLLABORATOR). Use "*" to allow
   # everyone (e.g. a fully-private repo). Comma-separated.
@@ -692,7 +695,7 @@ githubbot:
 
 # Discord chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over a
 # persistent Discord Gateway connection. Off by default; needs a Discord app + Message Content
-# Intent + a guild allowlist. Always exactly one replica (singleton Gateway session).
+# Intent + guild/channel/role allowlists. Always exactly one replica (singleton Gateway session).
 discordbot:
   enabled: false
   image:
@@ -702,6 +705,11 @@ discordbot:
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
   guildAllowlist: ""
+  # Comma/space-separated parent channel IDs. Required and fail-closed.
+  channelAllowlist: ""
+  # Comma/space-separated immutable role IDs allowed to trigger/continue human turns.
+  # Required and fail-closed. Role names are never used for authorization.
+  triggerRoleAllowlist: ""
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.

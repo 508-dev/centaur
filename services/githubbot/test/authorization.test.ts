@@ -3,7 +3,10 @@ import {
   authorAssociationFromRaw,
   DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS,
   isCommentAuthorAllowed,
+  isRepositoryAllowed,
+  repositoryFullNameFromRaw,
   resolveAllowedAuthorAssociations,
+  resolveRepositoryAllowlist,
 } from "../src/authorization";
 
 function raw(association: unknown): unknown {
@@ -74,5 +77,45 @@ describe("isCommentAuthorAllowed", () => {
     const opts = { allowedAuthorAssociations: ["contributor"] };
     expect(isCommentAuthorAllowed(raw("CONTRIBUTOR"), opts)).toBe(true);
     expect(isCommentAuthorAllowed(raw("MEMBER"), opts)).toBe(false);
+  });
+});
+
+describe("repository allowlist", () => {
+  const payload = (fullName: unknown): unknown => ({
+    repository: { full_name: fullName },
+  });
+
+  test("reads and normalizes owner/repository names", () => {
+    expect(repositoryFullNameFromRaw(payload("acme/widgets"))).toBe(
+      "acme/widgets",
+    );
+    expect(
+      resolveRepositoryAllowlist([" ACME/Widgets ", "bad", "acme/*"]),
+    ).toEqual(["acme/widgets"]);
+  });
+
+  test("matches exact repository names case-insensitively", () => {
+    expect(
+      isRepositoryAllowed(payload("acme/Widgets"), {
+        repositoryAllowlist: ["ACME/widgets"],
+      }),
+    ).toBe(true);
+    expect(
+      isRepositoryAllowed(payload("acme/interview-exercise"), {
+        repositoryAllowlist: ["acme/widgets"],
+      }),
+    ).toBe(false);
+  });
+
+  test("fails closed for empty, wildcard, or malformed configuration", () => {
+    expect(isRepositoryAllowed(payload("acme/widgets"), {})).toBe(false);
+    expect(
+      isRepositoryAllowed(payload("acme/widgets"), {
+        repositoryAllowlist: ["*"],
+      }),
+    ).toBe(false);
+    expect(
+      isRepositoryAllowed({}, { repositoryAllowlist: ["acme/widgets"] }),
+    ).toBe(false);
   });
 });

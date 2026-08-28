@@ -167,6 +167,11 @@ export type GithubbotOptions = {
    * GitHub permissions and are not affected by this.
    */
   allowedAuthorAssociations?: string[];
+  /**
+   * Exact owner/repository names whose signed webhooks may reach the bot.
+   * Empty or unset is fail-closed.
+   */
+  repositoryAllowlist?: readonly string[];
   /** Webhook signing secret configured on the GitHub repo/org webhook. */
   webhookSecret: string;
 };
