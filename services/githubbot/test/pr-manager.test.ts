@@ -714,6 +714,32 @@ describe("bounded review epochs", () => {
     ).toMatchObject({ epoch: 1, roundsUsed: 1 });
   });
 
+  test("retries a transient budget write after claiming a review", async () => {
+    const durableState = makeState();
+    let budgetWriteAttempts = 0;
+    const state = {
+      ...durableState,
+      async set(key: string, value: unknown) {
+        if (key.includes(":review-budget:")) {
+          budgetWriteAttempts += 1;
+          if (budgetWriteAttempts === 1) {
+            throw new Error("temporary Postgres interruption");
+          }
+        }
+        await durableState.set(key, value);
+      },
+    };
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(ctx, submittedReview(7, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(budgetWriteAttempts).toBe(2);
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ epoch: 1, roundsUsed: 1 });
+  });
+
   test("starts a new epoch for a material human-authored change", async () => {
     const state = makeState();
     const ctx = budgetCtx({
@@ -1008,6 +1034,64 @@ describe("bounded review epochs", () => {
     });
   });
 
+  test("retries a transient reset-approval read before admitting review", async () => {
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    let approvalReadAttempts = 0;
+    const state = {
+      ...durableState,
+      async get(key: string) {
+        if (key.includes(":review-reset:")) {
+          approvalReadAttempts += 1;
+          if (approvalReadAttempts === 1) {
+            throw new Error("temporary approval read failure");
+          }
+        }
+        return durableState.get(key);
+      },
+    };
+    const removedLabels: string[] = [];
+    const ctx = budgetCtx({ headSha: "head-4", removedLabels, state });
+
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "retry-reset-load",
+    );
+    await handleReviewEvent(ctx, submittedReview(18, "head-4"));
+    await drainBackgroundWork(5_000);
+
+    expect(approvalReadAttempts).toBe(2);
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      consumedResetApprovalId: "retry-reset-load",
+      epoch: 2,
+      roundsUsed: 1,
+    });
+    expect(
+      await durableState.get(
+        "centaur-githubbot:review-reset:base/repo#7:head-4",
+      ),
+    ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
+  });
+
   test("rejects a reset label while the review epoch is active", async () => {
     const removedLabels: string[] = [];
     const state = makeState();
@@ -1170,7 +1254,7 @@ describe("bounded review epochs", () => {
     });
   });
 
-  test("preserves an approved reset when the budget write fails", async () => {
+  test("retries an approved-reset budget write in the same delivery", async () => {
     const durableState = makeState();
     await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
       anchorHeadSha: "head-1",
@@ -1182,13 +1266,15 @@ describe("bounded review epochs", () => {
       roundsUsed: 3,
       version: 1,
     });
-    let failBudgetWrite = true;
+    let budgetWriteAttempts = 0;
     const state = {
       ...durableState,
       async set(key: string, value: unknown) {
-        if (key.includes(":review-budget:") && failBudgetWrite) {
-          failBudgetWrite = false;
-          throw new Error("temporary budget write failure");
+        if (key.includes(":review-budget:")) {
+          budgetWriteAttempts += 1;
+          if (budgetWriteAttempts === 1) {
+            throw new Error("temporary budget write failure");
+          }
         }
         await durableState.set(key, value);
       },
@@ -1226,21 +1312,7 @@ describe("bounded review epochs", () => {
 
     await handleReviewEvent(ctx, review);
 
-    expect(merges.count).toBe(0);
-    expect(removedLabels).toEqual([]);
-    expect(
-      await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
-    ).toMatchObject({ approvalId: "reset-survives-budget-failure" });
-    expect(
-      await state.get("centaur-githubbot:review-budget:base/repo#7"),
-    ).toMatchObject({
-      epoch: 1,
-      pausedHeadSha: "head-4",
-      roundsUsed: 3,
-    });
-
-    await handleReviewEvent(ctx, review);
-
+    expect(budgetWriteAttempts).toBe(2);
     expect(merges.count).toBe(1);
     expect(removedLabels).toEqual(["centaur-review-reset"]);
     expect(
@@ -1253,6 +1325,40 @@ describe("bounded review epochs", () => {
       epoch: 2,
       roundsUsed: 1,
     });
+  });
+
+  test("retries a transient human-handoff claim before acknowledging", async () => {
+    const comments: string[] = [];
+    const durableState = makeState();
+    await durableState.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      roundsUsed: 2,
+      version: 1,
+    });
+    let pauseClaimAttempts = 0;
+    const state = {
+      ...durableState,
+      async setIfNotExists(key: string, value: unknown) {
+        if (key.includes(":review-paused:")) {
+          pauseClaimAttempts += 1;
+          if (pauseClaimAttempts === 1) {
+            throw new Error("temporary handoff claim failure");
+          }
+        }
+        return durableState.setIfNotExists(key, value);
+      },
+    };
+    const ctx = budgetCtx({ comments, state });
+
+    await handleReviewEvent(ctx, submittedReview(19, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(pauseClaimAttempts).toBe(2);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("reviewer_round_budget_exhausted");
   });
 
   test("retries the human-handoff comment after a transient post failure", async () => {

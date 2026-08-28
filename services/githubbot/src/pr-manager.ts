@@ -279,74 +279,33 @@ async function loadReviewBudget(
   }
 }
 
-async function saveReviewBudget(
-  ctx: PrManagerContext,
-  owner: string,
-  repo: string,
-  n: number,
-  state: ReviewEpochState,
-): Promise<boolean> {
-  try {
-    await ctx.state.set(reviewBudgetKey(ctx, owner, repo, n), state, STATE_TTL_MS);
-    return true;
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_budget_save_failed", {
-      error: errorMessage(error),
-      pr: `${owner}/${repo}#${n}`,
-    });
-    return false;
-  }
-}
-
-async function loadReviewResetApproval(
+async function readReviewResetApproval(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
   n: number,
   headSha: string,
 ): Promise<ReviewResetApproval | undefined> {
-  try {
-    const value = await ctx.state.get<unknown>(
-      reviewResetApprovalKey(ctx, owner, repo, n, headSha),
-    );
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const approval = value as Partial<ReviewResetApproval>;
-    if (
-      approval.headSha !== headSha ||
-      typeof approval.approvalId !== "string" ||
-      !approval.approvalId ||
-      typeof approval.approvedBy !== "string"
-    ) {
-      return undefined;
-    }
-    return {
-      approvalId: approval.approvalId,
-      approvedBy: approval.approvedBy,
-      headSha,
-    };
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_reset_load_failed", {
-      error: errorMessage(error),
-      pr: `${owner}/${repo}#${n}`,
-    });
+  const value = await ctx.state.get<unknown>(
+    reviewResetApprovalKey(ctx, owner, repo, n, headSha),
+  );
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
-}
-
-async function strictClaim(
-  ctx: PrManagerContext,
-  key: string,
-  pr: string,
-): Promise<boolean> {
-  try {
-    return await ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS);
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_claim_failed", {
-      error: errorMessage(error),
-      pr,
-    });
-    return false;
+  const approval = value as Partial<ReviewResetApproval>;
+  if (
+    approval.headSha !== headSha ||
+    typeof approval.approvalId !== "string" ||
+    !approval.approvalId ||
+    typeof approval.approvedBy !== "string"
+  ) {
+    return undefined;
   }
+  return {
+    approvalId: approval.approvalId,
+    approvedBy: approval.approvedBy,
+    headSha,
+  };
 }
 
 async function retryingReviewStateOperation<T>(
@@ -391,6 +350,41 @@ async function retryingReviewBudgetLoad(
     "githubbot_review_budget_load_retry",
     `${owner}/${repo}#${n}`,
     () => readReviewBudget(ctx, owner, repo, n),
+  );
+}
+
+async function retryingReviewBudgetSave(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  state: ReviewEpochState,
+): Promise<void> {
+  await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_budget_save_retry",
+    `${owner}/${repo}#${n}`,
+    () =>
+      ctx.state.set(
+        reviewBudgetKey(ctx, owner, repo, n),
+        state,
+        STATE_TTL_MS,
+      ),
+  );
+}
+
+async function retryingReviewResetApprovalLoad(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  headSha: string,
+): Promise<ReviewResetApproval | undefined> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_load_retry",
+    `${owner}/${repo}#${n}`,
+    () => readReviewResetApproval(ctx, owner, repo, n, headSha),
   );
 }
 
@@ -966,7 +960,7 @@ async function pendingReviewResetApproval(
   pr: PullRequestSummary,
   state?: ReviewEpochState,
 ): Promise<ReviewResetApproval | undefined> {
-  const approval = await loadReviewResetApproval(
+  const approval = await retryingReviewResetApprovalLoad(
     ctx,
     owner,
     repo,
@@ -1059,11 +1053,7 @@ async function consumeApprovedReviewReset(
     automationPendingFromHeadSha: undefined,
     consumedResetApprovalId: approval.approvalId,
   };
-  if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
-    // Leave the approval and visible label intact. A redelivery can retry the
-    // same reset because no durable budget state says it was consumed.
-    return false;
-  }
+  await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
   traceLog(
     ctx.options,
     "githubbot_review_reset_consumed_by_approval",
@@ -1145,11 +1135,7 @@ async function admitReviewResponse(
   const state = approval
     ? { ...admission.state, consumedResetApprovalId: approval.approvalId }
     : admission.state;
-  if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
-    // The approval remains pending because its consumption marker is committed
-    // atomically with the budget transition above, not in a separate key.
-    return null;
-  }
+  await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
   if (admission.decision === "allow" && manualReset) {
     await cleanupReviewResetApproval(ctx, owner, repo, pr);
   }
@@ -1186,7 +1172,13 @@ async function escalateReviewBudget(
   reviewerKey: string,
 ): Promise<void> {
   const pauseClaim = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-paused:${owner}/${repo}#${pr.number}:${pr.headSha}:${admission.state.epoch}:${admission.reason}`;
-  if (!(await strictClaim(ctx, pauseClaim, `${owner}/${repo}#${pr.number}`))) {
+  if (
+    !(await retryingReviewClaim(
+      ctx,
+      pauseClaim,
+      `${owner}/${repo}#${pr.number}`,
+    ))
+  ) {
     return;
   }
   const handle = ctx.options.escalationHandle?.replace(/^@/, "");
