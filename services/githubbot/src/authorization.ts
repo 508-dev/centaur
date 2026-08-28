@@ -38,7 +38,15 @@ export function resolveRepositoryAllowlist(
 ): string[] {
   return (configured ?? [])
     .map((entry) => entry.trim().toLowerCase())
-    .filter((entry) => entry.split("/").length === 2 && !entry.includes("*"));
+    .filter((entry) => {
+      const segments = entry.split("/");
+      return (
+        segments.length === 2 &&
+        segments.every(Boolean) &&
+        !entry.includes("*") &&
+        !/\s/.test(entry)
+      );
+    });
 }
 
 /** Normalize startup policy and reject an inert or wildcard-only allowlist. */

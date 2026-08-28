@@ -127,6 +127,9 @@ describe("repository allowlist", () => {
     expect(() => requireRepositoryAllowlist(["*", "owner"])).toThrow(
       "must contain at least one exact owner/repository",
     );
+    expect(() =>
+      requireRepositoryAllowlist(["/repository", "owner/", "owner/re po"]),
+    ).toThrow("must contain at least one exact owner/repository");
     expect(
       requireRepositoryAllowlist(["*", " ACME/Widgets "]),
     ).toEqual(["acme/widgets"]);
