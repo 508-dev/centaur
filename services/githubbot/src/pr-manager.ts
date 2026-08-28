@@ -532,6 +532,24 @@ export async function handleReviewEvent(
   }
 
   if (reviewState === "approved") {
+    const effectiveHeadSha = reviewedHeadSha ?? pr.headSha;
+    if (
+      effectiveHeadSha === pr.headSha &&
+      !(await runExclusive(
+        `review-budget:${repo.owner}/${repo.repo}#${number}`,
+        () =>
+          consumeApprovedReviewReset(
+            ctx,
+            repo.owner,
+            repo.repo,
+            pr,
+            effectiveHeadSha,
+          ),
+      ))
+    ) {
+      await release(ctx, reviewClaimKey);
+      return;
+    }
     await tryMerge(ctx, repo.owner, repo.repo, number);
     return;
   }
@@ -784,6 +802,55 @@ async function consumeReviewResetApproval(
   }
 }
 
+async function consumeApprovedReviewReset(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  headSha: string,
+): Promise<boolean> {
+  const approval = await loadReviewResetApproval(
+    ctx,
+    owner,
+    repo,
+    pr.number,
+    headSha,
+  );
+  if (!approval) return true;
+  const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
+  if (!loaded.ok) return false;
+  if (loaded.state) {
+    const admission = decideReviewAdmission({
+      actor: "human",
+      headSha,
+      manualReset: true,
+      maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+      maxRoundsPerEpoch:
+        ctx.options.reviewMaxRoundsPerEpoch ??
+        DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+      state: loaded.state,
+    });
+    const state = {
+      ...admission.state,
+      automationPendingFromHeadSha: undefined,
+    };
+    if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
+      return false;
+    }
+    traceLog(
+      ctx.options,
+      "githubbot_review_reset_consumed_by_approval",
+      makeTrace(
+        managementThreadKey(owner, repo, pr.number),
+        `review-approved-${headSha}`,
+      ),
+      { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
+    );
+  }
+  await consumeReviewResetApproval(ctx, owner, repo, pr);
+  return true;
+}
+
 async function admitReviewResponse(
   ctx: PrManagerContext,
   owner: string,
@@ -811,6 +878,19 @@ async function admitReviewResponse(
       loaded.state.anchorHeadSha,
       headSha,
     );
+    if (
+      evidence.assessment.kind === "material" &&
+      loaded.state.anchorHeadSha !== loaded.state.lastReviewedHeadSha
+    ) {
+      const latestRange = await compareReviewChange(
+        ctx,
+        owner,
+        repo,
+        loaded.state.lastReviewedHeadSha,
+        headSha,
+      );
+      evidence = { ...evidence, actor: latestRange.actor };
+    }
     if (
       evidence.actor === "unknown" &&
       loaded.state.automationPendingFromHeadSha ===

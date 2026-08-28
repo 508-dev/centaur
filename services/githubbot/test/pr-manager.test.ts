@@ -518,6 +518,7 @@ describe("bounded review epochs", () => {
       },
       options: {
         apiUrl: "http://localhost",
+        deleteBranchOnMerge: false,
         escalationHandle: "maintainer",
         fetch: () => Promise.resolve(new Response("no", { status: 400 })),
         logger: quietLogger,
@@ -579,6 +580,64 @@ describe("bounded review epochs", () => {
       epoch: 2,
       roundsUsed: 1,
     });
+  });
+
+  test("uses the latest reviewed range for authorship while keeping cumulative materiality", async () => {
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-2",
+      epoch: 1,
+      lastReviewedHeadSha: "head-2",
+      roundsUsed: 2,
+      version: 1,
+    });
+    const ctx = budgetCtx({ headSha: "head-3", state });
+    const compared: string[] = [];
+    ctx.octokit.rest.repos.compareCommitsWithBasehead = (async (request: {
+      basehead: string;
+    }) => {
+      compared.push(request.basehead);
+      const latestRange = request.basehead === "head-2...head-3";
+      const humanCommit = {
+        author: { login: "alice", type: "User" },
+        commit: { message: "material human revision" },
+      };
+      return {
+        data: {
+          commits: latestRange
+            ? [humanCommit]
+            : [
+                {
+                  author: { login: "centaur-bot", type: "Bot" },
+                  commit: {
+                    message: "review fix\n\nCentaur-Automation: true",
+                  },
+                },
+                humanCommit,
+              ],
+          files: [
+            {
+              additions: 5,
+              changes: 5,
+              deletions: 0,
+              filename: "src/authorization.ts",
+              status: "modified",
+            },
+          ],
+          status: "ahead",
+          total_commits: latestRange ? 1 : 2,
+        },
+      };
+    }) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
+
+    await handleReviewEvent(ctx, submittedReview(8, "head-3"));
+    await drainBackgroundWork(5_000);
+
+    expect(compared).toEqual(["head-1...head-3", "head-2...head-3"]);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
   });
 
   test("consumes a write-authorized human reset for a bot-authored material change", async () => {
@@ -689,6 +748,65 @@ describe("bounded review epochs", () => {
       }),
     );
     expect(merges.count).toBe(0);
+  });
+
+  test("consumes an authorized reset before merging an approved head", async () => {
+    const merges = { count: 0 };
+    const removedLabels: string[] = [];
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    const ctx = budgetCtx({
+      headSha: "head-4",
+      merges,
+      removedLabels,
+      state,
+    });
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+    );
+    await handleReviewEvent(
+      ctx,
+      JSON.stringify({
+        action: "submitted",
+        pull_request: { head: { sha: "head-4" }, number: 7 },
+        repository: { full_name: "base/repo" },
+        review: {
+          commit_id: "head-4",
+          id: 10,
+          state: "approved",
+          user: { login: "reviewer" },
+        },
+      }),
+    );
+
+    expect(merges.count).toBe(1);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      anchorHeadSha: "head-4",
+      epoch: 2,
+      roundsUsed: 1,
+    });
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
+    ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 });
 
