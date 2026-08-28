@@ -132,7 +132,12 @@ select
     coalesce(
         (
             select jsonb_agg(payload_keys.key order by payload_keys.key)
-            from jsonb_object_keys(payload) as payload_keys(key)
+            from jsonb_object_keys(
+                case
+                    when jsonb_typeof(payload) = 'object' then payload
+                    else '{}'::jsonb
+                end
+            ) as payload_keys(key)
         ),
         '[]'::jsonb
     ) as payload_keys,

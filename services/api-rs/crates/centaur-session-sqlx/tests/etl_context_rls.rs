@@ -389,6 +389,12 @@ async fn assert_centaur_diagnostics_reader_security(
                 'exe_diagnostics',
                 'session.execution_failed',
                 '{"type":"result","status":"failed","error":"diagnostic-secret","terminal_reason":"diagnostic-secret"}'
+            ),
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'exe_diagnostics',
+                'session.output',
+                '"ordinary output"'
             );
         "#,
     )
@@ -415,7 +421,15 @@ async fn assert_centaur_diagnostics_reader_security(
     let event_shape: (bool, Option<i32>, serde_json::Value) = sqlx::query_as(
         "select has_error, error_length, payload_keys \
          from centaur_diagnostics.session_events \
-         where execution_id = 'exe_diagnostics'",
+         where execution_id = 'exe_diagnostics' \
+           and event_type = 'session.execution_failed'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let scalar_event_payload_keys: serde_json::Value = sqlx::query_scalar(
+        "select payload_keys from centaur_diagnostics.session_events \
+         where execution_id = 'exe_diagnostics' \
+           and event_type = 'session.output'",
     )
     .fetch_one(&mut *conn)
     .await?;
@@ -457,6 +471,7 @@ async fn assert_centaur_diagnostics_reader_security(
         event_shape.2,
         serde_json::json!(["error", "status", "terminal_reason", "type"])
     );
+    assert_eq!(scalar_event_payload_keys, serde_json::json!([]));
     assert!(!broad_role_member);
     assert_eq!(
         role_attributes,
