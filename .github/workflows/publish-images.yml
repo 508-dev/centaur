@@ -44,10 +44,12 @@ jobs:
   # Build each image with Depot's hosted builders, push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
   # arm64 is only built on pushes to main and release tags — PR and manual
-  # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
-  # jobs so untrusted changes do not run on the hosted image builders.
+  # dispatch builds stay amd64-only to keep iteration fast. PRs whose head repo
+  # differs from the base repo skip both jobs so untrusted fork changes do not
+  # run on the hosted image builders; internal branches still build when this
+  # repository is itself a fork.
   build:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false
@@ -146,19 +148,19 @@ jobs:
           # Tags are applied by the merge job on the multi-arch manifest;
           # per-arch builds are pushed by digest only. The fork check is also
           # enforced at the job level so external PRs do not build.
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
 
       - name: Export digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           mkdir -p ${{ runner.temp }}/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
@@ -169,7 +171,7 @@ jobs:
   merge:
     runs-on: depot-ubuntu-24.04-16
     needs: build
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
