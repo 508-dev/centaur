@@ -78,7 +78,7 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   after assignment, where being assigned is an explicit hand-off, so it fixes the PR regardless of who
   pushed last.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
-  holistic turn that reads all the feedback, validates each finding against reachable code
+  turn that reads all the feedback, validates each finding against reachable code
   and enforced contracts, makes one minimal coherent commit, replies on each thread, resolves what
   it addressed, and re-requests review only when code changed. Finding validation is prompt-level;
   the loop limit and epoch transitions below are deterministic controller decisions.
@@ -127,7 +127,8 @@ the bot stops accepting webhooks and **drains in-flight turns** for up to
 `GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
 running work isn't dropped (claims are taken before the work, so a dropped turn would never retry).
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
-sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
+sandbox. Both require the **single replica** the chart enforces (`replicaCount: 1`); increase sandbox
+runner and warm-pool capacity for concurrent work instead of scaling this webhook controller.
 
 ## Auth
 

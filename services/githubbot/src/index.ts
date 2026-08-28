@@ -509,7 +509,11 @@ function routeLifecycleEvent(
         state: input.state,
       });
     }
-    return handlePullRequestEvent(input.prManagerCtx, rawBody);
+    return handlePullRequestEvent(
+      input.prManagerCtx,
+      rawBody,
+      input.deliveryId,
+    );
   }
   if (eventType === "pull_request_review") {
     return handleReviewEvent(input.prManagerCtx, rawBody);

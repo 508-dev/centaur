@@ -132,6 +132,10 @@ function reviewBudgetKey(
   return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-budget:${owner}/${repo}#${n}`;
 }
 
+function reviewBudgetLockKey(owner: string, repo: string, n: number): string {
+  return `review-budget:${owner}/${repo}#${n}`;
+}
+
 function reviewResetApprovalKey(
   ctx: PrManagerContext,
   owner: string,
@@ -140,6 +144,16 @@ function reviewResetApprovalKey(
   headSha: string,
 ): string {
   return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-reset:${owner}/${repo}#${n}:${headSha}`;
+}
+
+function reviewResetConsumptionKey(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  approvalId: string,
+): string {
+  return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-reset-consumed:${owner}/${repo}#${n}:${approvalId}`;
 }
 
 export function managementThreadKey(
@@ -180,6 +194,7 @@ async function saveState(
 }
 
 type ReviewResetApproval = {
+  approvalId: string;
   approvedBy: string;
   headSha: string;
 };
@@ -269,10 +284,19 @@ async function loadReviewResetApproval(
     );
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const approval = value as Partial<ReviewResetApproval>;
-    if (approval.headSha !== headSha || typeof approval.approvedBy !== "string") {
+    if (
+      approval.headSha !== headSha ||
+      typeof approval.approvalId !== "string" ||
+      !approval.approvalId ||
+      typeof approval.approvedBy !== "string"
+    ) {
       return undefined;
     }
-    return { approvedBy: approval.approvedBy, headSha };
+    return {
+      approvalId: approval.approvalId,
+      approvedBy: approval.approvedBy,
+      headSha,
+    };
   } catch (error) {
     logger(ctx).warn("githubbot_review_reset_load_failed", {
       error: errorMessage(error),
@@ -437,6 +461,7 @@ function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {
 export async function handlePullRequestEvent(
   ctx: PrManagerContext,
   rawBody: string,
+  deliveryId = "",
 ): Promise<void> {
   const payload = parseJson(rawBody);
   if (!payload) return;
@@ -459,6 +484,7 @@ export async function handlePullRequestEvent(
       repo.repo,
       pr,
       payload,
+      deliveryId,
     ))
   ) {
     return;
@@ -536,7 +562,7 @@ export async function handleReviewEvent(
     if (
       effectiveHeadSha === pr.headSha &&
       !(await runExclusive(
-        `review-budget:${repo.owner}/${repo.repo}#${number}`,
+        reviewBudgetLockKey(repo.owner, repo.repo, number),
         () =>
           consumeApprovedReviewReset(
             ctx,
@@ -568,7 +594,7 @@ export async function handleReviewEvent(
       return;
     }
     const admission = await runExclusive(
-      `review-budget:${repo.owner}/${repo.repo}#${number}`,
+      reviewBudgetLockKey(repo.owner, repo.repo, number),
       () =>
         admitReviewResponse(
           ctx,
@@ -607,6 +633,7 @@ async function maybeRecordReviewResetApproval(
   repo: string,
   pr: PullRequestSummary,
   payload: JsonRecord,
+  deliveryId: string,
 ): Promise<boolean> {
   const labelNode = payload.label;
   const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
@@ -658,11 +685,23 @@ async function maybeRecordReviewResetApproval(
     });
     return true;
   }
+  if (!deliveryId) {
+    logger(ctx).warn("githubbot_review_reset_denied", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "missing_delivery_id",
+      sender,
+    });
+    return true;
+  }
 
   try {
     await ctx.state.set(
       reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
-      { approvedBy: sender, headSha: pr.headSha } satisfies ReviewResetApproval,
+      {
+        approvalId: deliveryId,
+        approvedBy: sender,
+        headSha: pr.headSha,
+      } satisfies ReviewResetApproval,
       CLAIM_TTL_MS,
     );
     traceLog(
@@ -771,7 +810,36 @@ async function compareReviewChange(
   }
 }
 
-async function consumeReviewResetApproval(
+async function takeReviewResetApproval(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  headSha: string,
+): Promise<ReviewResetApproval | undefined> {
+  const approval = await loadReviewResetApproval(
+    ctx,
+    owner,
+    repo,
+    prNumber,
+    headSha,
+  );
+  if (!approval) return undefined;
+  const claimed = await strictClaim(
+    ctx,
+    reviewResetConsumptionKey(
+      ctx,
+      owner,
+      repo,
+      prNumber,
+      approval.approvalId,
+    ),
+    `${owner}/${repo}#${prNumber}`,
+  );
+  return claimed ? approval : undefined;
+}
+
+async function cleanupReviewResetApproval(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
@@ -809,7 +877,9 @@ async function consumeApprovedReviewReset(
   pr: PullRequestSummary,
   headSha: string,
 ): Promise<boolean> {
-  const approval = await loadReviewResetApproval(
+  const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
+  if (!loaded.ok) return false;
+  const approval = await takeReviewResetApproval(
     ctx,
     owner,
     repo,
@@ -817,8 +887,6 @@ async function consumeApprovedReviewReset(
     headSha,
   );
   if (!approval) return true;
-  const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
-  if (!loaded.ok) return false;
   if (loaded.state) {
     const admission = decideReviewAdmission({
       actor: "human",
@@ -835,6 +903,7 @@ async function consumeApprovedReviewReset(
       automationPendingFromHeadSha: undefined,
     };
     if (!(await saveReviewBudget(ctx, owner, repo, pr.number, state))) {
+      await cleanupReviewResetApproval(ctx, owner, repo, pr);
       return false;
     }
     traceLog(
@@ -847,7 +916,7 @@ async function consumeApprovedReviewReset(
       { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
     );
   }
-  await consumeReviewResetApproval(ctx, owner, repo, pr);
+  await cleanupReviewResetApproval(ctx, owner, repo, pr);
   return true;
 }
 
@@ -860,7 +929,7 @@ async function admitReviewResponse(
 ): Promise<ReviewAdmission | null> {
   const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
   if (!loaded.ok) return null;
-  const approval = await loadReviewResetApproval(
+  const approval = await takeReviewResetApproval(
     ctx,
     owner,
     repo,
@@ -912,10 +981,13 @@ async function admitReviewResponse(
     state: loaded.state,
   });
   if (!(await saveReviewBudget(ctx, owner, repo, pr.number, admission.state))) {
+    if (manualReset) {
+      await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    }
     return null;
   }
   if (admission.decision === "allow" && manualReset) {
-    await consumeReviewResetApproval(ctx, owner, repo, pr);
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
   }
   traceLog(
     ctx.options,
@@ -968,6 +1040,7 @@ async function escalateReviewBudget(
       repo,
     });
   } catch (error) {
+    await release(ctx, pauseClaim);
     logger(ctx).warn("githubbot_review_budget_escalation_failed", {
       error: errorMessage(error),
       pr: `${owner}/${repo}#${pr.number}`,
@@ -1074,6 +1147,17 @@ async function processCi(
 
 /** Deterministic merge gate — no agent; GitHub's mergeable_state decides. */
 async function tryMerge(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<void> {
+  await runExclusive(reviewBudgetLockKey(owner, repo, number), () =>
+    tryMergeLocked(ctx, owner, repo, number),
+  );
+}
+
+async function tryMergeLocked(
   ctx: PrManagerContext,
   owner: string,
   repo: string,

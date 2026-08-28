@@ -23,6 +23,9 @@ behavioral contract and supported webhook events are documented in `README.md`.
 - Serialize turns for one management session and drain accepted work on
   shutdown. A webhook acknowledgement is not evidence that the claimed turn
   finished.
+- Keep the GitHub webhook controller at one replica unless every per-session and
+  per-PR lock is replaced with a distributed equivalent. Scale sandbox runners
+  for work concurrency instead.
 - Automated merge behavior applies only to explicitly owned PRs and must honor
   draft, hold, mergeability, settled-check, attempt-limit, and human-handoff
   gates. Keep deterministic merge decisions outside the agent prompt.

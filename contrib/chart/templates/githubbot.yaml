@@ -1,4 +1,7 @@
 {{- if .Values.githubbot.enabled }}
+{{- if ne (int .Values.githubbot.replicaCount) 1 }}
+{{- fail "githubbot.replicaCount must be 1; per-PR controllers are process-serialized (scale sandbox runners for concurrent work)" }}
+{{- end }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt .Values.githubbot.managementPrompt }}
 # Optional review / issue-work methodology overrides, delivered as mounted files
