@@ -25,8 +25,9 @@ reviewer** like any other collaborator.
   whose GitHub `author_association` is allowed (default `OWNER` / `MEMBER` / `COLLABORATOR`) can drive
   a turn — the agent runs in a write-capable sandbox and posts its transcript back, so untrusted
   commenters can't steer it. Widen or open it with `GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS` (`*` allows
-  everyone, e.g. a fully-private repo). Lifecycle triggers (assignment, review-request) are already
-  gated by GitHub permissions, so this applies only to the comment path.
+  everyone, e.g. a fully-private repo). Every path also requires an exact match in
+  `GITHUBBOT_REPOSITORY_ALLOWLIST`; lifecycle triggers (assignment, review-request) are gated by the
+  same repository boundary plus GitHub permissions.
 - **`@`-mentioning the bot in the body of a newly-opened issue or PR** (the description, not a
   comment) → the same conversational turn runs, keyed to that issue/PR thread, with the reply posted
   as a comment. Only the `opened` event is handled — an edit that adds a mention later won't
@@ -100,13 +101,16 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
 ## Ingress model
 
 GitHub delivers **HTTP webhooks** to `POST /api/webhooks/github` (content type **must** be
-`application/json`). Comment events (`issue_comment`, `pull_request_review_comment`) are handed to the
-chat adapter, which verifies the `X-Hub-Signature-256` HMAC and maps them to thread/message events.
+`application/json`). Githubbot first verifies the `X-Hub-Signature-256` HMAC over the raw body,
+then parses the body and applies the exact repository allowlist before dispatching supported
+events. Allowed comment events (`issue_comment`, `pull_request_review_comment`) are then handed to
+the chat adapter, which repeats signature verification and maps them to thread/message events.
 Lifecycle events (`pull_request`, `pull_request_review`, `issues`, and the CI events) are handled by
-githubbot directly (the adapter ignores them), so githubbot verifies the signature itself before acting. Turns run in the background — webhooks are acknowledged
-immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a bounded retry inside
-the turn for transient cold-start failures. On `SIGTERM` (a deploy/rollout) the bot stops accepting
-webhooks and **drains in-flight turns** for up to `GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
+githubbot directly (the adapter ignores them). Turns run in the background — webhooks are
+acknowledged immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a
+bounded retry inside the turn for transient cold-start failures. On `SIGTERM` (a deploy/rollout)
+the bot stops accepting webhooks and **drains in-flight turns** for up to
+`GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
 running work isn't dropped (claims are taken before the work, so a dropped turn would never retry).
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
@@ -137,6 +141,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUB_WEBHOOK_SECRET` | ✅ | Webhook signing secret (or `GITHUBBOT_WEBHOOK_SECRET`). |
 | `GITHUB_BOT_USERNAME` | ✅ | The bot account's GitHub login — drives `@`-mention and requested-reviewer matching (or `GITHUBBOT_USER_NAME`). |
 | `GITHUBBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL` / `POSTGRES_URL`). |
+| `GITHUBBOT_REPOSITORY_ALLOWLIST` | ✅ | Comma-separated exact `owner/repository` names. Empty/unset is rejected at startup; wildcards are not supported. Signed events for other repositories are acknowledged but ignored before chat state or agent work is created. |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
 | `GITHUBBOT_API_KEY` | — | Dedicated bearer sent to api-rs. |
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |

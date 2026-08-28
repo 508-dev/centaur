@@ -39,7 +39,9 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `DISCORD_BOT_TOKEN` | ✅ | Bot token (account-level credential — keep secret). |
 | `DISCORD_PUBLIC_KEY` | ✅ | Ed25519 public key (used by the adapter for any HTTP interactions). |
 | `DISCORD_APPLICATION_ID` | ✅ | Doubles as the bot user id for mention detection. |
-| `DISCORDBOT_GUILD_ALLOWLIST` | ✅ to do anything | Comma/space-separated guild IDs. **Fail-closed: empty ⇒ the bot ignores all messages.** |
+| `DISCORDBOT_GUILD_ALLOWLIST` | ✅ to do anything | Comma/space-separated guild IDs. **Fail-closed when empty.** |
+| `DISCORDBOT_CHANNEL_ALLOWLIST` | ✅ to do anything | Comma/space-separated parent channel IDs. Messages in other channels and their threads are ignored before a thread/session is created. |
+| `DISCORDBOT_TRIGGER_ROLE_ALLOWLIST` | ✅ to do anything | Comma/space-separated immutable Discord role IDs. A human must currently hold at least one on every message; role names are never authorization inputs. |
 | `DISCORDBOT_API_KEY` | – | Bearer to api-rs. Use a dedicated key, not the Slack one. |
 | `CENTAUR_API_URL` | – | api-rs base URL (default `http://127.0.0.1:8080`). |
 | `DISCORDBOT_DATABASE_URL` / `DATABASE_URL` / `POSTGRES_URL` | ✅ | Thread-state store. The bot refuses to boot without one (no silent localhost fallback). |
@@ -56,7 +58,10 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | – | Forwarded to api-rs execute. |
 
 DMs are denied by the guild allowlist: the adapter does request the DirectMessages intent, but a
-DM has no guild, so the fail-closed allowlist check rejects it.
+DM has no guild, so the fail-closed allowlist check rejects it. Guild, parent channel, and role
+checks happen before a channel mention creates a public thread and again before every follow-up is
+forwarded. Removing a role therefore blocks the member's next message, including replies inside an
+already-active thread.
 
 ## Discord application setup
 
@@ -69,8 +74,10 @@ DM has no guild, so the fail-closed allowlist check rejects it.
 4. **Invite the bot** (OAuth2 → URL Generator) with scope `bot` and permissions:
    _View Channels_, _Send Messages_, _Send Messages in Threads_, **Create Public Threads**,
    _Embed Links_, _Read Message History_, _Add Reactions_ (the 👀/✅ run-status indicator).
-5. Set `DISCORDBOT_GUILD_ALLOWLIST` to the server(s) you invited it to — the bot is **inert** until
-   this is set.
+5. Set `DISCORDBOT_GUILD_ALLOWLIST`, `DISCORDBOT_CHANNEL_ALLOWLIST`, and
+   `DISCORDBOT_TRIGGER_ROLE_ALLOWLIST` to numeric IDs. The bot is **inert** for human messages until
+   all three are set. Use Discord's role API or Developer Mode during deployment to translate role
+   names to IDs; pin the resulting IDs rather than checking mutable names at runtime.
 
 ## Runtime assumptions (validated 2026-06-02)
 
