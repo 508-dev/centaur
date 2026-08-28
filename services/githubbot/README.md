@@ -101,15 +101,16 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
 ## Ingress model
 
 GitHub delivers **HTTP webhooks** to `POST /api/webhooks/github` (content type **must** be
-`application/json`). Githubbot verifies the `X-Hub-Signature-256` HMAC and exact repository
-allowlist before parsing or dispatching supported events. Allowed comment events (`issue_comment`,
-`pull_request_review_comment`) are then handed to the chat adapter, which repeats signature
-verification and maps them to thread/message events. Lifecycle events (`pull_request`,
-`pull_request_review`, `issues`, and the CI events) are handled by githubbot directly (the adapter
-ignores them). Turns run in the background — webhooks are acknowledged
-immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a bounded retry inside
-the turn for transient cold-start failures. On `SIGTERM` (a deploy/rollout) the bot stops accepting
-webhooks and **drains in-flight turns** for up to `GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
+`application/json`). Githubbot first verifies the `X-Hub-Signature-256` HMAC over the raw body,
+then parses the body and applies the exact repository allowlist before dispatching supported
+events. Allowed comment events (`issue_comment`, `pull_request_review_comment`) are then handed to
+the chat adapter, which repeats signature verification and maps them to thread/message events.
+Lifecycle events (`pull_request`, `pull_request_review`, `issues`, and the CI events) are handled by
+githubbot directly (the adapter ignores them). Turns run in the background — webhooks are
+acknowledged immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a
+bounded retry inside the turn for transient cold-start failures. On `SIGTERM` (a deploy/rollout)
+the bot stops accepting webhooks and **drains in-flight turns** for up to
+`GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
 running work isn't dropped (claims are taken before the work, so a dropped turn would never retry).
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
