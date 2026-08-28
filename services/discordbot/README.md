@@ -12,12 +12,11 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
   keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an active thread** append to the same session without a re-mention.
-- **Append-only narration**: a run instantly reacts 👀 on the triggering message, then posts the
-  agent's reasoning blurbs as their own *italic* messages as each thought completes (commands/tools
-  are not rendered — they just end a thought). The **answer** streams into a separate message
-  created when the first answer text arrives, so it lands at the bottom of the thread even when
-  users chime in mid-run. On settle the 👀 flips to ✅ (or ❌); no bot message is ever edited or
-  deleted.
+- **Safe public output**: a run instantly reacts 👀 on the triggering message. The **final
+  answer** streams into a separate message created when its first text arrives, so it lands at the
+  bottom of the thread even when users chime in mid-run. On settle the 👀 flips to ✅ (or ❌).
+  Reasoning, commentary, activity summaries, task/tool details, and transcripts are never posted
+  to Discord.
 
 ## Ingress model
 
