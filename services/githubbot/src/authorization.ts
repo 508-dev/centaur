@@ -41,6 +41,19 @@ export function resolveRepositoryAllowlist(
     .filter((entry) => entry.split("/").length === 2 && !entry.includes("*"));
 }
 
+/** Normalize startup policy and reject an inert or wildcard-only allowlist. */
+export function requireRepositoryAllowlist(
+  configured: readonly string[] | undefined,
+): string[] {
+  const repositories = resolveRepositoryAllowlist(configured);
+  if (!repositories.length) {
+    throw new Error(
+      "GITHUBBOT_REPOSITORY_ALLOWLIST must contain at least one exact owner/repository",
+    );
+  }
+  return repositories;
+}
+
 /** Whether a webhook targets an explicitly configured repository. */
 export function isRepositoryAllowed(
   raw: unknown,

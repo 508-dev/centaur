@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
 
@@ -129,7 +130,9 @@ const options: GithubbotOptions = {
   reviewPrompt,
   issuePrompt,
   managementPrompt,
-  repositoryAllowlist: requiredListEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
+  repositoryAllowlist: requireRepositoryAllowlist(
+    listEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
+  ),
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
   userName,
@@ -197,14 +200,6 @@ function listEnv(name: string): string[] | undefined {
     .map((entry) => entry.trim())
     .filter(Boolean);
   return items.length ? items : undefined;
-}
-
-function requiredListEnv(name: string): string[] {
-  const items = listEnv(name);
-  if (!items) {
-    throw new Error(`${name} must contain at least one owner/repository`);
-  }
-  return items;
 }
 
 function boolEnv(name: string, fallback: boolean): boolean {

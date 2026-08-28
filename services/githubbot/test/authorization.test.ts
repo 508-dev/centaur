@@ -4,6 +4,7 @@ import {
   DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS,
   isCommentAuthorAllowed,
   isRepositoryAllowed,
+  requireRepositoryAllowlist,
   repositoryFullNameFromRaw,
   resolveAllowedAuthorAssociations,
   resolveRepositoryAllowlist,
@@ -117,5 +118,17 @@ describe("repository allowlist", () => {
     expect(
       isRepositoryAllowed({}, { repositoryAllowlist: ["acme/widgets"] }),
     ).toBe(false);
+  });
+
+  test("fails startup unless normalization leaves an exact repository", () => {
+    expect(() => requireRepositoryAllowlist(undefined)).toThrow(
+      "must contain at least one exact owner/repository",
+    );
+    expect(() => requireRepositoryAllowlist(["*", "owner"])).toThrow(
+      "must contain at least one exact owner/repository",
+    );
+    expect(
+      requireRepositoryAllowlist(["*", " ACME/Widgets "]),
+    ).toEqual(["acme/widgets"]);
   });
 });
