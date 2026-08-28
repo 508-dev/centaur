@@ -10,7 +10,9 @@ on:
       - harness/**
       - centaur_sdk/**
       - packages/**
+      - patches/**
       - tools/**
+      - workflows/**
       - scripts/bootstrap-k8s-secrets.sh
       - package.json
       - pnpm-lock.yaml
@@ -25,7 +27,9 @@ on:
       - harness/**
       - centaur_sdk/**
       - packages/**
+      - patches/**
       - tools/**
+      - workflows/**
       - scripts/bootstrap-k8s-secrets.sh
       - package.json
       - pnpm-lock.yaml
