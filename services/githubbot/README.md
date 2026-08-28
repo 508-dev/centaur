@@ -90,13 +90,15 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   are changes that cross configured runtime-line or runtime-file thresholds. Non-linear or
   unreadable comparisons pause instead of guessing. A material human-authored change starts a fresh
   epoch until the PR-wide epoch cap; automated changes consume the current epoch and cannot award
-  themselves a reset. Once exhausted, auto-merge remains paused across descendant heads until a
-  reviewed, authorized transition clears the handoff; an already-running repair cannot push around
-  the pause. Only while that handoff pause is active, a non-bot collaborator with write/admin
+  themselves a reset. Admitting the final allowed round records the handoff pause before its repair
+  turn starts. Once exhausted, auto-merge remains paused across descendant heads until a reviewed,
+  authorized transition clears the handoff; an already-running repair cannot push around the pause.
+  Only while that handoff pause is active, a non-bot collaborator with write/admin
   permission can continue by adding the
   `centaur-review-reset` label and re-requests review. The approval is pinned to the current head,
-  consumed in the same durable write that advances the epoch, and the label is removed. Create that
-  label in each managed repository before use.
+  consumed in the same durable write that advances the epoch, and the label is removed. Rejected
+  reset labels are also removed so a later authorized human can retry the documented flow. Create
+  that label in each managed repository before use.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for

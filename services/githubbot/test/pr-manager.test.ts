@@ -540,22 +540,38 @@ describe("bounded review epochs", () => {
     );
   }
 
-  test("counts submitted reviews and pauses after three rounds", async () => {
+  test("admits the final review round but pauses merge before its descendant", async () => {
     const comments: string[] = [];
+    const merges = { count: 0 };
     const state = makeState();
-    const ctx = budgetCtx({ comments, state });
+    const ctx = budgetCtx({ comments, merges, state });
 
     await handleReviewEvent(ctx, submittedReview(1, "head-1"));
     await handleReviewEvent(ctx, submittedReview(2, "head-1"));
     setHeadSha(ctx, "head-2");
     await handleReviewEvent(ctx, submittedReview(3, "head-2"));
     setHeadSha(ctx, "head-3");
-    await handleReviewEvent(ctx, submittedReview(4, "head-3"));
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "synchronize",
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+      }),
+      "post-final-round-push",
+    );
     await drainBackgroundWork(5_000);
 
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
-    ).toMatchObject({ epoch: 1, lastReviewedHeadSha: "head-2", roundsUsed: 3 });
+    ).toMatchObject({
+      epoch: 1,
+      lastReviewedHeadSha: "head-2",
+      pausedHeadSha: "head-2",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+    });
+    expect(merges.count).toBe(0);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("round_budget_exhausted");
     expect(comments[0]).toContain("centaur-review-reset");
@@ -584,6 +600,32 @@ describe("bounded review epochs", () => {
     expect(reviewClaimAttempts).toBe(2);
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ epoch: 1, roundsUsed: 1 });
+  });
+
+  test("retries a transient budget read after claiming a review", async () => {
+    const durableState = makeState();
+    let budgetReadAttempts = 0;
+    const state = {
+      ...durableState,
+      async get(key: string) {
+        if (key.includes(":review-budget:")) {
+          budgetReadAttempts += 1;
+          if (budgetReadAttempts === 1) {
+            throw new Error("temporary Postgres interruption");
+          }
+        }
+        return durableState.get(key);
+      },
+    };
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(ctx, submittedReview(6, "head-1"));
+    await drainBackgroundWork(5_000);
+
+    expect(budgetReadAttempts).toBe(2);
+    expect(
+      await durableState.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({ epoch: 1, roundsUsed: 1 });
   });
 
@@ -920,8 +962,9 @@ describe("bounded review epochs", () => {
   });
 
   test("rejects reset labels added by the managed bot", async () => {
+    const removedLabels: string[] = [];
     const state = makeState();
-    const ctx = budgetCtx({ headSha: "head-4", state });
+    const ctx = budgetCtx({ headSha: "head-4", removedLabels, state });
     await handlePullRequestEvent(
       ctx,
       JSON.stringify({
@@ -936,11 +979,28 @@ describe("bounded review epochs", () => {
     expect(
       await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
     ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 
   test("rejects reset labels from users without write permission", async () => {
+    const removedLabels: string[] = [];
     const state = makeState();
-    const ctx = budgetCtx({ headSha: "head-4", permission: "read", state });
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-4",
+      pauseReason: "round_budget_exhausted",
+      roundsUsed: 3,
+      version: 1,
+    });
+    const ctx = budgetCtx({
+      headSha: "head-4",
+      permission: "read",
+      removedLabels,
+      state,
+    });
     await handlePullRequestEvent(
       ctx,
       JSON.stringify({
@@ -955,11 +1015,13 @@ describe("bounded review epochs", () => {
     expect(
       await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
     ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 
   test("rejects an authorized reset label without a delivery id", async () => {
+    const removedLabels: string[] = [];
     const state = makeState();
-    const ctx = budgetCtx({ headSha: "head-4", state });
+    const ctx = budgetCtx({ headSha: "head-4", removedLabels, state });
     await handlePullRequestEvent(
       ctx,
       JSON.stringify({
@@ -973,6 +1035,7 @@ describe("bounded review epochs", () => {
     expect(
       await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
     ).toBeUndefined();
+    expect(removedLabels).toEqual(["centaur-review-reset"]);
   });
 
   test("uses one reset delivery only once when approval cleanup fails", async () => {

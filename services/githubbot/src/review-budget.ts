@@ -188,22 +188,37 @@ function paused(
   return { ...state, pausedHeadSha: headSha, pauseReason: reason };
 }
 
+function withFinalRoundHandoff(
+  state: ReviewEpochState,
+  headSha: string,
+  maxRoundsPerEpoch: number,
+): ReviewEpochState {
+  return state.roundsUsed >= maxRoundsPerEpoch
+    ? paused(state, headSha, "round_budget_exhausted")
+    : state;
+}
+
 export function decideReviewAdmission(
   input: ReviewAdmissionInput,
 ): ReviewAdmission {
   const existing = input.state;
   if (!existing) {
+    const state: ReviewEpochState = {
+      anchorHeadSha: input.headSha,
+      automationPendingFromHeadSha: input.headSha,
+      epoch: 1,
+      lastReviewedHeadSha: input.headSha,
+      roundsUsed: 1,
+      version: 1,
+    };
     return {
       decision: "allow",
       resetEpoch: false,
-      state: {
-        anchorHeadSha: input.headSha,
-        automationPendingFromHeadSha: input.headSha,
-        epoch: 1,
-        lastReviewedHeadSha: input.headSha,
-        roundsUsed: 1,
-        version: 1,
-      },
+      state: withFinalRoundHandoff(
+        state,
+        input.headSha,
+        input.maxRoundsPerEpoch,
+      ),
     };
   }
 
@@ -212,7 +227,11 @@ export function decideReviewAdmission(
       assessment: input.assessment,
       decision: "allow",
       resetEpoch: true,
-      state: nextEpoch(existing, input.headSha),
+      state: withFinalRoundHandoff(
+        nextEpoch(existing, input.headSha),
+        input.headSha,
+        input.maxRoundsPerEpoch,
+      ),
     };
   }
 
@@ -227,7 +246,11 @@ export function decideReviewAdmission(
     return {
       decision: "allow",
       resetEpoch: false,
-      state: nextRound(existing, input.headSha),
+      state: withFinalRoundHandoff(
+        nextRound(existing, input.headSha),
+        input.headSha,
+        input.maxRoundsPerEpoch,
+      ),
     };
   }
 
@@ -254,7 +277,11 @@ export function decideReviewAdmission(
         assessment: input.assessment,
         decision: "allow",
         resetEpoch: true,
-        state: nextEpoch(existing, input.headSha),
+        state: withFinalRoundHandoff(
+          nextEpoch(existing, input.headSha),
+          input.headSha,
+          input.maxRoundsPerEpoch,
+        ),
       };
     }
     if (input.actor === "unknown") {
@@ -281,7 +308,11 @@ export function decideReviewAdmission(
       assessment: input.assessment,
       decision: "allow",
       resetEpoch: false,
-      state: nextRound(existing, input.headSha),
+      state: withFinalRoundHandoff(
+        nextRound(existing, input.headSha),
+        input.headSha,
+        input.maxRoundsPerEpoch,
+      ),
     };
   }
 
@@ -298,6 +329,10 @@ export function decideReviewAdmission(
     assessment: input.assessment,
     decision: "allow",
     resetEpoch: false,
-    state: nextRound(existing, input.headSha),
+    state: withFinalRoundHandoff(
+      nextRound(existing, input.headSha),
+      input.headSha,
+      input.maxRoundsPerEpoch,
+    ),
   };
 }

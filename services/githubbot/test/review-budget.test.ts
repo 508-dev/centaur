@@ -128,22 +128,54 @@ describe("decideReviewAdmission", () => {
     ).toMatchObject({ decision: "allow", state: { roundsUsed: 2 } });
   });
 
-  test("allows two repair-validation rounds then pauses", () => {
+  test("marks the final allowed repair round as a merge-blocking handoff", () => {
     const roundTwo = decideReviewAdmission({ ...base, state: epoch() });
     expect(roundTwo).toMatchObject({
       decision: "allow",
       resetEpoch: false,
       state: { epoch: 1, roundsUsed: 2 },
     });
+
+    const finalRound = decideReviewAdmission({
+      ...base,
+      headSha: "head-4",
+      state: epoch({ lastReviewedHeadSha: "head-3", roundsUsed: 2 }),
+    });
+    expect(finalRound).toMatchObject({
+      decision: "allow",
+      resetEpoch: false,
+      state: {
+        pausedHeadSha: "head-4",
+        pauseReason: "round_budget_exhausted",
+        roundsUsed: 3,
+      },
+    });
     expect(
       decideReviewAdmission({
         ...base,
-        headSha: "head-4",
-        state: epoch({ lastReviewedHeadSha: "head-3", roundsUsed: 3 }),
+        headSha: "head-5",
+        state: finalRound.state,
       }),
     ).toMatchObject({
       decision: "pause",
       reason: "round_budget_exhausted",
+    });
+  });
+
+  test("marks the first review as a handoff when the configured limit is one", () => {
+    expect(
+      decideReviewAdmission({
+        ...base,
+        maxRoundsPerEpoch: 1,
+        state: undefined,
+      }),
+    ).toMatchObject({
+      decision: "allow",
+      state: {
+        pausedHeadSha: "head-2",
+        pauseReason: "round_budget_exhausted",
+        roundsUsed: 1,
+      },
     });
   });
 
@@ -172,7 +204,12 @@ describe("decideReviewAdmission", () => {
     ).toMatchObject({
       decision: "allow",
       resetEpoch: false,
-      state: { epoch: 1, roundsUsed: 3 },
+      state: {
+        epoch: 1,
+        pausedHeadSha: "head-2",
+        pauseReason: "round_budget_exhausted",
+        roundsUsed: 3,
+      },
     });
     expect(
       decideReviewAdmission({

@@ -190,6 +190,10 @@ type ReviewResetApproval = {
   headSha: string;
 };
 
+type ReviewBudgetLoadResult =
+  | { ok: true; state?: ReviewEpochState }
+  | { ok: false };
+
 function isReviewEpochState(value: unknown): value is ReviewEpochState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<ReviewEpochState>;
@@ -220,22 +224,33 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
   );
 }
 
+async function readReviewBudget(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): Promise<ReviewBudgetLoadResult> {
+  const value = await ctx.state.get<unknown>(
+    reviewBudgetKey(ctx, owner, repo, n),
+  );
+  if (value === undefined || value === null) return { ok: true };
+  if (!isReviewEpochState(value)) {
+    logger(ctx).warn("githubbot_review_budget_invalid", {
+      pr: `${owner}/${repo}#${n}`,
+    });
+    return { ok: false };
+  }
+  return { ok: true, state: value };
+}
+
 async function loadReviewBudget(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
   n: number,
-): Promise<{ ok: true; state?: ReviewEpochState } | { ok: false }> {
+): Promise<ReviewBudgetLoadResult> {
   try {
-    const value = await ctx.state.get<unknown>(reviewBudgetKey(ctx, owner, repo, n));
-    if (value === undefined || value === null) return { ok: true };
-    if (!isReviewEpochState(value)) {
-      logger(ctx).warn("githubbot_review_budget_invalid", {
-        pr: `${owner}/${repo}#${n}`,
-      });
-      return { ok: false };
-    }
-    return { ok: true, state: value };
+    return await readReviewBudget(ctx, owner, repo, n);
   } catch (error) {
     logger(ctx).warn("githubbot_review_budget_load_failed", {
       error: errorMessage(error),
@@ -344,6 +359,20 @@ async function retryingReviewStateOperation<T>(
       }
     }
   }
+}
+
+async function retryingReviewBudgetLoad(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): Promise<ReviewBudgetLoadResult> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_budget_load_retry",
+    `${owner}/${repo}#${n}`,
+    () => readReviewBudget(ctx, owner, repo, n),
+  );
 }
 
 async function retryingReviewClaim(
@@ -673,6 +702,14 @@ export async function handleReviewEvent(
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
     });
+    if (admission.state.pausedHeadSha && admission.state.pauseReason) {
+      await escalateReviewBudget(ctx, repo.owner, repo.repo, pr, {
+        assessment: admission.assessment,
+        decision: "pause",
+        reason: admission.state.pauseReason,
+        state: admission.state,
+      });
+    }
   }
 }
 
@@ -706,6 +743,7 @@ async function maybeRecordReviewResetApproval(
       reason: "non_human_sender",
       sender,
     });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return true;
   }
 
@@ -723,6 +761,7 @@ async function maybeRecordReviewResetApproval(
       pr: `${owner}/${repo}#${pr.number}`,
       sender,
     });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return true;
   }
   if (permission !== "admin" && permission !== "write") {
@@ -732,6 +771,7 @@ async function maybeRecordReviewResetApproval(
       reason: "insufficient_repository_permission",
       sender,
     });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return true;
   }
   if (!deliveryId) {
@@ -740,11 +780,15 @@ async function maybeRecordReviewResetApproval(
       reason: "missing_delivery_id",
       sender,
     });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return true;
   }
 
-  const budget = await loadReviewBudget(ctx, owner, repo, pr.number);
-  if (!budget.ok) return true;
+  const budget = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
+  if (!budget.ok) {
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
   if (!budget.state?.pausedHeadSha) {
     logger(ctx).warn("githubbot_review_reset_denied", {
       pr: `${owner}/${repo}#${pr.number}`,
@@ -941,7 +985,7 @@ async function consumeApprovedReviewReset(
   pr: PullRequestSummary,
   headSha: string,
 ): Promise<boolean> {
-  const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
+  const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
   if (!loaded.ok) return false;
   const approval = await pendingReviewResetApproval(
     ctx,
@@ -991,7 +1035,7 @@ async function admitReviewResponse(
   pr: PullRequestSummary,
   headSha: string,
 ): Promise<ReviewAdmission | null> {
-  const loaded = await loadReviewBudget(ctx, owner, repo, pr.number);
+  const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
   if (!loaded.ok) return null;
   const approval = await pendingReviewResetApproval(
     ctx,
@@ -1092,11 +1136,12 @@ async function escalateReviewBudget(
   const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
   const evidence = admission.assessment?.reasons.join("; ") ?? "unavailable";
   const body =
-    `${mention}Automatic review response is paused to prevent an open-ended ` +
-    `review/fix loop (reason: ${admission.reason}; epoch ` +
+    `${mention}The bounded review budget reached its human-handoff boundary ` +
+    `to prevent an open-ended review/fix loop (reason: ${admission.reason}; epoch ` +
     `${admission.state.epoch}, round ${admission.state.roundsUsed}). ` +
-    `Change assessment: ${evidence}. A write-authorized human can add the ` +
-    `\`${resetLabel}\` label and re-request review to explicitly start another ` +
+    `Change assessment: ${evidence}. No further automatic review response or ` +
+    `merge will proceed until a write-authorized human adds the ` +
+    `\`${resetLabel}\` label and re-requests review to explicitly start another ` +
     `epoch; otherwise adjudicate the finding or split the PR.`;
   try {
     await ctx.octokit.rest.issues.createComment({
