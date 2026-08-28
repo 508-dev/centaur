@@ -105,6 +105,8 @@ spec:
               value: {{ .Values.githubbot.mergeMethod | quote }}
             - name: GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH
               value: {{ .Values.githubbot.reviewMaxRoundsPerEpoch | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH
+              value: {{ .Values.githubbot.reviewMaxTotalRoundsPerEpoch | quote }}
             - name: GITHUBBOT_REVIEW_MAX_EPOCHS
               value: {{ .Values.githubbot.reviewMaxEpochs | quote }}
             - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES

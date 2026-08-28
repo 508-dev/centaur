@@ -423,7 +423,14 @@ describe("CI fix counter and escalation", () => {
 });
 
 describe("bounded review epochs", () => {
-  const submittedReview = (reviewId: number, headSha: string) =>
+  const submittedReview = (
+    reviewId: number,
+    headSha: string,
+    reviewer: { id: number; login: string } = {
+      id: 101,
+      login: "reviewer",
+    },
+  ) =>
     JSON.stringify({
       action: "submitted",
       repository: { full_name: "base/repo" },
@@ -432,7 +439,7 @@ describe("bounded review epochs", () => {
         commit_id: headSha,
         id: reviewId,
         state: "commented",
-        user: { login: "reviewer" },
+        user: reviewer,
       },
     });
 
@@ -442,6 +449,7 @@ describe("bounded review epochs", () => {
     comments?: string[];
     headSha?: string;
     merges?: { count: number };
+    maxTotalRoundsPerEpoch?: number;
     permission?: string;
     removedLabels?: string[];
     state?: ReturnType<typeof makeState>;
@@ -522,6 +530,7 @@ describe("bounded review epochs", () => {
         escalationHandle: "maintainer",
         fetch: () => Promise.resolve(new Response("no", { status: 400 })),
         logger: quietLogger,
+        reviewMaxTotalRoundsPerEpoch: input?.maxTotalRoundsPerEpoch,
       },
       state: input?.state ?? makeState(),
       userName: "centaur-bot",
@@ -568,13 +577,89 @@ describe("bounded review epochs", () => {
       epoch: 1,
       lastReviewedHeadSha: "head-2",
       pausedHeadSha: "head-2",
-      pauseReason: "round_budget_exhausted",
+      pauseReason: "reviewer_round_budget_exhausted",
+      reviewerRoundsUsed: { "github-user:101": 3 },
       roundsUsed: 3,
     });
     expect(merges.count).toBe(0);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("round_budget_exhausted");
     expect(comments[0]).toContain("centaur-review-reset");
+  });
+
+  test("separates reviewer budgets while enforcing the epoch aggregate cap", async () => {
+    const comments: string[] = [];
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-3",
+      epoch: 1,
+      lastReviewedHeadSha: "head-3",
+      pausedHeadSha: "head-3",
+      pauseReason: "reviewer_round_budget_exhausted",
+      reviewerRoundsUsed: { "github-user:101": 3 },
+      roundsUsed: 3,
+      version: 1,
+    });
+    const ctx = budgetCtx({
+      comments,
+      headSha: "head-4",
+      maxTotalRoundsPerEpoch: 4,
+      state,
+    });
+
+    await handleReviewEvent(
+      ctx,
+      submittedReview(18, "head-4", {
+        id: 202,
+        login: "second-reviewer[bot]",
+      }),
+    );
+    await handleReviewEvent(
+      ctx,
+      submittedReview(19, "head-4", {
+        id: 303,
+        login: "third-reviewer[bot]",
+      }),
+    );
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      pausedHeadSha: "head-4",
+      pauseReason: "aggregate_round_budget_exhausted",
+      reviewerRoundsUsed: {
+        "github-user:101": 3,
+        "github-user:202": 1,
+      },
+      roundsUsed: 4,
+    });
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("reviewer round 1/3");
+    expect(comments[0]).toContain("epoch total 4/4");
+  });
+
+  test("keeps a reviewer budget stable across login changes", async () => {
+    const state = makeState();
+    const ctx = budgetCtx({ state });
+
+    await handleReviewEvent(
+      ctx,
+      submittedReview(20, "head-1", { id: 404, login: "old-name[bot]" }),
+    );
+    await handleReviewEvent(
+      ctx,
+      submittedReview(21, "head-1", { id: 404, login: "new-name[bot]" }),
+    );
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      reviewerRoundsUsed: { "github-user:404": 2 },
+      roundsUsed: 2,
+    });
   });
 
   test("retries a transient durable review-claim failure", async () => {
@@ -760,7 +845,7 @@ describe("bounded review epochs", () => {
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({
       pausedHeadSha: "head-2",
-      pauseReason: "round_budget_exhausted",
+      pauseReason: "reviewer_round_budget_exhausted",
     });
   });
 

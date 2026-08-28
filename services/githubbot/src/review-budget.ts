@@ -1,4 +1,5 @@
 export const DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH = 3;
+export const DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH = 6;
 export const DEFAULT_REVIEW_MAX_EPOCHS = 3;
 export const DEFAULT_REVIEW_MATERIAL_CHANGE_LINES = 200;
 export const DEFAULT_REVIEW_MATERIAL_CHANGE_FILES = 8;
@@ -28,6 +29,7 @@ export type ReviewEpochState = {
   lastReviewedHeadSha: string;
   pausedHeadSha?: string;
   pauseReason?: ReviewPauseReason;
+  reviewerRoundsUsed?: Record<string, number>;
   roundsUsed: number;
   version: 1;
 };
@@ -39,6 +41,8 @@ export type ReviewPauseReason =
   | "change_actor_unknown"
   | "change_significance_unknown"
   | "epoch_budget_exhausted"
+  | "aggregate_round_budget_exhausted"
+  | "reviewer_round_budget_exhausted"
   | "round_budget_exhausted";
 
 export type ReviewAdmission =
@@ -62,6 +66,8 @@ type ReviewAdmissionInput = {
   manualReset: boolean;
   maxEpochs: number;
   maxRoundsPerEpoch: number;
+  maxTotalRoundsPerEpoch: number;
+  reviewerKey: string;
   state?: ReviewEpochState;
 };
 
@@ -158,24 +164,57 @@ export function assessReviewChange(input: {
   };
 }
 
-function nextEpoch(state: ReviewEpochState, headSha: string): ReviewEpochState {
+function firstEpoch(
+  headSha: string,
+  reviewerKey: string,
+  epoch = 1,
+): ReviewEpochState {
   return {
     anchorHeadSha: headSha,
     automationPendingFromHeadSha: headSha,
-    epoch: state.epoch + 1,
+    epoch,
     lastReviewedHeadSha: headSha,
+    reviewerRoundsUsed: { [reviewerKey]: 1 },
     roundsUsed: 1,
     version: 1,
   };
 }
 
-function nextRound(state: ReviewEpochState, headSha: string): ReviewEpochState {
+function nextEpoch(
+  state: ReviewEpochState,
+  headSha: string,
+  reviewerKey: string,
+): ReviewEpochState {
+  return firstEpoch(headSha, reviewerKey, state.epoch + 1);
+}
+
+function reviewerRounds(
+  state: ReviewEpochState,
+  reviewerKey: string,
+): number {
+  if (!state.reviewerRoundsUsed) {
+    // Version-1 states written before reviewer attribution are conservatively
+    // charged to the first reviewer handled after upgrade.
+    return state.roundsUsed;
+  }
+  return state.reviewerRoundsUsed[reviewerKey] ?? 0;
+}
+
+function nextRound(
+  state: ReviewEpochState,
+  headSha: string,
+  reviewerKey: string,
+): ReviewEpochState {
+  const reviewerRoundsUsed = state.reviewerRoundsUsed
+    ? { ...state.reviewerRoundsUsed }
+    : { [reviewerKey]: state.roundsUsed };
+  reviewerRoundsUsed[reviewerKey] =
+    (reviewerRoundsUsed[reviewerKey] ?? 0) + 1;
   return {
     ...state,
     automationPendingFromHeadSha: headSha,
     lastReviewedHeadSha: headSha,
-    pausedHeadSha: undefined,
-    pauseReason: undefined,
+    reviewerRoundsUsed,
     roundsUsed: state.roundsUsed + 1,
   };
 }
@@ -191,11 +230,47 @@ function paused(
 function withFinalRoundHandoff(
   state: ReviewEpochState,
   headSha: string,
+  reviewerKey: string,
   maxRoundsPerEpoch: number,
+  maxTotalRoundsPerEpoch: number,
 ): ReviewEpochState {
-  return state.roundsUsed >= maxRoundsPerEpoch
-    ? paused(state, headSha, "round_budget_exhausted")
-    : state;
+  if (state.roundsUsed >= maxTotalRoundsPerEpoch) {
+    return paused(state, headSha, "aggregate_round_budget_exhausted");
+  }
+  if (reviewerRounds(state, reviewerKey) >= maxRoundsPerEpoch) {
+    return state.pausedHeadSha
+      ? state
+      : paused(state, headSha, "reviewer_round_budget_exhausted");
+  }
+  return state;
+}
+
+function exhaustedAdmission(
+  input: ReviewAdmissionInput,
+  state: ReviewEpochState,
+  reviewerReason: ReviewPauseReason = "reviewer_round_budget_exhausted",
+): Extract<ReviewAdmission, { decision: "pause" }> | undefined {
+  if (state.roundsUsed >= input.maxTotalRoundsPerEpoch) {
+    return {
+      assessment: input.assessment,
+      decision: "pause",
+      reason: "aggregate_round_budget_exhausted",
+      state: paused(
+        state,
+        input.headSha,
+        "aggregate_round_budget_exhausted",
+      ),
+    };
+  }
+  if (reviewerRounds(state, input.reviewerKey) >= input.maxRoundsPerEpoch) {
+    return {
+      assessment: input.assessment,
+      decision: "pause",
+      reason: reviewerReason,
+      state: paused(state, input.headSha, reviewerReason),
+    };
+  }
+  return undefined;
 }
 
 export function decideReviewAdmission(
@@ -203,21 +278,16 @@ export function decideReviewAdmission(
 ): ReviewAdmission {
   const existing = input.state;
   if (!existing) {
-    const state: ReviewEpochState = {
-      anchorHeadSha: input.headSha,
-      automationPendingFromHeadSha: input.headSha,
-      epoch: 1,
-      lastReviewedHeadSha: input.headSha,
-      roundsUsed: 1,
-      version: 1,
-    };
+    const state = firstEpoch(input.headSha, input.reviewerKey);
     return {
       decision: "allow",
       resetEpoch: false,
       state: withFinalRoundHandoff(
         state,
         input.headSha,
+        input.reviewerKey,
         input.maxRoundsPerEpoch,
+        input.maxTotalRoundsPerEpoch,
       ),
     };
   }
@@ -228,28 +298,27 @@ export function decideReviewAdmission(
       decision: "allow",
       resetEpoch: true,
       state: withFinalRoundHandoff(
-        nextEpoch(existing, input.headSha),
+        nextEpoch(existing, input.headSha, input.reviewerKey),
         input.headSha,
+        input.reviewerKey,
         input.maxRoundsPerEpoch,
+        input.maxTotalRoundsPerEpoch,
       ),
     };
   }
 
   if (existing.lastReviewedHeadSha === input.headSha) {
-    if (existing.roundsUsed >= input.maxRoundsPerEpoch) {
-      return {
-        decision: "pause",
-        reason: "round_budget_exhausted",
-        state: paused(existing, input.headSha, "round_budget_exhausted"),
-      };
-    }
+    const exhausted = exhaustedAdmission(input, existing);
+    if (exhausted) return exhausted;
     return {
       decision: "allow",
       resetEpoch: false,
       state: withFinalRoundHandoff(
-        nextRound(existing, input.headSha),
+        nextRound(existing, input.headSha, input.reviewerKey),
         input.headSha,
+        input.reviewerKey,
         input.maxRoundsPerEpoch,
+        input.maxTotalRoundsPerEpoch,
       ),
     };
   }
@@ -278,9 +347,11 @@ export function decideReviewAdmission(
         decision: "allow",
         resetEpoch: true,
         state: withFinalRoundHandoff(
-          nextEpoch(existing, input.headSha),
+          nextEpoch(existing, input.headSha, input.reviewerKey),
           input.headSha,
+          input.reviewerKey,
           input.maxRoundsPerEpoch,
+          input.maxTotalRoundsPerEpoch,
         ),
       };
     }
@@ -292,47 +363,39 @@ export function decideReviewAdmission(
         state: paused(existing, input.headSha, "change_actor_unknown"),
       };
     }
-    if (existing.roundsUsed >= input.maxRoundsPerEpoch) {
-      return {
-        assessment: input.assessment,
-        decision: "pause",
-        reason: "automation_material_change_requires_reset",
-        state: paused(
-          existing,
-          input.headSha,
-          "automation_material_change_requires_reset",
-        ),
-      };
-    }
+    const exhausted = exhaustedAdmission(
+      input,
+      existing,
+      "automation_material_change_requires_reset",
+    );
+    if (exhausted) return exhausted;
     return {
       assessment: input.assessment,
       decision: "allow",
       resetEpoch: false,
       state: withFinalRoundHandoff(
-        nextRound(existing, input.headSha),
+        nextRound(existing, input.headSha, input.reviewerKey),
         input.headSha,
+        input.reviewerKey,
         input.maxRoundsPerEpoch,
+        input.maxTotalRoundsPerEpoch,
       ),
     };
   }
 
-  if (existing.roundsUsed >= input.maxRoundsPerEpoch) {
-    return {
-      assessment: input.assessment,
-      decision: "pause",
-      reason: "round_budget_exhausted",
-      state: paused(existing, input.headSha, "round_budget_exhausted"),
-    };
-  }
+  const exhausted = exhaustedAdmission(input, existing);
+  if (exhausted) return exhausted;
 
   return {
     assessment: input.assessment,
     decision: "allow",
     resetEpoch: false,
     state: withFinalRoundHandoff(
-      nextRound(existing, input.headSha),
+      nextRound(existing, input.headSha, input.reviewerKey),
       input.headSha,
+      input.reviewerKey,
       input.maxRoundsPerEpoch,
+      input.maxTotalRoundsPerEpoch,
     ),
   };
 }

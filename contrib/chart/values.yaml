@@ -668,10 +668,12 @@ githubbot:
   # / draft status.
   autoMerge: true
   mergeMethod: squash
-  # Bound automated review/fix loops. One epoch includes the first broad review
-  # plus two repair-validation rounds. Material human changes start a new epoch;
-  # automation needs an explicitly approved reset once the current budget ends.
+  # Bound automated review/fix loops. Each reviewer gets the first broad review
+  # plus two repair-validation rounds, while the aggregate cap prevents adding
+  # reviewers from making the epoch unbounded. Material human changes start a
+  # new epoch; automation needs an approved reset once the budget ends.
   reviewMaxRoundsPerEpoch: 3
+  reviewMaxTotalRoundsPerEpoch: 6
   reviewMaxEpochs: 3
   reviewMaterialChangeLines: 200
   reviewMaterialChangeFiles: 8

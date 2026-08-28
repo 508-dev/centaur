@@ -5,15 +5,23 @@ import {
   type ReviewEpochState,
 } from "../src/review-budget";
 
-const epoch = (overrides: Partial<ReviewEpochState> = {}): ReviewEpochState => ({
-  anchorHeadSha: "head-1",
-  automationPendingFromHeadSha: "head-1",
-  epoch: 1,
-  lastReviewedHeadSha: "head-1",
-  roundsUsed: 1,
-  version: 1,
-  ...overrides,
-});
+const DEFAULT_REVIEWER_KEY = "github-user:101";
+
+const epoch = (overrides: Partial<ReviewEpochState> = {}): ReviewEpochState => {
+  const state: ReviewEpochState = {
+    anchorHeadSha: "head-1",
+    automationPendingFromHeadSha: "head-1",
+    epoch: 1,
+    lastReviewedHeadSha: "head-1",
+    roundsUsed: 1,
+    version: 1,
+    ...overrides,
+  };
+  state.reviewerRoundsUsed = overrides.reviewerRoundsUsed ?? {
+    [DEFAULT_REVIEWER_KEY]: state.roundsUsed,
+  };
+  return state;
+};
 
 describe("assessReviewChange", () => {
   test("keeps a small runtime change in the current epoch", () => {
@@ -105,6 +113,8 @@ describe("decideReviewAdmission", () => {
     manualReset: false,
     maxEpochs: 3,
     maxRoundsPerEpoch: 3,
+    maxTotalRoundsPerEpoch: 6,
+    reviewerKey: DEFAULT_REVIEWER_KEY,
   };
 
   test("starts the first epoch and counts its broad review", () => {
@@ -116,16 +126,86 @@ describe("decideReviewAdmission", () => {
         automationPendingFromHeadSha: "head-2",
         epoch: 1,
         lastReviewedHeadSha: "head-2",
+        reviewerRoundsUsed: { [DEFAULT_REVIEWER_KEY]: 1 },
         roundsUsed: 1,
         version: 1,
       },
     });
   });
 
-  test("counts repeated reviews of the same head against the bounded epoch", () => {
+  test("counts repeated reviews against both reviewer and aggregate budgets", () => {
     expect(
       decideReviewAdmission({ ...base, headSha: "head-1", state: epoch() }),
-    ).toMatchObject({ decision: "allow", state: { roundsUsed: 2 } });
+    ).toMatchObject({
+      decision: "allow",
+      state: {
+        reviewerRoundsUsed: { [DEFAULT_REVIEWER_KEY]: 2 },
+        roundsUsed: 2,
+      },
+    });
+  });
+
+  test("keeps separate reviewer budgets without clearing an existing handoff", () => {
+    expect(
+      decideReviewAdmission({
+        ...base,
+        reviewerKey: "github-user:202",
+        state: epoch({
+          pauseReason: "reviewer_round_budget_exhausted",
+          pausedHeadSha: "head-1",
+          reviewerRoundsUsed: { [DEFAULT_REVIEWER_KEY]: 3 },
+          roundsUsed: 3,
+        }),
+      }),
+    ).toMatchObject({
+      decision: "allow",
+      state: {
+        pausedHeadSha: "head-1",
+        reviewerRoundsUsed: {
+          [DEFAULT_REVIEWER_KEY]: 3,
+          "github-user:202": 1,
+        },
+        roundsUsed: 4,
+      },
+    });
+  });
+
+  test("enforces the aggregate cap even when a new reviewer has budget", () => {
+    const finalAggregateRound = decideReviewAdmission({
+      ...base,
+      headSha: "head-6",
+      reviewerKey: "github-user:303",
+      state: epoch({
+        lastReviewedHeadSha: "head-5",
+        pauseReason: "reviewer_round_budget_exhausted",
+        pausedHeadSha: "head-3",
+        reviewerRoundsUsed: {
+          [DEFAULT_REVIEWER_KEY]: 3,
+          "github-user:202": 2,
+        },
+        roundsUsed: 5,
+      }),
+    });
+    expect(finalAggregateRound).toMatchObject({
+      decision: "allow",
+      state: {
+        pausedHeadSha: "head-6",
+        pauseReason: "aggregate_round_budget_exhausted",
+        reviewerRoundsUsed: { "github-user:303": 1 },
+        roundsUsed: 6,
+      },
+    });
+    expect(
+      decideReviewAdmission({
+        ...base,
+        headSha: "head-7",
+        reviewerKey: "github-user:404",
+        state: finalAggregateRound.state,
+      }),
+    ).toMatchObject({
+      decision: "pause",
+      reason: "aggregate_round_budget_exhausted",
+    });
   });
 
   test("marks the final allowed repair round as a merge-blocking handoff", () => {
@@ -146,7 +226,7 @@ describe("decideReviewAdmission", () => {
       resetEpoch: false,
       state: {
         pausedHeadSha: "head-4",
-        pauseReason: "round_budget_exhausted",
+        pauseReason: "reviewer_round_budget_exhausted",
         roundsUsed: 3,
       },
     });
@@ -158,7 +238,7 @@ describe("decideReviewAdmission", () => {
       }),
     ).toMatchObject({
       decision: "pause",
-      reason: "round_budget_exhausted",
+      reason: "reviewer_round_budget_exhausted",
     });
   });
 
@@ -173,7 +253,7 @@ describe("decideReviewAdmission", () => {
       decision: "allow",
       state: {
         pausedHeadSha: "head-2",
-        pauseReason: "round_budget_exhausted",
+        pauseReason: "reviewer_round_budget_exhausted",
         roundsUsed: 1,
       },
     });
@@ -207,7 +287,7 @@ describe("decideReviewAdmission", () => {
       state: {
         epoch: 1,
         pausedHeadSha: "head-2",
-        pauseReason: "round_budget_exhausted",
+        pauseReason: "reviewer_round_budget_exhausted",
         roundsUsed: 3,
       },
     });

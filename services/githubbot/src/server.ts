@@ -120,6 +120,9 @@ const options: GithubbotOptions = {
   reviewMaxRoundsPerEpoch: optionalNumberEnv(
     "GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH",
   ),
+  reviewMaxTotalRoundsPerEpoch: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH",
+  ),
   reviewMaxEpochs: optionalNumberEnv("GITHUBBOT_REVIEW_MAX_EPOCHS"),
   reviewMaterialChangeLines: optionalNumberEnv(
     "GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES",

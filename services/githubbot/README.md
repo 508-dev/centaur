@@ -82,9 +82,11 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   and enforced contracts, makes one minimal coherent commit, replies on each thread, resolves what
   it addressed, and re-requests review only when code changed. Finding validation is prompt-level;
   the loop limit and epoch transitions below are deterministic controller decisions.
-- **Bound review loops.** Review response is limited to three rounds per epoch by default: the first
-  broad review plus two repair-validation rounds. Repeated reviews of the same head consume that
-  budget instead of creating an unbounded side channel.
+- **Bound review loops.** Each reviewer is limited to three rounds per epoch by default: the first
+  broad review plus two repair-validation rounds. Reviewer budgets use the stable GitHub user ID
+  when available (with a normalized-login fallback), so one review bot cannot consume another's
+  allowance. The epoch also has a six-round aggregate cap, so adding reviewers cannot create an
+  unbounded side channel. Repeated reviews of the same head consume both counters.
   For a new head, githubbot compares the cumulative change against the epoch anchor. Authorization,
   policy, schema/migration, dependency/build, API-contract, CI/deployment changes are material, as
   are changes that cross configured runtime-line or runtime-file thresholds. Non-linear or
@@ -183,7 +185,8 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
 | `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
-| `GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH` | — | Review heads handled within one epoch. Default 3 (initial review plus two validations). |
+| `GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH` | — | Review heads handled per reviewer within one epoch. Default 3 (initial review plus two validations). |
+| `GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH` | — | Aggregate review heads handled across all reviewers in one epoch. Default 6. |
 | `GITHUBBOT_REVIEW_MAX_EPOCHS` | — | Material human-change epochs before explicit continuation is required. Default 3. |
 | `GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES` | — | Cumulative changed runtime lines that start a new epoch for a human change. Default 200. |
 | `GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES` | — | Cumulative changed runtime files that start a new epoch for a human change. Default 8. |

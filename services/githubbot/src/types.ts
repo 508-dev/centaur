@@ -144,8 +144,10 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
-  /** Review passes allowed in one epoch (initial review plus validations). Default 3. */
+  /** Review passes allowed per reviewer in one epoch. Default 3. */
   reviewMaxRoundsPerEpoch?: number;
+  /** Aggregate review passes allowed across all reviewers in one epoch. Default 6. */
+  reviewMaxTotalRoundsPerEpoch?: number;
   /** Material-change epochs allowed before human continuation is required. Default 3. */
   reviewMaxEpochs?: number;
   /** Cumulative changed runtime lines that make a review change material. Default 200. */

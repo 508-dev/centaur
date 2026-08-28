@@ -9,6 +9,7 @@ import {
   DEFAULT_REVIEW_MATERIAL_CHANGE_LINES,
   DEFAULT_REVIEW_MAX_EPOCHS,
   DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+  DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
   DEFAULT_REVIEW_RESET_LABEL,
   type ReviewAdmission,
   type ReviewChangeActor,
@@ -197,6 +198,21 @@ type ReviewBudgetLoadResult =
 function isReviewEpochState(value: unknown): value is ReviewEpochState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<ReviewEpochState>;
+  const reviewerRounds = candidate.reviewerRoundsUsed;
+  const validReviewerRounds =
+    reviewerRounds === undefined ||
+    (reviewerRounds !== null &&
+      typeof reviewerRounds === "object" &&
+      !Array.isArray(reviewerRounds) &&
+      Object.entries(reviewerRounds).every(
+        ([key, rounds]) =>
+          key.length > 0 &&
+          typeof rounds === "number" &&
+          Number.isInteger(rounds) &&
+          rounds > 0,
+      ) &&
+      Object.values(reviewerRounds).reduce((sum, rounds) => sum + rounds, 0) ===
+        candidate.roundsUsed);
   return (
     candidate.version === 1 &&
     typeof candidate.anchorHeadSha === "string" &&
@@ -213,12 +229,15 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
       typeof candidate.consumedResetApprovalId === "string") &&
     (candidate.pausedHeadSha === undefined ||
       typeof candidate.pausedHeadSha === "string") &&
+    validReviewerRounds &&
     (candidate.pauseReason === undefined ||
       [
+        "aggregate_round_budget_exhausted",
         "automation_material_change_requires_reset",
         "change_actor_unknown",
         "change_significance_unknown",
         "epoch_budget_exhausted",
+        "reviewer_round_budget_exhausted",
         "round_budget_exhausted",
       ].includes(candidate.pauseReason))
   );
@@ -523,6 +542,15 @@ function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {
   return isOwnedPr({ assignees: pr.assignees, userName: ctx.userName });
 }
 
+function reviewBudgetReviewerKey(user?: JsonRecord): string {
+  const id = numberValue(user?.id);
+  if (id !== undefined && Number.isSafeInteger(id) && id > 0) {
+    return `github-user:${id}`;
+  }
+  const login = stringValue(user?.login)?.trim().toLowerCase();
+  return login ? `github-login:${login}` : "github-reviewer:unknown";
+}
+
 /** `pull_request` lifecycle (non-review_requested actions). */
 export async function handlePullRequestEvent(
   ctx: PrManagerContext,
@@ -596,7 +624,9 @@ export async function handleReviewEvent(
   const number = numberValue(prNode.number);
   const reviewId = numberValue(reviewNode.id);
   if (number === undefined || reviewId === undefined) return;
-  const reviewer = stringValue(isRecord(reviewNode.user) ? reviewNode.user.login : undefined);
+  const reviewerNode = isRecord(reviewNode.user) ? reviewNode.user : undefined;
+  const reviewer = stringValue(reviewerNode?.login);
+  const reviewerKey = reviewBudgetReviewerKey(reviewerNode);
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
 
   // A review is tied to review.commit_id. The PR head can advance before this
@@ -648,6 +678,7 @@ export async function handleReviewEvent(
             repo.repo,
             pr,
             effectiveHeadSha,
+            reviewerKey,
           ),
       ))
     ) {
@@ -680,6 +711,7 @@ export async function handleReviewEvent(
           repo.repo,
           pr,
           effectiveHeadSha,
+          reviewerKey,
         ),
     );
     if (!admission) {
@@ -693,22 +725,34 @@ export async function handleReviewEvent(
         repo.repo,
         pr,
         admission,
+        reviewerKey,
       );
       return;
     }
     fireAddressReviewTurn(ctx, repo.owner, repo.repo, pr, {
       budget: admission.state,
       reviewer: reviewer ?? "the reviewer",
+      reviewerKey,
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
     });
-    if (admission.state.pausedHeadSha && admission.state.pauseReason) {
-      await escalateReviewBudget(ctx, repo.owner, repo.repo, pr, {
-        assessment: admission.assessment,
-        decision: "pause",
-        reason: admission.state.pauseReason,
-        state: admission.state,
-      });
+    if (
+      admission.state.pausedHeadSha === effectiveHeadSha &&
+      admission.state.pauseReason
+    ) {
+      await escalateReviewBudget(
+        ctx,
+        repo.owner,
+        repo.repo,
+        pr,
+        {
+          assessment: admission.assessment,
+          decision: "pause",
+          reason: admission.state.pauseReason,
+          state: admission.state,
+        },
+        reviewerKey,
+      );
     }
   }
 }
@@ -984,6 +1028,7 @@ async function consumeApprovedReviewReset(
   repo: string,
   pr: PullRequestSummary,
   headSha: string,
+  reviewerKey: string,
 ): Promise<boolean> {
   const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
   if (!loaded.ok) return false;
@@ -1003,6 +1048,10 @@ async function consumeApprovedReviewReset(
     maxRoundsPerEpoch:
       ctx.options.reviewMaxRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    maxTotalRoundsPerEpoch:
+      ctx.options.reviewMaxTotalRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+    reviewerKey,
     state: loaded.state,
   });
   const state = {
@@ -1034,6 +1083,7 @@ async function admitReviewResponse(
   repo: string,
   pr: PullRequestSummary,
   headSha: string,
+  reviewerKey: string,
 ): Promise<ReviewAdmission | null> {
   const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
   if (!loaded.ok) return null;
@@ -1086,6 +1136,10 @@ async function admitReviewResponse(
     maxRoundsPerEpoch:
       ctx.options.reviewMaxRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    maxTotalRoundsPerEpoch:
+      ctx.options.reviewMaxTotalRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+    reviewerKey,
     state: loaded.state,
   });
   const state = approval
@@ -1114,6 +1168,9 @@ async function admitReviewResponse(
       head_sha: headSha,
       reset_epoch:
         admission.decision === "allow" ? admission.resetEpoch : undefined,
+      reviewer_key: reviewerKey,
+      reviewer_rounds_used:
+        state.reviewerRoundsUsed?.[reviewerKey] ?? state.roundsUsed,
       rounds_used: state.roundsUsed,
     },
   );
@@ -1126,6 +1183,7 @@ async function escalateReviewBudget(
   repo: string,
   pr: PullRequestSummary,
   admission: Extract<ReviewAdmission, { decision: "pause" }>,
+  reviewerKey: string,
 ): Promise<void> {
   const pauseClaim = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-paused:${owner}/${repo}#${pr.number}:${pr.headSha}:${admission.state.epoch}:${admission.reason}`;
   if (!(await strictClaim(ctx, pauseClaim, `${owner}/${repo}#${pr.number}`))) {
@@ -1135,10 +1193,20 @@ async function escalateReviewBudget(
   const mention = handle ? `@${handle} ` : "";
   const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
   const evidence = admission.assessment?.reasons.join("; ") ?? "unavailable";
+  const reviewerRounds =
+    admission.state.reviewerRoundsUsed?.[reviewerKey] ??
+    admission.state.roundsUsed;
+  const maxReviewerRounds =
+    ctx.options.reviewMaxRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH;
+  const maxTotalRounds =
+    ctx.options.reviewMaxTotalRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH;
   const body =
     `${mention}The bounded review budget reached its human-handoff boundary ` +
     `to prevent an open-ended review/fix loop (reason: ${admission.reason}; epoch ` +
-    `${admission.state.epoch}, round ${admission.state.roundsUsed}). ` +
+    `${admission.state.epoch}, reviewer round ${reviewerRounds}/${maxReviewerRounds}, ` +
+    `epoch total ${admission.state.roundsUsed}/${maxTotalRounds}). ` +
     `Change assessment: ${evidence}. No further automatic review response or ` +
     `merge will proceed until a write-authorized human adds the ` +
     `\`${resetLabel}\` label and re-requests review to explicitly start another ` +
@@ -1449,18 +1517,25 @@ function fireAddressReviewTurn(
   review: {
     budget: ReviewEpochState;
     reviewer: string;
+    reviewerKey: string;
     reviewId: number;
     reviewNodeId?: string;
   },
 ): void {
-  const { budget, reviewer, reviewId, reviewNodeId } = review;
-  const maxRounds =
+  const { budget, reviewer, reviewerKey, reviewId, reviewNodeId } = review;
+  const maxReviewerRounds =
     ctx.options.reviewMaxRoundsPerEpoch ??
     DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH;
+  const maxTotalRounds =
+    ctx.options.reviewMaxTotalRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH;
+  const reviewerRounds =
+    budget.reviewerRoundsUsed?.[reviewerKey] ?? budget.roundsUsed;
   const preamble =
     `A review was submitted on pull request ${owner}/${repo}#${pr.number} ` +
-    `(head ${pr.headSha}). This is review epoch ${budget.epoch}, round ` +
-    `${budget.roundsUsed} of ${maxRounds}. Address it as the PR author, working ` +
+    `(head ${pr.headSha}). This is review epoch ${budget.epoch}, reviewer round ` +
+    `${reviewerRounds} of ${maxReviewerRounds}, and aggregate round ` +
+    `${budget.roundsUsed} of ${maxTotalRounds}. Address it as the PR author, working ` +
     `in your sandbox. This is a bounded validation-and-repair turn, not a new ` +
     `open-ended review:\n` +
     `- Read all of the feedback: \`gh pr view ${pr.number} --comments\` and the ` +
