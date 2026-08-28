@@ -101,7 +101,9 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   Only while that handoff pause is active, a non-bot collaborator with write/admin
   permission can continue by adding the
   `centaur-review-reset` label and re-requesting review. The approval is pinned to the current head,
-  consumed in the same durable write that advances the epoch, and the label is removed. Rejected
+  stored without expiry, consumed in the same durable write that advances the epoch, and invalidated
+  with its label when the head changes. Transient permission checks and consumed-label removals stay
+  in the retained lifecycle path and retry; permanent permission failures still fail closed. Rejected
   reset labels are also removed so a later authorized human can retry the documented flow. Create
   that label in each managed repository before use. An approval-only reset may merge even when a
   round cap is one; unlike a commented or changes-requested review, it does not start a repair turn

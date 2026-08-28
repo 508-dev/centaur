@@ -340,6 +340,23 @@ async function retryingReviewStateOperation<T>(
   }
 }
 
+function githubErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  return numberValue((error as { status?: unknown }).status);
+}
+
+function isTransientGithubError(error: unknown): boolean {
+  const status = githubErrorStatus(error);
+  return (
+    status === undefined ||
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
 async function retryingReviewBudgetLoad(
   ctx: PrManagerContext,
   owner: string,
@@ -590,6 +607,36 @@ export async function handlePullRequestEvent(
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
+  const previousHeadSha = stringValue(payload.before);
+  if (
+    action === "synchronize" &&
+    previousHeadSha &&
+    previousHeadSha !== pr.headSha
+  ) {
+    await runExclusive(
+      reviewBudgetLockKey(repo.owner, repo.repo, number),
+      async () => {
+        const approval = await retryingReviewResetApprovalLoad(
+          ctx,
+          repo.owner,
+          repo.repo,
+          number,
+          previousHeadSha,
+        );
+        if (approval) {
+          await cleanupReviewResetApproval(
+            ctx,
+            repo.owner,
+            repo.repo,
+            { ...pr, headSha: previousHeadSha },
+            true,
+          );
+        }
+        await tryMergeLocked(ctx, repo.owner, repo.repo, number);
+      },
+    );
+    return;
+  }
   // Being assigned the PR is the explicit signal to take it over: evaluate CI now
   // (forcing past the human-commit back-off — the assignment is a human handing
   // it to us) so an already-red or already-green PR is acted on immediately,
@@ -791,20 +838,31 @@ async function maybeRecordReviewResetApproval(
     return true;
   }
 
-  let permission: string | undefined;
-  try {
-    const { data } = await ctx.octokit.rest.repos.getCollaboratorPermissionLevel({
-      owner,
-      repo,
-      username: sender,
-    });
-    permission = data.permission;
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_reset_permission_failed", {
-      error: errorMessage(error),
-      pr: `${owner}/${repo}#${pr.number}`,
-      sender,
-    });
+  const permission = await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_permission_retry",
+    `${owner}/${repo}#${pr.number}`,
+    async () => {
+      try {
+        const { data } =
+          await ctx.octokit.rest.repos.getCollaboratorPermissionLevel({
+            owner,
+            repo,
+            username: sender,
+          });
+        return data.permission;
+      } catch (error) {
+        if (isTransientGithubError(error)) throw error;
+        logger(ctx).warn("githubbot_review_reset_permission_failed", {
+          error: errorMessage(error),
+          pr: `${owner}/${repo}#${pr.number}`,
+          sender,
+        });
+        return undefined;
+      }
+    },
+  );
+  if (!permission) {
     await cleanupReviewResetApproval(ctx, owner, repo, pr);
     return true;
   }
@@ -857,7 +915,6 @@ async function maybeRecordReviewResetApproval(
           approvedBy: sender,
           headSha: pr.headSha,
         } satisfies ReviewResetApproval,
-        CLAIM_TTL_MS,
       ),
   );
   traceLog(
@@ -977,7 +1034,7 @@ async function pendingReviewResetApproval(
   if (state?.consumedResetApprovalId === approval.approvalId) {
     // The budget write is the reset's durable commit point. Cleanup is only
     // hygiene and may be retried if a prior delete or label removal failed.
-    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
     return undefined;
   }
   if (!state?.pausedHeadSha) {
@@ -996,7 +1053,37 @@ async function cleanupReviewResetApproval(
   owner: string,
   repo: string,
   pr: PullRequestSummary,
+  consumed = false,
 ): Promise<void> {
+  if (consumed) {
+    const labelRemoved = await retryingReviewStateOperation(
+      ctx,
+      "githubbot_review_reset_label_remove_retry",
+      `${owner}/${repo}#${pr.number}`,
+      async () => {
+        try {
+          await ctx.octokit.rest.issues.removeLabel({
+            issue_number: pr.number,
+            name: ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL,
+            owner,
+            repo,
+          });
+          return true;
+        } catch (error) {
+          if (githubErrorStatus(error) === 404) return true;
+          if (isTransientGithubError(error)) throw error;
+          logger(ctx).warn("githubbot_review_reset_label_remove_failed", {
+            error: errorMessage(error),
+            pr: `${owner}/${repo}#${pr.number}`,
+          });
+          return false;
+        }
+      },
+    );
+    // Preserve the approval marker on a permanent removal failure so another
+    // lifecycle event can retry after repository permissions are repaired.
+    if (!labelRemoved) return;
+  }
   try {
     await ctx.state.delete(
       reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
@@ -1007,18 +1094,20 @@ async function cleanupReviewResetApproval(
       pr: `${owner}/${repo}#${pr.number}`,
     });
   }
-  try {
-    await ctx.octokit.rest.issues.removeLabel({
-      issue_number: pr.number,
-      name: ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL,
-      owner,
-      repo,
-    });
-  } catch (error) {
-    logger(ctx).debug("githubbot_review_reset_label_remove_failed", {
-      error: errorMessage(error),
-      pr: `${owner}/${repo}#${pr.number}`,
-    });
+  if (!consumed) {
+    try {
+      await ctx.octokit.rest.issues.removeLabel({
+        issue_number: pr.number,
+        name: ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL,
+        owner,
+        repo,
+      });
+    } catch (error) {
+      logger(ctx).debug("githubbot_review_reset_label_remove_failed", {
+        error: errorMessage(error),
+        pr: `${owner}/${repo}#${pr.number}`,
+      });
+    }
   }
 }
 
@@ -1089,7 +1178,7 @@ async function recordApprovedReview(
     ),
     { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
   );
-  await cleanupReviewResetApproval(ctx, owner, repo, pr);
+  await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
   return true;
 }
 
@@ -1164,7 +1253,7 @@ async function admitReviewResponse(
     : admission.state;
   await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
   if (admission.decision === "allow" && manualReset) {
-    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
   }
   traceLog(
     ctx.options,
