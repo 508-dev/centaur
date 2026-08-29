@@ -14,6 +14,7 @@ MAX_CONCURRENCY = 8
 MAX_TOTAL_ATTEMPTS = 32
 MAX_MEMBER_OUTPUT_CHARS = 12_000
 MAX_TOTAL_EVIDENCE_CHARS = 48_000
+MAX_AGENT_BATCH_NAME_BYTES = 128
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,7 +88,7 @@ async def run_model_ensemble(
         raise ValueError("run_model_ensemble requires replay_safe=True")
     limits = EnsemblePolicy() if policy is None else policy
     base_metadata = {} if metadata is None else metadata
-    _validate(
+    members = _validate(
         ensemble_name,
         prompt,
         principal,
@@ -444,7 +445,7 @@ def _validate(
     synthesis: Any,
     policy: Any,
     metadata: Any,
-) -> None:
+) -> list[EnsembleMember]:
     _nonempty(name, "ensemble_name")
     _nonempty(prompt, "prompt")
     _nonempty(principal, "principal")
@@ -452,14 +453,18 @@ def _validate(
         raise TypeError("members must be a sequence of EnsembleMember values")
     if not 2 <= len(members) <= MAX_MEMBERS:
         raise ValueError(f"members must contain between 2 and {MAX_MEMBERS} items")
+    normalized_members = []
     names = []
     for index, member in enumerate(members):
         if not isinstance(member, EnsembleMember):
             raise TypeError(f"members[{index}] must be an EnsembleMember")
         _nonempty(member.name, f"members[{index}].name")
+        member_name = member.name.strip()
+        _validate_batch_name(f"review-{member_name}-attempt-{MAX_TARGETS}", index)
         _nonempty(member.instructions, f"members[{index}].instructions", optional=True)
         _validate_targets(member.targets, f"members[{index}].targets")
-        names.append(member.name)
+        names.append(member_name)
+        normalized_members.append(dataclasses.replace(member, name=member_name))
     if len(names) != len(set(names)):
         raise ValueError("members must have unique names")
 
@@ -485,6 +490,15 @@ def _validate(
         )
     if not isinstance(metadata, dict) or any(not isinstance(key, str) for key in metadata):
         raise TypeError("metadata must be a dict with string keys")
+    return normalized_members
+
+
+def _validate_batch_name(name: str, member_index: int) -> None:
+    if len(name.encode("utf-8")) > MAX_AGENT_BATCH_NAME_BYTES:
+        raise ValueError(
+            f"members[{member_index}].name generates a ctx.run_agents name longer "
+            f"than {MAX_AGENT_BATCH_NAME_BYTES} UTF-8 bytes"
+        )
 
 
 def _validate_targets(targets: Any, path: str) -> None:

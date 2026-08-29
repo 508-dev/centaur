@@ -101,7 +101,7 @@ class ModelEnsembleTests(unittest.TestCase):
                 "Review PR #42 and recommend the smallest justified change.",
                 [
                     EnsembleMember(
-                        "correctness",
+                        " correctness ",
                         [ModelTarget("model-a", "openrouter")],
                     ),
                     EnsembleMember(
@@ -307,6 +307,38 @@ class ModelEnsembleTests(unittest.TestCase):
                         members[0],
                         {"name": "two", "targets": []},  # type: ignore[list-item]
                     ],  # type: ignore[arg-type]
+                    synthesis,
+                    principal="workflow-review-readonly",
+                    replay_safe=True,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "unique names"):
+            asyncio.run(
+                run_model_ensemble(
+                    context,
+                    "normalized-duplicate",
+                    "Review.",
+                    [
+                        EnsembleMember("one", [ModelTarget("a", "openrouter")]),
+                        EnsembleMember(" one ", [ModelTarget("b", "openrouter")]),
+                    ],
+                    synthesis,
+                    principal="workflow-review-readonly",
+                    replay_safe=True,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "128 UTF-8 bytes"):
+            asyncio.run(
+                run_model_ensemble(
+                    context,
+                    "oversized-member-name",
+                    "Review.",
+                    [
+                        EnsembleMember("é" * 60, [ModelTarget("a", "openrouter")]),
+                        members[1],
+                    ],
                     synthesis,
                     principal="workflow-review-readonly",
                     replay_safe=True,
