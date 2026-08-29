@@ -123,7 +123,7 @@ async def run_model_ensemble(
 
         agents = [
             _turn(
-                f"review-{index}-attempt-{attempt}",
+                f"review-{state.member.name}-attempt-{attempt}",
                 _review_prompt(prompt, state.member),
                 principal,
                 target,
@@ -136,7 +136,7 @@ async def run_model_ensemble(
                     target,
                 ),
             )
-            for index, (state, target, attempt) in enumerate(scheduled)
+            for state, target, attempt in scheduled
         ]
         outcomes = await _run_batch(
             context,

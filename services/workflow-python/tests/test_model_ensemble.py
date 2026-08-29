@@ -153,7 +153,19 @@ class ModelEnsembleTests(unittest.TestCase):
             ["model-a", "model-b", "model-c"],
         )
         self.assertEqual(
+            [agent["name"] for agent in context.requests[0]["agents"]],
+            [
+                "review-correctness-attempt-1",
+                "review-adversarial-attempt-1",
+                "review-simplicity-attempt-1",
+            ],
+        )
+        self.assertEqual(
             context.requests[1]["agents"][0]["model"], "model-b-fallback"
+        )
+        self.assertEqual(
+            context.requests[1]["agents"][0]["name"],
+            "review-adversarial-attempt-2",
         )
         for request in context.requests:
             for agent in request["agents"]:
