@@ -1,4 +1,7 @@
 {{- if .Values.githubbot.enabled }}
+{{- if ne (int .Values.githubbot.replicaCount) 1 }}
+{{- fail "githubbot.replicaCount must be 1; per-PR controllers are process-serialized (scale sandbox runners for concurrent work)" }}
+{{- end }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt .Values.githubbot.managementPrompt }}
 # Optional review / issue-work methodology overrides, delivered as mounted files
@@ -93,11 +96,29 @@ spec:
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
             - name: GITHUB_BOT_USERNAME
               value: {{ required "githubbot.userName is required (the bot account's GitHub login)" .Values.githubbot.userName | quote }}
+            - name: GITHUBBOT_REPOSITORY_ALLOWLIST
+              value: {{ required "githubbot.repositoryAllowlist is required when githubbot is enabled" .Values.githubbot.repositoryAllowlist | quote }}
             # v2 PR self-management knobs.
             - name: GITHUBBOT_AUTO_MERGE
               value: {{ .Values.githubbot.autoMerge | quote }}
             - name: GITHUBBOT_MERGE_METHOD
               value: {{ .Values.githubbot.mergeMethod | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH
+              value: {{ .Values.githubbot.reviewMaxRoundsPerEpoch | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH
+              value: {{ .Values.githubbot.reviewMaxTotalRoundsPerEpoch | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_EPOCHS
+              value: {{ .Values.githubbot.reviewMaxEpochs | quote }}
+            - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES
+              value: {{ .Values.githubbot.reviewMaterialChangeLines | quote }}
+            - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES
+              value: {{ .Values.githubbot.reviewMaterialChangeFiles | quote }}
+{{- if .Values.githubbot.reviewAuthorAllowlist }}
+            - name: GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST
+              value: {{ .Values.githubbot.reviewAuthorAllowlist | quote }}
+{{- end }}
+            - name: GITHUBBOT_REVIEW_RESET_LABEL
+              value: {{ .Values.githubbot.reviewResetLabel | quote }}
             - name: GITHUBBOT_WORKFLOW_EVENTS
               value: {{ .Values.githubbot.workflowEvents | quote }}
 {{- if .Values.githubbot.escalationHandle }}

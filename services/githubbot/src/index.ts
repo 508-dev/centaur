@@ -14,6 +14,8 @@ import pg from "pg";
 import {
   authorAssociationFromRaw,
   isCommentAuthorAllowed,
+  isRepositoryAllowed,
+  repositoryFullNameFromRaw,
 } from "./authorization";
 import { handleBodyMention } from "./body-mention";
 import { backgroundWaitUntil, requestContext, waitUntil } from "./context";
@@ -145,32 +147,16 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   const handleGithubWebhook = async (c: Context) => {
     const eventType = c.req.header("x-github-event") ?? "";
     const deliveryId = c.req.header("x-github-delivery") ?? "";
-    await ensureChatInitialized();
-    const context = {
-      retryableErrors: [],
-      waitUntil: (p: Promise<unknown>) => waitUntil(c, p),
-    };
-
-    // Comment threads (mentions, follow-ups) are the adapter's domain: it
-    // verifies the signature and maps the payload to a thread/message that
-    // drives onNewMention/onSubscribedMessage.
-    if (
+    const isCommentEvent =
       eventType === "issue_comment" ||
-      eventType === "pull_request_review_comment"
-    ) {
-      return requestContext.run(context, () =>
-        chat.webhooks.github(c.req.raw, {
-          waitUntil: (p) => waitUntil(c, p),
-        }),
-      );
-    }
-
-    // Every other event is a lifecycle event the adapter ignores (review
-    // requests in v1; PR/review/CI events in v2). The adapter never sees these
-    // bodies, so verify the signature ourselves before acting.
-    if (!LIFECYCLE_EVENTS.has(eventType)) {
+      eventType === "pull_request_review_comment";
+    if (!isCommentEvent && !LIFECYCLE_EVENTS.has(eventType)) {
       return new globalThis.Response("ok", { status: 200 });
     }
+
+    // Verify before parsing or evaluating policy. Comment events are checked
+    // here as well as by the adapter so a disallowed repository is rejected
+    // before the adapter creates thread state or dispatches a handler.
     const rawBody = await c.req.raw.clone().text();
     if (
       !verifyGithubSignature(
@@ -181,6 +167,34 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
     ) {
       return new globalThis.Response("invalid signature", { status: 401 });
     }
+    const payload = parseWebhookPayload(rawBody);
+    if (!isRepositoryAllowed(payload, options)) {
+      logger.warn("githubbot_repository_not_allowlisted", {
+        delivery_id: deliveryId,
+        event_type: eventType,
+        repository: repositoryFullNameFromRaw(payload) ?? "unknown",
+      });
+      return new globalThis.Response("ok", { status: 200 });
+    }
+
+    await ensureChatInitialized();
+    const context = {
+      retryableErrors: [],
+      waitUntil: (p: Promise<unknown>) => waitUntil(c, p),
+    };
+
+    // Comment threads (mentions, follow-ups) are the adapter's domain. The
+    // adapter repeats signature verification and maps the payload to a message.
+    if (isCommentEvent) {
+      return requestContext.run(context, () =>
+        chat.webhooks.github(c.req.raw, {
+          waitUntil: (p) => waitUntil(c, p),
+        }),
+      );
+    }
+
+    // Every other event is a lifecycle event the adapter ignores (review
+    // requests in v1; PR/review/CI events in v2).
     const handled = requestContext.run(context, () =>
       Promise.all([
         routeLifecycleEvent(eventType, rawBody, {
@@ -196,6 +210,11 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
         handleBodyMention(prManagerCtx, eventType, rawBody) ?? undefined,
       ]),
     );
+    // Retain accepted lifecycle work process-wide as well as in the request
+    // execution context. In particular, a review whose durable claim store is
+    // temporarily unavailable keeps retrying and participates in shutdown
+    // draining instead of being acknowledged and silently forgotten.
+    backgroundWaitUntil(handled);
     waitUntil(c, handled);
     return new globalThis.Response("ok", { status: 200 });
   };
@@ -232,6 +251,14 @@ async function handleMessage(
   if (message.author.isMe) {
     traceLog(options, "githubbot_self_message_skipped", undefined, {
       message_id: message.id,
+      thread_id: thread.id,
+    });
+    return;
+  }
+  if (!isRepositoryAllowed(message.raw, options)) {
+    traceLog(options, "githubbot_repository_not_allowlisted", undefined, {
+      message_id: message.id,
+      repository: repositoryFullNameFromRaw(message.raw) ?? "unknown",
       thread_id: thread.id,
     });
     return;
@@ -354,6 +381,14 @@ async function handleMessage(
     threadId: sessionKey,
   };
   backgroundWaitUntil(appendFollowup(options, serialized, sessionKey, trace));
+}
+
+function parseWebhookPayload(rawBody: string): unknown {
+  try {
+    return JSON.parse(rawBody) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -479,7 +514,11 @@ function routeLifecycleEvent(
         state: input.state,
       });
     }
-    return handlePullRequestEvent(input.prManagerCtx, rawBody);
+    return handlePullRequestEvent(
+      input.prManagerCtx,
+      rawBody,
+      input.deliveryId,
+    );
   }
   if (eventType === "pull_request_review") {
     return handleReviewEvent(input.prManagerCtx, rawBody);
@@ -500,7 +539,7 @@ function pullRequestAction(rawBody: string): string | undefined {
 }
 
 /** Verify GitHub's `X-Hub-Signature-256` HMAC over the raw body. */
-function verifyGithubSignature(
+export function verifyGithubSignature(
   body: string,
   signature: string | undefined,
   secret: string,

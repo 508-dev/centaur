@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
 
@@ -116,6 +117,21 @@ const options: GithubbotOptions = {
   autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
   ciFixMaxAttempts: optionalNumberEnv("GITHUBBOT_CI_FIX_MAX_ATTEMPTS"),
+  reviewMaxRoundsPerEpoch: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH",
+  ),
+  reviewMaxTotalRoundsPerEpoch: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH",
+  ),
+  reviewMaxEpochs: optionalNumberEnv("GITHUBBOT_REVIEW_MAX_EPOCHS"),
+  reviewMaterialChangeLines: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES",
+  ),
+  reviewMaterialChangeFiles: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES",
+  ),
+  reviewAuthorAllowlist: listEnv("GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST"),
+  reviewResetLabel: optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL"),
   workflowEvents: boolEnv("GITHUBBOT_WORKFLOW_EVENTS", false),
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
   escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
@@ -129,6 +145,9 @@ const options: GithubbotOptions = {
   reviewPrompt,
   issuePrompt,
   managementPrompt,
+  repositoryAllowlist: requireRepositoryAllowlist(
+    listEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
+  ),
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
   userName,

@@ -18,9 +18,10 @@ import {
 import { Hono } from "hono";
 import pg from "pg";
 import {
+  discordIngressDenialReason,
   isAllowedDiscordGuild,
   isAllowedDiscordMessage,
-  isGuildAllowlistEmpty,
+  isDiscordIngressAllowlistEmpty,
   parseDiscordThreadKey,
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
@@ -175,9 +176,9 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
 
-  if (isGuildAllowlistEmpty(options)) {
-    logger.warn("discordbot_guild_allowlist_empty_inert", {
-      hint: "Set DISCORDBOT_GUILD_ALLOWLIST; the bot ignores all messages until configured.",
+  if (isDiscordIngressAllowlistEmpty(options)) {
+    logger.warn("discordbot_ingress_allowlist_incomplete_inert", {
+      hint: "Set DISCORDBOT_GUILD_ALLOWLIST, DISCORDBOT_CHANNEL_ALLOWLIST, and DISCORDBOT_TRIGGER_ROLE_ALLOWLIST; human messages are ignored until all three are configured.",
     });
   }
 
@@ -190,12 +191,29 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     userName,
     logger,
     // Discord delta (patched adapter): gate mentions BEFORE the adapter
-    // creates a public thread — a mention rejected by the fail-closed guild
-    // allowlist must not mutate the server (no orphan threads in
-    // non-allowlisted guilds). The full message gate (isAllowedDiscordMessage)
-    // still runs in the handlers below.
-    shouldHandleMention: ({ guildId }) =>
-      isAllowedDiscordGuild(guildId, options),
+    // creates a public thread. The full gate still runs in the handlers below
+    // so every follow-up is re-authorized as well.
+    shouldHandleMention: ({
+      authorId,
+      authorIsBot,
+      channelId,
+      guildId,
+      roleIds,
+    }) => {
+      const denialReason = discordIngressDenialReason(
+        { authorIsBot, channelId, guildId, roleIds },
+        options,
+      );
+      if (denialReason) {
+        logger.warn("discordbot_mention_rejected_before_thread", {
+          channel_id: channelId,
+          guild_id: guildId,
+          reason: denialReason,
+          user_id: authorId,
+        });
+      }
+      return denialReason === undefined;
+    },
     // Discord delta (patched adapter): the gateway drops bot-authored
     // messages by default; forward only allowlisted trigger bots in
     // allowlisted guilds. The allowlist entry must be the id the message is
@@ -1184,8 +1202,8 @@ async function renderExecutionStream(
   if (isPlainTextOnlyRequest(message.text)) {
     // Discord delta (no slackbotv2 analog): plain-text-only runs previously
     // bypassed the narrator entirely — no 👀, no ✅/❌. Reuse the narrator for
-    // the reaction lifecycle only (update() is never called, so no reasoning
-    // blurbs are posted; the run still produces a single plain-text message).
+    // the reaction lifecycle; the run still produces a single plain-text
+    // message.
     const narrator = DiscordNarrator.start(thread, message, options, {
       logger,
     });
@@ -1206,12 +1224,9 @@ async function renderExecutionStream(
     return;
   }
 
-  // Append-only narration: an instant 👀 reaction on the triggering message,
-  // then the agent's reasoning blurbs posted as their own subtext (-#)
-  // messages as each thought completes, then the answer streamed into a separate message
-  // created on first answer text. On settle the 👀 flips to ✅/❌. No bot
-  // message is ever edited or deleted, so messages keep their place in the
-  // timeline even when users chime in mid-run.
+  // Public run output is deliberately narrow: an instant 👀 reaction, the
+  // final answer streamed into a separate message, then ✅/❌ on settle.
+  // Reasoning, activity summaries, and task/tool details stay out of Discord.
   const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
@@ -1228,11 +1243,12 @@ async function renderExecutionStream(
 }
 
 /**
- * Consumes the renderer's chunk stream, routing task updates to the narrator
- * (reasoning blurbs) and answer text to separately streamed messages. The
- * answer post is created lazily on the first visible answer chunk (which is
- * also what keeps the startingStreamNotification priming working: the
- * synthetic item only unblocks deltas, it never creates an empty message).
+ * Consumes the renderer's chunk stream, routing task errors to the reaction
+ * state and answer text to separately streamed messages. All other non-answer
+ * chunks remain private. The answer post is created lazily on the first
+ * visible answer chunk (which is also what keeps the
+ * startingStreamNotification priming working: the synthetic item only
+ * unblocks deltas, it never creates an empty message).
  */
 async function renderSplitExecutionStreams(
   thread: Thread,
@@ -1246,7 +1262,7 @@ async function renderSplitExecutionStreams(
   try {
     for await (const chunk of harnessToChatSdkStream(
       stream,
-      rendererOptions(options, narrator),
+      rendererOptions(options),
     )) {
       if (chunk.type === "markdown_text") {
         if (!answerPost) {
@@ -1613,14 +1629,11 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
   void promise.catch(() => undefined);
 }
 
-// Mirrors slackbotv2's rendererOptions: forwards the configured mapper and
-// hooks onRendererEvent. Slack routes renderer.status (server-side activity
-// summaries) to its native assistant status; Discord has no such surface, so
-// they post as the narrator's append-only subtext blurbs. Paths without a
-// narrator (plain-text runs) drop status events by design.
+// Mirrors slackbotv2's rendererOptions and preserves the configured mapper's
+// observability callback. Discord has no private status surface, so renderer
+// status events are deliberately not forwarded to chat messages.
 function rendererOptions(
   options: DiscordbotOptions,
-  narrator?: DiscordNarrator,
 ): CodexAppServerToChatStreamOptions {
   const mapper = options.mapper;
   return {
@@ -1633,9 +1646,6 @@ function rendererOptions(
     preStreamGraceMs: 0,
     async onRendererEvent(event: RendererEvent) {
       await mapper?.onRendererEvent?.(event);
-      if (event.type === "renderer.status") {
-        narrator?.status(event.status);
-      }
     },
   };
 }

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { Logger, Message } from "chat";
 import {
+  discordIngressDenialReason,
+  discordRoleIdsFromRaw,
   isAllowedDiscordMessage,
   isAllowedTriggerBotMessage,
+  isDiscordIngressAllowlistEmpty,
   isGuildAllowlistEmpty,
   parseDiscordThreadKey,
 } from "../src/discord-allowlist";
@@ -20,6 +23,7 @@ function message(overrides: {
   threadId: string;
   isBot?: boolean | "unknown";
   isMe?: boolean;
+  roleIds?: string[];
 }): Message {
   return {
     id: "m1",
@@ -32,6 +36,7 @@ function message(overrides: {
       userName: "alice",
       fullName: "Alice",
     },
+    raw: { member: { roles: overrides.roleIds ?? ["R1"] } },
   } as unknown as Message;
 }
 
@@ -43,7 +48,9 @@ function options(
     applicationId: "app",
     botToken: "token",
     publicKey: "key",
+    channelAllowlist: ["C1"],
     guildAllowlist: ["G1", "G2"],
+    triggerRoleAllowlist: ["R1"],
     ...overrides,
   };
 }
@@ -95,6 +102,46 @@ describe("isAllowedDiscordMessage", () => {
       isAllowedDiscordMessage(
         message({ threadId: "discord:G9:C1:T1" }),
         options(),
+        silentLogger,
+      ),
+    ).toBe(false);
+  });
+
+  it("denies a channel not on the allowlist", () => {
+    expect(
+      isAllowedDiscordMessage(
+        message({ threadId: "discord:G1:C9:T1" }),
+        options(),
+        silentLogger,
+      ),
+    ).toBe(false);
+  });
+
+  it("is fail-closed when the channel allowlist is empty", () => {
+    expect(
+      isAllowedDiscordMessage(
+        message({ threadId: "discord:G1:C1:T1" }),
+        options({ channelAllowlist: [] }),
+        silentLogger,
+      ),
+    ).toBe(false);
+  });
+
+  it("denies a human without an allowlisted role", () => {
+    expect(
+      isAllowedDiscordMessage(
+        message({ threadId: "discord:G1:C1:T1", roleIds: ["R9"] }),
+        options(),
+        silentLogger,
+      ),
+    ).toBe(false);
+  });
+
+  it("is fail-closed when the role allowlist is empty", () => {
+    expect(
+      isAllowedDiscordMessage(
+        message({ threadId: "discord:G1:C1:T1" }),
+        options({ triggerRoleAllowlist: [] }),
         silentLogger,
       ),
     ).toBe(false);
@@ -214,5 +261,39 @@ describe("isGuildAllowlistEmpty", () => {
 
   it("is false when guilds are configured", () => {
     expect(isGuildAllowlistEmpty(options())).toBe(false);
+  });
+});
+
+describe("Discord ingress context", () => {
+  it("reports the first deterministic denial reason", () => {
+    expect(
+      discordIngressDenialReason(
+        {
+          authorIsBot: false,
+          channelId: "C9",
+          guildId: "G1",
+          roleIds: ["R1"],
+        },
+        options(),
+      ),
+    ).toBe("channel_not_allowlisted");
+  });
+
+  it("extracts role ids only from Discord member data", () => {
+    expect(discordRoleIdsFromRaw({ member: { roles: ["R1", 2, "R3"] } })).toEqual([
+      "R1",
+      "R3",
+    ]);
+    expect(discordRoleIdsFromRaw({ roles: ["R1"] })).toEqual([]);
+  });
+
+  it("treats any missing required human allowlist as inert", () => {
+    expect(isDiscordIngressAllowlistEmpty(options())).toBe(false);
+    expect(
+      isDiscordIngressAllowlistEmpty(options({ channelAllowlist: [] })),
+    ).toBe(true);
+    expect(
+      isDiscordIngressAllowlistEmpty(options({ triggerRoleAllowlist: [] })),
+    ).toBe(true);
   });
 });

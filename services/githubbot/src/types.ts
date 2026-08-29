@@ -144,6 +144,20 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
+  /** Review passes allowed per reviewer in one epoch. Default 3. */
+  reviewMaxRoundsPerEpoch?: number;
+  /** Aggregate review passes allowed across all reviewers in one epoch. Default 6. */
+  reviewMaxTotalRoundsPerEpoch?: number;
+  /** Material-change epochs allowed before human continuation is required. Default 3. */
+  reviewMaxEpochs?: number;
+  /** Cumulative changed runtime lines that make a review change material. Default 200. */
+  reviewMaterialChangeLines?: number;
+  /** Cumulative changed runtime files that make a review change material. Default 8. */
+  reviewMaterialChangeFiles?: number;
+  /** Exact GitHub logins for trusted reviewer bots whose association is NONE. */
+  reviewAuthorAllowlist?: readonly string[];
+  /** Write-authorized human label that explicitly starts another review epoch. */
+  reviewResetLabel?: string;
   /** Delay before confirming a settled-green rollup. Default 15000ms. */
   ciSettleConfirmMs?: number;
   /** Emit settled CI and submitted-review workflow events. Default false. */
@@ -167,6 +181,11 @@ export type GithubbotOptions = {
    * GitHub permissions and are not affected by this.
    */
   allowedAuthorAssociations?: string[];
+  /**
+   * Exact owner/repository names whose signed webhooks may reach the bot.
+   * Empty or unset is fail-closed.
+   */
+  repositoryAllowlist?: readonly string[];
   /** Webhook signing secret configured on the GitHub repo/org webhook. */
   webhookSecret: string;
 };
