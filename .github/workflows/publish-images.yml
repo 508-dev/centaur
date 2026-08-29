@@ -31,22 +31,25 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: paradigmxyz/centaur
-  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
+  # Build jobs derive a lowercase image namespace from the repository owner so
+  # forks stay self-contained and always produce valid Docker references.
+  IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
   # Rust binaries that are immediately replaced by the next test build.
   RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && 'debug' || 'release' }}
 
 jobs:
-  # Build each image with Depot's hosted builders, push by digest, and hand
+  # Build each image on a native GitHub-hosted runner, push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
   # arm64 is only built on pushes to main and release tags — PR and manual
-  # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
-  # jobs so untrusted changes do not run on the hosted image builders.
+  # dispatch builds stay amd64-only to keep iteration fast. PRs whose head repo
+  # differs from the base repo skip both jobs so untrusted fork changes do not
+  # run on the hosted image builders; internal branches still build when this
+  # repository is itself a fork.
   build:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -105,13 +108,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Derive platform slug
+      - name: Derive build variables
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAMESPACE=${REPOSITORY_OWNER,,}/centaur" >> "$GITHUB_ENV"
 
-      - name: Set up Depot
-        uses: depot/setup-action@91bc8495a33ebfc504ffc89e5674379ccf23c29c # v1.7.2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -133,9 +139,8 @@ jobs:
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
         id: build
-        uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.18.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          project: d8qqlh1bmq
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
@@ -144,19 +149,21 @@ jobs:
           # Tags are applied by the merge job on the multi-arch manifest;
           # per-arch builds are pushed by digest only. The fork check is also
           # enforced at the job level so external PRs do not build.
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
       - name: Export digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           mkdir -p ${{ runner.temp }}/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
@@ -165,9 +172,9 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-24.04
     needs: build
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
@@ -183,6 +190,11 @@ jobs:
           - image: centaur-teamsbot
 
     steps:
+      - name: Derive image namespace
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "IMAGE_NAMESPACE=${REPOSITORY_OWNER,,}/centaur" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

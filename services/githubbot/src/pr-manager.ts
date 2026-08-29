@@ -1,7 +1,23 @@
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
-import { backgroundWaitUntil } from "./context";
+import { isReviewAuthorAllowed } from "./authorization";
+import { backgroundWaitUntil, runExclusive } from "./context";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
+import {
+  assessReviewChange,
+  decideReviewAdmission,
+  DEFAULT_REVIEW_MATERIAL_CHANGE_FILES,
+  DEFAULT_REVIEW_MATERIAL_CHANGE_LINES,
+  DEFAULT_REVIEW_MAX_EPOCHS,
+  DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+  DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+  DEFAULT_REVIEW_RESET_LABEL,
+  type ReviewAdmission,
+  type ReviewChangeActor,
+  type ReviewChangeAssessment,
+  type ReviewChangeFile,
+  type ReviewEpochState,
+} from "./review-budget";
 import { runTurnStream } from "./turn";
 import {
   fetchCiEvaluation,
@@ -42,6 +58,7 @@ export type PrManagerContext = {
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+const REVIEW_STATE_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -109,6 +126,29 @@ function prKey(ctx: PrManagerContext, owner: string, repo: string, n: number): s
   return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:pr:${owner}/${repo}#${n}`;
 }
 
+function reviewBudgetKey(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): string {
+  return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-budget:${owner}/${repo}#${n}`;
+}
+
+function reviewBudgetLockKey(owner: string, repo: string, n: number): string {
+  return `review-budget:${owner}/${repo}#${n}`;
+}
+
+function reviewResetApprovalKey(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  headSha: string,
+): string {
+  return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-reset:${owner}/${repo}#${n}:${headSha}`;
+}
+
 export function managementThreadKey(
   owner: string,
   repo: string,
@@ -144,6 +184,239 @@ async function saveState(
       error: errorMessage(error),
     });
   }
+}
+
+type ReviewResetApproval = {
+  approvalId: string;
+  approvedBy: string;
+  headSha: string;
+};
+
+type ReviewBudgetLoadResult =
+  | { ok: true; state?: ReviewEpochState }
+  | { ok: false };
+
+function isReviewEpochState(value: unknown): value is ReviewEpochState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<ReviewEpochState>;
+  const reviewerRounds = candidate.reviewerRoundsUsed;
+  const validReviewerRounds =
+    reviewerRounds === undefined ||
+    (reviewerRounds !== null &&
+      typeof reviewerRounds === "object" &&
+      !Array.isArray(reviewerRounds) &&
+      Object.entries(reviewerRounds).every(
+        ([key, rounds]) =>
+          key.length > 0 &&
+          typeof rounds === "number" &&
+          Number.isInteger(rounds) &&
+          rounds > 0,
+      ) &&
+      Object.values(reviewerRounds).reduce((sum, rounds) => sum + rounds, 0) ===
+        candidate.roundsUsed);
+  return (
+    candidate.version === 1 &&
+    typeof candidate.anchorHeadSha === "string" &&
+    typeof candidate.lastReviewedHeadSha === "string" &&
+    typeof candidate.epoch === "number" &&
+    Number.isInteger(candidate.epoch) &&
+    candidate.epoch > 0 &&
+    typeof candidate.roundsUsed === "number" &&
+    Number.isInteger(candidate.roundsUsed) &&
+    candidate.roundsUsed > 0 &&
+    (candidate.automationPendingFromHeadSha === undefined ||
+      typeof candidate.automationPendingFromHeadSha === "string") &&
+    (candidate.consumedResetApprovalId === undefined ||
+      typeof candidate.consumedResetApprovalId === "string") &&
+    (candidate.pausedHeadSha === undefined ||
+      typeof candidate.pausedHeadSha === "string") &&
+    validReviewerRounds &&
+    (candidate.pauseReason === undefined ||
+      [
+        "aggregate_round_budget_exhausted",
+        "automation_material_change_requires_reset",
+        "change_actor_unknown",
+        "change_significance_unknown",
+        "epoch_budget_exhausted",
+        "reviewer_round_budget_exhausted",
+        "round_budget_exhausted",
+      ].includes(candidate.pauseReason))
+  );
+}
+
+async function readReviewBudget(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): Promise<ReviewBudgetLoadResult> {
+  const value = await ctx.state.get<unknown>(
+    reviewBudgetKey(ctx, owner, repo, n),
+  );
+  if (value === undefined || value === null) return { ok: true };
+  if (!isReviewEpochState(value)) {
+    logger(ctx).warn("githubbot_review_budget_invalid", {
+      pr: `${owner}/${repo}#${n}`,
+    });
+    return { ok: false };
+  }
+  return { ok: true, state: value };
+}
+
+async function loadReviewBudget(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): Promise<ReviewBudgetLoadResult> {
+  try {
+    return await readReviewBudget(ctx, owner, repo, n);
+  } catch (error) {
+    logger(ctx).warn("githubbot_review_budget_load_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${n}`,
+    });
+    return { ok: false };
+  }
+}
+
+async function readReviewResetApproval(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  headSha: string,
+): Promise<ReviewResetApproval | undefined> {
+  const value = await ctx.state.get<unknown>(
+    reviewResetApprovalKey(ctx, owner, repo, n, headSha),
+  );
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const approval = value as Partial<ReviewResetApproval>;
+  if (
+    approval.headSha !== headSha ||
+    typeof approval.approvalId !== "string" ||
+    !approval.approvalId ||
+    typeof approval.approvedBy !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    approvalId: approval.approvalId,
+    approvedBy: approval.approvedBy,
+    headSha,
+  };
+}
+
+async function retryingReviewStateOperation<T>(
+  ctx: PrManagerContext,
+  event: string,
+  pr: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let failureCount = 0;
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      const delayMs =
+        REVIEW_STATE_RETRY_DELAYS_MS[
+          Math.min(failureCount, REVIEW_STATE_RETRY_DELAYS_MS.length - 1)
+        ] ?? 30_000;
+      failureCount += 1;
+      logger(ctx).warn(event, {
+        attempt: failureCount,
+        error: errorMessage(error),
+        pr,
+        retry_in_ms: delayMs,
+      });
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        await Promise.resolve();
+      }
+    }
+  }
+}
+
+function githubErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  return numberValue((error as { status?: unknown }).status);
+}
+
+function isTransientGithubError(error: unknown): boolean {
+  const status = githubErrorStatus(error);
+  return (
+    status === undefined ||
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
+async function retryingReviewBudgetLoad(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+): Promise<ReviewBudgetLoadResult> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_budget_load_retry",
+    `${owner}/${repo}#${n}`,
+    () => readReviewBudget(ctx, owner, repo, n),
+  );
+}
+
+async function retryingReviewBudgetSave(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  state: ReviewEpochState,
+): Promise<void> {
+  await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_budget_save_retry",
+    `${owner}/${repo}#${n}`,
+    () =>
+      ctx.state.set(
+        reviewBudgetKey(ctx, owner, repo, n),
+        state,
+        state.pausedHeadSha ? undefined : STATE_TTL_MS,
+      ),
+  );
+}
+
+async function retryingReviewResetApprovalLoad(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  n: number,
+  headSha: string,
+): Promise<ReviewResetApproval | undefined> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_load_retry",
+    `${owner}/${repo}#${n}`,
+    () => readReviewResetApproval(ctx, owner, repo, n, headSha),
+  );
+}
+
+async function retryingReviewClaim(
+  ctx: PrManagerContext,
+  key: string,
+  pr: string,
+): Promise<boolean> {
+  return retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_claim_retry",
+    pr,
+    () => ctx.state.setIfNotExists(key, "1", CLAIM_TTL_MS),
+  );
 }
 
 async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
@@ -281,10 +554,20 @@ function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {
   return isOwnedPr({ assignees: pr.assignees, userName: ctx.userName });
 }
 
+function reviewBudgetReviewerKey(user?: JsonRecord): string {
+  const id = numberValue(user?.id);
+  if (id !== undefined && Number.isSafeInteger(id) && id > 0) {
+    return `github-user:${id}`;
+  }
+  const login = stringValue(user?.login)?.trim().toLowerCase();
+  return login ? `github-login:${login}` : "github-reviewer:unknown";
+}
+
 /** `pull_request` lifecycle (non-review_requested actions). */
 export async function handlePullRequestEvent(
   ctx: PrManagerContext,
   rawBody: string,
+  deliveryId = "",
 ): Promise<void> {
   const payload = parseJson(rawBody);
   if (!payload) return;
@@ -297,8 +580,63 @@ export async function handlePullRequestEvent(
   if (number === undefined) return;
   if (action === "closed") return; // nothing to drive once closed/merged.
 
+  const labelNode = payload.label;
+  const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
+  const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
+  if (
+    action === "labeled" &&
+    label?.toLowerCase() === resetLabel.toLowerCase()
+  ) {
+    // Enter the per-PR queue before fetching the PR or checking the labeler's
+    // permission. A review webhook delivered concurrently after this label
+    // event must not overtake the durable reset approval.
+    await runExclusive(reviewBudgetLockKey(repo.owner, repo.repo, number), async () => {
+      const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
+      if (!pr || !owns(ctx, pr)) return;
+      await maybeRecordReviewResetApproval(
+        ctx,
+        repo.owner,
+        repo.repo,
+        pr,
+        payload,
+        deliveryId,
+      );
+    });
+    return;
+  }
+
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
+  const previousHeadSha = stringValue(payload.before);
+  if (
+    action === "synchronize" &&
+    previousHeadSha &&
+    previousHeadSha !== pr.headSha
+  ) {
+    await runExclusive(
+      reviewBudgetLockKey(repo.owner, repo.repo, number),
+      async () => {
+        const approval = await retryingReviewResetApprovalLoad(
+          ctx,
+          repo.owner,
+          repo.repo,
+          number,
+          previousHeadSha,
+        );
+        if (approval) {
+          await cleanupReviewResetApproval(
+            ctx,
+            repo.owner,
+            repo.repo,
+            { ...pr, headSha: previousHeadSha },
+            true,
+          );
+        }
+        await tryMergeLocked(ctx, repo.owner, repo.repo, number);
+      },
+    );
+    return;
+  }
   // Being assigned the PR is the explicit signal to take it over: evaluate CI now
   // (forcing past the human-commit back-off — the assignment is a human handing
   // it to us) so an already-red or already-green PR is acted on immediately,
@@ -328,8 +666,20 @@ export async function handleReviewEvent(
   const number = numberValue(prNode.number);
   const reviewId = numberValue(reviewNode.id);
   if (number === undefined || reviewId === undefined) return;
-  const reviewer = stringValue(isRecord(reviewNode.user) ? reviewNode.user.login : undefined);
+  const reviewerNode = isRecord(reviewNode.user) ? reviewNode.user : undefined;
+  const reviewer = stringValue(reviewerNode?.login);
+  const reviewerKey = reviewBudgetReviewerKey(reviewerNode);
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
+  // Submitted reviews on public repositories are not collaborator-only by
+  // default. Gate before workflow emission, claims, or write-capable turns.
+  if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
+  if (!isReviewAuthorAllowed(payload, ctx.options)) {
+    logger(ctx).warn("githubbot_review_author_denied", {
+      pr: `${repo.owner}/${repo.repo}#${number}`,
+      reviewer,
+    });
+    return;
+  }
 
   // A review is tied to review.commit_id. The PR head can advance before this
   // webhook is handled, so a live PR lookup would correlate the review to the
@@ -353,27 +703,635 @@ export async function handleReviewEvent(
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
-  // Never act on the bot's own review (it shouldn't review its own PRs anyway).
-  if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
 
+  const reviewClaimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-handled:${repo.owner}/${repo.repo}#${number}:${reviewId}`;
   if (
-    !(await claim(
+    !(await retryingReviewClaim(
       ctx,
-      `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-handled:${repo.owner}/${repo.repo}#${number}:${reviewId}`,
+      reviewClaimKey,
+      `${repo.owner}/${repo.repo}#${number}`,
     ))
   ) {
     return;
   }
 
   if (reviewState === "approved") {
+    const effectiveHeadSha = reviewedHeadSha ?? pr.headSha;
+    if (
+      effectiveHeadSha === pr.headSha &&
+      !(await runExclusive(
+        reviewBudgetLockKey(repo.owner, repo.repo, number),
+        () =>
+          recordApprovedReview(
+            ctx,
+            repo.owner,
+            repo.repo,
+            pr,
+            effectiveHeadSha,
+            reviewerKey,
+          ),
+      ))
+    ) {
+      await release(ctx, reviewClaimKey);
+      return;
+    }
     await tryMerge(ctx, repo.owner, repo.repo, number);
     return;
   }
   if (reviewState === "changes_requested" || reviewState === "commented") {
+    const effectiveHeadSha = reviewedHeadSha ?? pr.headSha;
+    if (effectiveHeadSha !== pr.headSha) {
+      traceLog(
+        ctx.options,
+        "githubbot_review_stale_head_skipped",
+        makeTrace(
+          managementThreadKey(repo.owner, repo.repo, number),
+          `review-stale-${reviewId}`,
+        ),
+        { current_head_sha: pr.headSha, reviewed_head_sha: effectiveHeadSha },
+      );
+      return;
+    }
+    const admission = await runExclusive(
+      reviewBudgetLockKey(repo.owner, repo.repo, number),
+      () =>
+        admitReviewResponse(
+          ctx,
+          repo.owner,
+          repo.repo,
+          pr,
+          effectiveHeadSha,
+          reviewerKey,
+        ),
+    );
+    if (!admission) {
+      await release(ctx, reviewClaimKey);
+      return;
+    }
+    if (admission.decision === "pause") {
+      await escalateReviewBudget(
+        ctx,
+        repo.owner,
+        repo.repo,
+        pr,
+        admission,
+        reviewerKey,
+      );
+      return;
+    }
     fireAddressReviewTurn(ctx, repo.owner, repo.repo, pr, {
+      budget: admission.state,
       reviewer: reviewer ?? "the reviewer",
+      reviewerKey,
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
+    });
+    if (admission.state.pausedHeadSha && admission.state.pauseReason) {
+      await escalateReviewBudget(
+        ctx,
+        repo.owner,
+        repo.repo,
+        pr,
+        {
+          assessment: admission.assessment,
+          decision: "pause",
+          reason: admission.state.pauseReason,
+          state: admission.state,
+        },
+        reviewerKey,
+      );
+    }
+  }
+}
+
+async function maybeRecordReviewResetApproval(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  payload: JsonRecord,
+  deliveryId: string,
+): Promise<boolean> {
+  const labelNode = payload.label;
+  const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
+  const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
+  if (!label || label.toLowerCase() !== resetLabel.toLowerCase()) return false;
+
+  const senderNode = payload.sender;
+  const sender = isRecord(senderNode)
+    ? stringValue(senderNode.login)
+    : undefined;
+  const senderType = isRecord(senderNode)
+    ? stringValue(senderNode.type)?.toLowerCase()
+    : undefined;
+  if (
+    !sender ||
+    senderType !== "user" ||
+    sender.toLowerCase() === ctx.userName.toLowerCase()
+  ) {
+    logger(ctx).warn("githubbot_review_reset_denied", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "non_human_sender",
+      sender,
+    });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+
+  const permission = await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_permission_retry",
+    `${owner}/${repo}#${pr.number}`,
+    async () => {
+      try {
+        const { data } =
+          await ctx.octokit.rest.repos.getCollaboratorPermissionLevel({
+            owner,
+            repo,
+            username: sender,
+          });
+        return data.permission;
+      } catch (error) {
+        if (isTransientGithubError(error)) throw error;
+        logger(ctx).warn("githubbot_review_reset_permission_failed", {
+          error: errorMessage(error),
+          pr: `${owner}/${repo}#${pr.number}`,
+          sender,
+        });
+        return undefined;
+      }
+    },
+  );
+  if (!permission) {
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+  if (permission !== "admin" && permission !== "write") {
+    logger(ctx).warn("githubbot_review_reset_denied", {
+      permission,
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "insufficient_repository_permission",
+      sender,
+    });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+  if (!deliveryId) {
+    logger(ctx).warn("githubbot_review_reset_denied", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "missing_delivery_id",
+      sender,
+    });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+
+  const budget = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
+  if (!budget.ok) {
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+  if (!budget.state?.pausedHeadSha) {
+    logger(ctx).warn("githubbot_review_reset_denied", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "review_budget_not_paused",
+      sender,
+    });
+    // Do not leave a visible reset label that was never accepted. Deleting an
+    // old approval also prevents an early label from becoming usable later.
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return true;
+  }
+
+  await retryingReviewStateOperation(
+    ctx,
+    "githubbot_review_reset_save_retry",
+    `${owner}/${repo}#${pr.number}`,
+    () =>
+      ctx.state.set(
+        reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
+        {
+          approvalId: deliveryId,
+          approvedBy: sender,
+          headSha: pr.headSha,
+        } satisfies ReviewResetApproval,
+      ),
+  );
+  traceLog(
+    ctx.options,
+    "githubbot_review_reset_approved",
+    makeTrace(
+      managementThreadKey(owner, repo, pr.number),
+      `review-reset-${pr.headSha}`,
+    ),
+    { approved_by: sender, head_sha: pr.headSha },
+  );
+  return true;
+}
+
+type ReviewComparisonEvidence = {
+  actor: ReviewChangeActor;
+  assessment: ReviewChangeAssessment;
+};
+
+function commitActorKind(
+  value: unknown,
+  botUserName: string,
+): ReviewChangeActor {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "unknown";
+  const commit = value as {
+    author?: { login?: string | null; type?: string | null } | null;
+    commit?: { message?: string | null } | null;
+    committer?: { login?: string | null; type?: string | null } | null;
+  };
+  if (commit.commit?.message?.includes("Centaur-Automation: true")) {
+    return "automation";
+  }
+  const account = commit.author ?? commit.committer;
+  const login = account?.login?.toLowerCase();
+  if (
+    account?.type?.toLowerCase() === "bot" ||
+    login?.endsWith("[bot]") ||
+    login === botUserName.toLowerCase()
+  ) {
+    return "automation";
+  }
+  return login ? "human" : "unknown";
+}
+
+async function compareReviewChange(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  baseHeadSha: string,
+  currentHeadSha: string,
+): Promise<ReviewComparisonEvidence> {
+  try {
+    const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
+      basehead: `${baseHeadSha}...${currentHeadSha}`,
+      owner,
+      per_page: 100,
+      repo,
+    });
+    const rawFiles = Array.isArray(data.files) ? data.files : undefined;
+    const files: ReviewChangeFile[] | undefined = rawFiles?.map((file) => ({
+      additions: file.additions,
+      changes: file.changes,
+      deletions: file.deletions,
+      filename: file.filename,
+      status: file.status,
+    }));
+    const assessment = assessReviewChange({
+      comparisonStatus: data.status,
+      files,
+      fileThreshold:
+        ctx.options.reviewMaterialChangeFiles ??
+        DEFAULT_REVIEW_MATERIAL_CHANGE_FILES,
+      lineThreshold:
+        ctx.options.reviewMaterialChangeLines ??
+        DEFAULT_REVIEW_MATERIAL_CHANGE_LINES,
+    });
+    const commits = Array.isArray(data.commits) ? data.commits : [];
+    const totalCommits =
+      typeof data.total_commits === "number" ? data.total_commits : commits.length;
+    const kinds = new Set(
+      commits.map((commit) => commitActorKind(commit, ctx.userName)),
+    );
+    let actor: ReviewChangeActor = "unknown";
+    if (totalCommits === commits.length && !kinds.has("unknown")) {
+      if (kinds.size === 1) actor = kinds.values().next().value ?? "unknown";
+    }
+    return { actor, assessment };
+  } catch (error) {
+    logger(ctx).warn("githubbot_review_compare_failed", {
+      base_head_sha: baseHeadSha,
+      current_head_sha: currentHeadSha,
+      error: errorMessage(error),
+      pr: `${owner}/${repo}`,
+    });
+    return {
+      actor: "unknown",
+      assessment: assessReviewChange({ files: undefined }),
+    };
+  }
+}
+
+async function pendingReviewResetApproval(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  state?: ReviewEpochState,
+): Promise<ReviewResetApproval | undefined> {
+  const approval = await retryingReviewResetApprovalLoad(
+    ctx,
+    owner,
+    repo,
+    pr.number,
+    pr.headSha,
+  );
+  if (!approval) return undefined;
+  if (state?.consumedResetApprovalId === approval.approvalId) {
+    // The budget write is the reset's durable commit point. Cleanup is only
+    // hygiene and may be retried if a prior delete or label removal failed.
+    await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
+    return undefined;
+  }
+  if (!state?.pausedHeadSha) {
+    logger(ctx).warn("githubbot_review_reset_ignored", {
+      pr: `${owner}/${repo}#${pr.number}`,
+      reason: "review_budget_not_paused",
+    });
+    await cleanupReviewResetApproval(ctx, owner, repo, pr);
+    return undefined;
+  }
+  return approval;
+}
+
+async function cleanupReviewResetApproval(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  consumed = false,
+): Promise<void> {
+  if (consumed) {
+    const labelRemoved = await retryingReviewStateOperation(
+      ctx,
+      "githubbot_review_reset_label_remove_retry",
+      `${owner}/${repo}#${pr.number}`,
+      async () => {
+        try {
+          await ctx.octokit.rest.issues.removeLabel({
+            issue_number: pr.number,
+            name: ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL,
+            owner,
+            repo,
+          });
+          return true;
+        } catch (error) {
+          if (githubErrorStatus(error) === 404) return true;
+          if (isTransientGithubError(error)) throw error;
+          logger(ctx).warn("githubbot_review_reset_label_remove_failed", {
+            error: errorMessage(error),
+            pr: `${owner}/${repo}#${pr.number}`,
+          });
+          return false;
+        }
+      },
+    );
+    // Preserve the approval marker on a permanent removal failure so another
+    // lifecycle event can retry after repository permissions are repaired.
+    if (!labelRemoved) return;
+  }
+  try {
+    await ctx.state.delete(
+      reviewResetApprovalKey(ctx, owner, repo, pr.number, pr.headSha),
+    );
+  } catch (error) {
+    logger(ctx).debug("githubbot_review_reset_delete_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${pr.number}`,
+    });
+  }
+  if (!consumed) {
+    try {
+      await ctx.octokit.rest.issues.removeLabel({
+        issue_number: pr.number,
+        name: ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL,
+        owner,
+        repo,
+      });
+    } catch (error) {
+      logger(ctx).debug("githubbot_review_reset_label_remove_failed", {
+        error: errorMessage(error),
+        pr: `${owner}/${repo}#${pr.number}`,
+      });
+    }
+  }
+}
+
+async function recordApprovedReview(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  headSha: string,
+  reviewerKey: string,
+): Promise<boolean> {
+  const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
+  if (!loaded.ok) return false;
+  const approval = await pendingReviewResetApproval(
+    ctx,
+    owner,
+    repo,
+    pr,
+    loaded.state,
+  );
+  if (!approval) {
+    if (loaded.state && loaded.state.lastReviewedHeadSha !== headSha) {
+      const state = {
+        ...loaded.state,
+        automationPendingFromHeadSha: undefined,
+        lastReviewedHeadSha: headSha,
+      };
+      await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
+      traceLog(
+        ctx.options,
+        "githubbot_review_approved_head_recorded",
+        makeTrace(
+          managementThreadKey(owner, repo, pr.number),
+          `review-approved-${headSha}`,
+        ),
+        { epoch: state.epoch, head_sha: headSha },
+      );
+    }
+    return true;
+  }
+  const admission = decideReviewAdmission({
+    actor: "human",
+    headSha,
+    manualReset: true,
+    maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+    maxRoundsPerEpoch:
+      ctx.options.reviewMaxRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    maxTotalRoundsPerEpoch:
+      ctx.options.reviewMaxTotalRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+    reviewerKey,
+    startsRepairTurn: false,
+    state: loaded.state,
+  });
+  const state = {
+    ...admission.state,
+    automationPendingFromHeadSha: undefined,
+    consumedResetApprovalId: approval.approvalId,
+  };
+  await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
+  traceLog(
+    ctx.options,
+    "githubbot_review_reset_consumed_by_approval",
+    makeTrace(
+      managementThreadKey(owner, repo, pr.number),
+      `review-approved-${headSha}`,
+    ),
+    { approved_by: approval.approvedBy, epoch: state.epoch, head_sha: headSha },
+  );
+  await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
+  return true;
+}
+
+async function admitReviewResponse(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  headSha: string,
+  reviewerKey: string,
+): Promise<ReviewAdmission | null> {
+  const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
+  if (!loaded.ok) return null;
+  const approval = await pendingReviewResetApproval(
+    ctx,
+    owner,
+    repo,
+    pr,
+    loaded.state,
+  );
+  const manualReset = approval !== undefined;
+
+  let evidence: ReviewComparisonEvidence | undefined;
+  if (loaded.state && (loaded.state.lastReviewedHeadSha !== headSha || manualReset)) {
+    evidence = await compareReviewChange(
+      ctx,
+      owner,
+      repo,
+      loaded.state.anchorHeadSha,
+      headSha,
+    );
+    if (
+      evidence.assessment.kind === "material" &&
+      loaded.state.anchorHeadSha !== loaded.state.lastReviewedHeadSha
+    ) {
+      const latestRange = await compareReviewChange(
+        ctx,
+        owner,
+        repo,
+        loaded.state.lastReviewedHeadSha,
+        headSha,
+      );
+      evidence = { ...evidence, actor: latestRange.actor };
+    }
+    if (
+      evidence.actor === "unknown" &&
+      loaded.state.automationPendingFromHeadSha ===
+        loaded.state.lastReviewedHeadSha
+    ) {
+      evidence = { ...evidence, actor: "automation" };
+    }
+  }
+
+  const admission = decideReviewAdmission({
+    actor: evidence?.actor ?? "unknown",
+    assessment: evidence?.assessment,
+    headSha,
+    manualReset,
+    maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+    maxRoundsPerEpoch:
+      ctx.options.reviewMaxRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    maxTotalRoundsPerEpoch:
+      ctx.options.reviewMaxTotalRoundsPerEpoch ??
+      DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+    reviewerKey,
+    startsRepairTurn: true,
+    state: loaded.state,
+  });
+  const state = approval
+    ? { ...admission.state, consumedResetApprovalId: approval.approvalId }
+    : admission.state;
+  await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
+  if (admission.decision === "allow" && manualReset) {
+    await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
+  }
+  traceLog(
+    ctx.options,
+    "githubbot_review_budget_decision",
+    makeTrace(
+      managementThreadKey(owner, repo, pr.number),
+      `review-budget-${headSha}`,
+    ),
+    {
+      assessment: admission.assessment?.kind,
+      assessment_reasons: admission.assessment?.reasons,
+      decision: admission.decision,
+      epoch: state.epoch,
+      head_sha: headSha,
+      reset_epoch:
+        admission.decision === "allow" ? admission.resetEpoch : undefined,
+      reviewer_key: reviewerKey,
+      reviewer_rounds_used:
+        state.reviewerRoundsUsed?.[reviewerKey] ?? state.roundsUsed,
+      rounds_used: state.roundsUsed,
+    },
+  );
+  return { ...admission, state };
+}
+
+async function escalateReviewBudget(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pr: PullRequestSummary,
+  admission: Extract<ReviewAdmission, { decision: "pause" }>,
+  reviewerKey: string,
+): Promise<void> {
+  const pausedHeadSha = admission.state.pausedHeadSha ?? pr.headSha;
+  const pauseClaim = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-paused:${owner}/${repo}#${pr.number}:${pausedHeadSha}:${admission.state.epoch}:${admission.reason}`;
+  if (
+    !(await retryingReviewClaim(
+      ctx,
+      pauseClaim,
+      `${owner}/${repo}#${pr.number}`,
+    ))
+  ) {
+    return;
+  }
+  const handle = ctx.options.escalationHandle?.replace(/^@/, "");
+  const mention = handle ? `@${handle} ` : "";
+  const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
+  const evidence = admission.assessment?.reasons.join("; ") ?? "unavailable";
+  const reviewerRounds =
+    admission.state.reviewerRoundsUsed?.[reviewerKey] ??
+    admission.state.roundsUsed;
+  const maxReviewerRounds =
+    ctx.options.reviewMaxRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH;
+  const maxTotalRounds =
+    ctx.options.reviewMaxTotalRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH;
+  const body =
+    `${mention}The bounded review budget reached its human-handoff boundary ` +
+    `to prevent an open-ended review/fix loop (reason: ${admission.reason}; epoch ` +
+    `${admission.state.epoch}, reviewer round ${reviewerRounds}/${maxReviewerRounds}, ` +
+    `epoch total ${admission.state.roundsUsed}/${maxTotalRounds}). ` +
+    `Change assessment: ${evidence}. No further automatic review response or ` +
+    `merge will proceed until a write-authorized human adds the ` +
+    `\`${resetLabel}\` label and re-requests review to explicitly start another ` +
+    `epoch; otherwise adjudicate the finding or split the PR.`;
+  try {
+    await ctx.octokit.rest.issues.createComment({
+      body,
+      issue_number: pr.number,
+      owner,
+      repo,
+    });
+  } catch (error) {
+    await release(ctx, pauseClaim);
+    logger(ctx).warn("githubbot_review_budget_escalation_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${pr.number}`,
     });
   }
 }
@@ -482,8 +1440,35 @@ async function tryMerge(
   repo: string,
   number: number,
 ): Promise<void> {
+  await runExclusive(reviewBudgetLockKey(owner, repo, number), () =>
+    tryMergeLocked(ctx, owner, repo, number),
+  );
+}
+
+async function tryMergeLocked(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
+  const reviewBudget = await loadReviewBudget(ctx, owner, repo, number);
+  if (!reviewBudget.ok) return;
+  if (reviewBudget.state?.pausedHeadSha) {
+    traceLog(
+      ctx.options,
+      "githubbot_merge_review_budget_paused",
+      makeTrace(managementThreadKey(owner, repo, number), `merge-${pr.headSha}`),
+      {
+        epoch: reviewBudget.state.epoch,
+        pause_started_at_head_sha: reviewBudget.state.pausedHeadSha,
+        pause_reason: reviewBudget.state.pauseReason,
+        pr: `${owner}/${repo}#${number}`,
+      },
+    );
+    return;
+  }
   const decision = decideMerge({
     autoMerge: ctx.options.autoMerge !== false,
     draft: pr.draft,
@@ -638,19 +1623,46 @@ function fireAddressReviewTurn(
   owner: string,
   repo: string,
   pr: PullRequestSummary,
-  review: { reviewer: string; reviewId: number; reviewNodeId?: string },
+  review: {
+    budget: ReviewEpochState;
+    reviewer: string;
+    reviewerKey: string;
+    reviewId: number;
+    reviewNodeId?: string;
+  },
 ): void {
-  const { reviewer, reviewId, reviewNodeId } = review;
+  const { budget, reviewer, reviewerKey, reviewId, reviewNodeId } = review;
+  const maxReviewerRounds =
+    ctx.options.reviewMaxRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH;
+  const maxTotalRounds =
+    ctx.options.reviewMaxTotalRoundsPerEpoch ??
+    DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH;
+  const reviewerRounds =
+    budget.reviewerRoundsUsed?.[reviewerKey] ?? budget.roundsUsed;
   const preamble =
     `A review was submitted on pull request ${owner}/${repo}#${pr.number} ` +
-    `(head ${pr.headSha}). Address it as the PR author, working in your sandbox:\n` +
+    `(head ${pr.headSha}). This is review epoch ${budget.epoch}, reviewer round ` +
+    `${reviewerRounds} of ${maxReviewerRounds}, and aggregate round ` +
+    `${budget.roundsUsed} of ${maxTotalRounds}. Address it as the PR author, working ` +
+    `in your sandbox. This is a bounded validation-and-repair turn, not a new ` +
+    `open-ended review:\n` +
     `- Read all of the feedback: \`gh pr view ${pr.number} --comments\` and the ` +
     `pull-request review-comments API.\n` +
-    `- Make the changes you agree with in a single coherent commit and push to ` +
-    `${pr.headRef}.\n` +
-    `- Reply to each review thread saying what you changed; where you disagree, ` +
-    `explain why, briefly and respectfully. Resolve the threads you've addressed.\n` +
-    `- Re-request review from @${reviewer} once you've pushed.\n` +
+    `- Validate each finding before editing: identify the concrete code path, ` +
+    `show that its preconditions are reachable under enforced types, schema, ` +
+    `authorization, and deployment policy, and state the material impact. ` +
+    `Classify duplicates, impossible-by-contract cases, optional nits, and ` +
+    `speculation as non-blocking instead of manufacturing defensive machinery.\n` +
+    `- Make only the smallest changes needed for validated, in-scope findings. ` +
+    `Do not redesign adjacent systems or reopen resolved findings. If a fix ` +
+    `would materially expand the PR, stop and ask for human approval.\n` +
+    `- Put all agreed changes in one coherent commit on ${pr.headRef} and include ` +
+    `the commit trailer \`Centaur-Automation: true\`, then push.\n` +
+    `- Reply to every thread with the evidence and what changed. Where a finding ` +
+    `is invalid, explain the enforcing contract briefly. Resolve addressed or ` +
+    `evidence-rejected threads when authorized.\n` +
+    `- Re-request review from @${reviewer} only if you pushed code.\n` +
     `- If a request is unclear or you can't address it, say so in the thread and ask.`;
   fireManagementTurn(
     ctx,
