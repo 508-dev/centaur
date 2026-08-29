@@ -202,8 +202,10 @@ impl PgSessionStore {
             sqlx::query(
                 r#"
                 update sessions
-                set proxy_labels = $2, updated_at = now()
-                where thread_key = $1 and proxy_labels = '{}'::jsonb
+                set proxy_labels = $2 || sessions.proxy_labels,
+                    updated_at = now()
+                where thread_key = $1
+                  and sessions.proxy_labels is distinct from ($2 || sessions.proxy_labels)
                 "#,
             )
             .bind(thread_key.as_str())
@@ -2232,6 +2234,49 @@ mod tests {
                 .expect("get session")
                 .proxy_labels,
             labels
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_or_get_session_backfills_missing_proxy_labels_without_overwriting_existing() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:proxy-label-backfill-{}", Uuid::new_v4())).unwrap();
+        let original_labels = BTreeMap::from([("existing".to_owned(), "original".to_owned())]);
+
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                original_labels,
+            )
+            .await
+            .expect("create session with an existing proxy label");
+
+        let updated = store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::from([
+                    ("centaur.thread_key".to_owned(), thread_key.to_string()),
+                    ("existing".to_owned(), "replacement".to_owned()),
+                ]),
+            )
+            .await
+            .expect("backfill missing proxy labels");
+
+        assert_eq!(
+            updated.proxy_labels,
+            BTreeMap::from([
+                ("centaur.thread_key".to_owned(), thread_key.to_string()),
+                ("existing".to_owned(), "original".to_owned()),
+            ])
         );
     }
 

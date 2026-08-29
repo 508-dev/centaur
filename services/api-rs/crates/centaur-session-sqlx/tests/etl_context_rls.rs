@@ -84,6 +84,15 @@ async fn company_context_reader_role_has_narrow_security_surface() -> Result<(),
 }
 
 #[tokio::test]
+async fn centaur_diagnostics_reader_exposes_only_sanitized_views() -> Result<(), Box<dyn Error>> {
+    let Some(mut fixture) = RlsTestFixture::create().await? else {
+        return Ok(());
+    };
+    let result = assert_centaur_diagnostics_reader_security(&mut fixture.conn).await;
+    fixture.finish(result).await
+}
+
+#[tokio::test]
 async fn company_context_reader_preserves_scoped_search_behavior() -> Result<(), Box<dyn Error>> {
     let Some(mut fixture) = RlsTestFixture::create().await? else {
         return Ok(());
@@ -331,6 +340,319 @@ async fn assert_multiterm_granola_keyword_scope(
         vec!["granola:note:granola_note_other"]
     );
     Ok(())
+}
+
+async fn assert_centaur_diagnostics_reader_security(
+    conn: &mut PgConnection,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute("revoke centaur_diagnostics_operator from current_user")
+        .await?;
+    sqlx::raw_sql(
+        r#"
+        insert into sessions
+            (thread_key, harness_type, status, metadata)
+        values
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'codex',
+                'idle',
+                '{"source":"discord","platform":"discord","thread_id":"test-thread"}'
+            ),
+            (
+                'discord:other-guild:other-channel:other-thread',
+                'codex',
+                'idle',
+                '{"source":"discord","platform":"discord","thread_id":"other-thread"}'
+            );
+
+        insert into session_messages
+            (message_id, thread_key, role, parts, metadata)
+        values
+            (
+                'msg_diagnostics',
+                'discord:test-guild:test-channel:test-thread',
+                'user',
+                '[{"type":"text","text":"diagnostic-secret"}]',
+                '{"source":"discord","platform":"discord","user_id":"test-user"}'
+            ),
+            (
+                'msg_diagnostics_other',
+                'discord:other-guild:other-channel:other-thread',
+                'user',
+                '[{"type":"text","text":"other-session-secret"}]',
+                '{"source":"discord","platform":"discord","user_id":"other-user"}'
+            );
+
+        insert into session_executions
+            (execution_id, thread_key, status, metadata, error, started_at, completed_at)
+        values
+            (
+                'exe_diagnostics',
+                'discord:test-guild:test-channel:test-thread',
+                'failed',
+                '{"model":"test-model","workflow_name":"test-workflow"}',
+                'diagnostic-secret',
+                now() - interval '1 minute',
+                now()
+            ),
+            (
+                'exe_diagnostics_other',
+                'discord:other-guild:other-channel:other-thread',
+                'failed',
+                '{"model":"other-model","workflow_name":"other-workflow"}',
+                'other-session-secret',
+                now() - interval '1 minute',
+                now()
+            );
+
+        insert into session_events
+            (thread_key, execution_id, event_type, payload)
+        values
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'exe_diagnostics',
+                'session.execution_failed',
+                '{"type":"result","status":"failed","error":"diagnostic-secret","terminal_reason":"diagnostic-secret"}'
+            ),
+            (
+                'discord:test-guild:test-channel:test-thread',
+                'exe_diagnostics',
+                'session.output',
+                '"ordinary output"'
+            ),
+            (
+                'discord:other-guild:other-channel:other-thread',
+                'exe_diagnostics_other',
+                'session.execution_failed',
+                '{"type":"result","status":"failed","error":"other-session-secret"}'
+            );
+
+        insert into slack_sync_channels
+            (channel_id, channel_name, is_private)
+        values
+            ('C0DIAGNOSTICS', 'diagnostics-leak-target', false);
+
+        insert into slack_sync_messages
+            (channel_id, message_ts, user_id, text)
+        values
+            ('C0DIAGNOSTICS', '1770000000.000001', 'U0DIAGNOSTICS', 'slack-secret');
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("discord:test-guild:test-channel:test-thread")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+
+    let current_user: String = sqlx::query_scalar("select current_user::text")
+        .fetch_one(&mut *conn)
+        .await?;
+    let message_shape: (i32, serde_json::Value) = sqlx::query_as(
+        "select part_count, part_types from centaur_diagnostics.session_messages \
+         where message_id = 'msg_diagnostics'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let execution_shape: (bool, Option<i32>) = sqlx::query_as(
+        "select has_error, error_length from centaur_diagnostics.session_executions \
+         where execution_id = 'exe_diagnostics'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let event_shape: (bool, Option<i32>, serde_json::Value) = sqlx::query_as(
+        "select has_error, error_length, payload_keys \
+         from centaur_diagnostics.session_events \
+         where execution_id = 'exe_diagnostics' \
+           and event_type = 'session.execution_failed'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let scalar_event_payload_keys: serde_json::Value = sqlx::query_scalar(
+        "select payload_keys from centaur_diagnostics.session_events \
+         where execution_id = 'exe_diagnostics' \
+           and event_type = 'session.output'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let broad_role_member: bool =
+        sqlx::query_scalar("select pg_has_role(current_user, 'centaur_readonly', 'member')")
+            .fetch_one(&mut *conn)
+            .await?;
+    let role_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, \
+         rolreplication, rolbypassrls from pg_roles where rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let visible_sessions: Vec<String> = sqlx::query_scalar(
+        "select thread_key from centaur_diagnostics.sessions order by thread_key",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_executions: Vec<String> = sqlx::query_scalar(
+        "select execution_id from centaur_diagnostics.session_executions order by execution_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_messages: Vec<String> = sqlx::query_scalar(
+        "select message_id from centaur_diagnostics.session_messages order by message_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_events: Vec<String> = sqlx::query_scalar(
+        "select execution_id from centaur_diagnostics.session_events order by event_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let pinned_scope: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_thread_key()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let reader_is_operator: bool = sqlx::query_scalar("select centaur_diagnostics.is_operator()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let reader_has_operator_membership: bool = sqlx::query_scalar(
+        "select pg_has_role(current_user, 'centaur_diagnostics_operator', 'member')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let raw_message = sqlx::query("select parts from public.session_messages limit 1")
+        .fetch_optional(&mut *conn)
+        .await;
+    let raw_event = sqlx::query("select payload from public.session_events limit 1")
+        .fetch_optional(&mut *conn)
+        .await;
+    let hidden_message_parts =
+        sqlx::query("select parts from centaur_diagnostics.session_messages limit 1")
+            .fetch_optional(&mut *conn)
+            .await;
+    let hidden_event_payload =
+        sqlx::query("select payload from centaur_diagnostics.session_events limit 1")
+            .fetch_optional(&mut *conn)
+            .await;
+
+    conn.execute("reset role").await?;
+
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("discord:test-guild:C0DIAGNOSTICS:1770000000.000001")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let generic_key_slack_channel: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_slack_channel_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let generic_key_slack_message_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.slack_sync_messages")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("slack:T0HOME:C0DIAGNOSTICS:1770000000.000001")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let slack_key_channel: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_slack_channel_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let slack_key_message_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.slack_sync_messages")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
+    sqlx::query("select set_config('centaur.thread_key', '', false)")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let unscoped_session_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.sessions")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
+    conn.execute("grant centaur_diagnostics_operator to current_user")
+        .await?;
+    conn.execute("set role centaur_diagnostics_operator")
+        .await?;
+    let operator_session_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.sessions")
+            .fetch_one(&mut *conn)
+            .await?;
+    let operator_is_operator: bool = sqlx::query_scalar("select centaur_diagnostics.is_operator()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let operator_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, \
+         rolreplication, rolbypassrls from pg_roles where rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    conn.execute("reset role").await?;
+    conn.execute("revoke centaur_diagnostics_operator from current_user")
+        .await?;
+
+    assert_eq!(current_user, "centaur_diagnostics_reader");
+    assert_eq!(message_shape.0, 1);
+    assert_eq!(message_shape.1, serde_json::json!(["text"]));
+    assert_eq!(execution_shape, (true, Some(17)));
+    assert!(event_shape.0);
+    assert_eq!(event_shape.1, Some(17));
+    assert_eq!(
+        event_shape.2,
+        serde_json::json!(["error", "status", "terminal_reason", "type"])
+    );
+    assert_eq!(scalar_event_payload_keys, serde_json::json!([]));
+    assert!(!broad_role_member);
+    assert_eq!(
+        role_attributes,
+        (false, false, false, false, false, false, false)
+    );
+    assert_eq!(
+        visible_sessions,
+        vec!["discord:test-guild:test-channel:test-thread".to_owned()]
+    );
+    assert_eq!(visible_executions, vec!["exe_diagnostics".to_owned()]);
+    assert_eq!(visible_messages, vec!["msg_diagnostics".to_owned()]);
+    assert_eq!(
+        visible_events,
+        vec!["exe_diagnostics".to_owned(), "exe_diagnostics".to_owned()]
+    );
+    assert_eq!(
+        pinned_scope.as_deref(),
+        Some("discord:test-guild:test-channel:test-thread")
+    );
+    assert!(!reader_is_operator);
+    assert!(!reader_has_operator_membership);
+    assert_eq!(generic_key_slack_channel, None);
+    assert_eq!(generic_key_slack_message_count, 0);
+    assert_eq!(slack_key_channel.as_deref(), Some("C0DIAGNOSTICS"));
+    assert_eq!(slack_key_message_count, 1);
+    assert_eq!(unscoped_session_count, 0);
+    assert!(operator_session_count >= 2);
+    assert!(operator_is_operator);
+    assert_eq!(
+        operator_attributes,
+        (false, false, false, false, false, false, false)
+    );
+    assert_database_error_code(raw_message, "42501");
+    assert_database_error_code(raw_event, "42501");
+    assert_database_error_code(hidden_message_parts, "42703");
+    assert_database_error_code(hidden_event_payload, "42703");
+    Ok(())
+}
+
+fn assert_database_error_code<T>(result: Result<T, sqlx::Error>, expected: &str) {
+    let Err(sqlx::Error::Database(error)) = result else {
+        panic!("expected database error with SQLSTATE {expected}");
+    };
+    assert_eq!(error.code().as_deref(), Some(expected));
 }
 
 fn test_database_url() -> Option<String> {
