@@ -90,6 +90,38 @@ as $$
     select nullif(pg_catalog.current_setting('centaur.thread_key', true), '')
 $$;
 
+create or replace function centaur_diagnostics.scoped_slack_channel_id()
+returns text
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select case
+        -- Current Slack keys: slack:<channel>:<thread_ts>.
+        when pg_catalog.cardinality(parts) = 3
+          and parts[1] = 'slack'
+          and parts[2] ~ '^[CDG][A-Z0-9]+$'
+        then parts[2]
+        -- Team-qualified Slack keys: slack:<team>:<channel>:<thread_ts>.
+        when pg_catalog.cardinality(parts) = 4
+          and parts[1] = 'slack'
+          and parts[2] ~ '^T[A-Z0-9]+$'
+          and parts[3] ~ '^[CDG][A-Z0-9]+$'
+        then parts[3]
+        -- Legacy Chat SDK keys: <channel>:<thread_ts>.
+        when pg_catalog.cardinality(parts) = 2
+          and parts[1] ~ '^[CDG][A-Z0-9]+$'
+        then parts[1]
+    end
+    from (
+        select pg_catalog.string_to_array(
+            coalesce(centaur_diagnostics.scoped_thread_key(), ''),
+            ':'
+        ) as parts
+    ) scoped
+$$;
+
 create or replace function centaur_diagnostics.scoped_slack_thread_ts()
 returns text
 language sql
@@ -97,12 +129,14 @@ stable
 parallel safe
 set search_path = ''
 as $$
-    select (
-        pg_catalog.regexp_match(
-            coalesce(centaur_diagnostics.scoped_thread_key(), ''),
-            '([0-9]{10}\.[0-9]{1,6})$'
-        )
-    )[1]
+    select case
+        when centaur_diagnostics.scoped_slack_channel_id() is not null then (
+            pg_catalog.regexp_match(
+                coalesce(centaur_diagnostics.scoped_thread_key(), ''),
+                '([0-9]{10}\.[0-9]{1,6})$'
+            )
+        )[1]
+    end
 $$;
 
 create or replace function centaur_diagnostics.allows_thread(candidate text)
@@ -124,12 +158,7 @@ parallel safe
 set search_path = ''
 as $$
     select centaur_diagnostics.is_operator()
-        or candidate = any(
-            pg_catalog.string_to_array(
-                coalesce(centaur_diagnostics.scoped_thread_key(), ''),
-                ':'
-            )
-        )
+        or candidate = centaur_diagnostics.scoped_slack_channel_id()
 $$;
 
 create or replace function centaur_diagnostics.allows_slack_message(
@@ -434,17 +463,14 @@ select
     metadata ->> 'source' as source
 from public.slack_sync_runs
 where centaur_diagnostics.is_operator()
-   or channels_requested ?| pg_catalog.string_to_array(
-       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
-   )
-   or channels_synced ?| pg_catalog.string_to_array(
-       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
-   )
-   or channels_failed ?| pg_catalog.string_to_array(
-       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
-   )
-   or channels_skipped ?| pg_catalog.string_to_array(
-       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
+   or (
+       centaur_diagnostics.scoped_slack_channel_id() is not null
+       and (
+           channels_requested ? centaur_diagnostics.scoped_slack_channel_id()
+           or channels_synced ? centaur_diagnostics.scoped_slack_channel_id()
+           or channels_failed ? centaur_diagnostics.scoped_slack_channel_id()
+           or channels_skipped ? centaur_diagnostics.scoped_slack_channel_id()
+       )
    );
 
 do $$

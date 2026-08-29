@@ -426,6 +426,16 @@ async fn assert_centaur_diagnostics_reader_security(
                 'session.execution_failed',
                 '{"type":"result","status":"failed","error":"other-session-secret"}'
             );
+
+        insert into slack_sync_channels
+            (channel_id, channel_name, is_private)
+        values
+            ('C0DIAGNOSTICS', 'diagnostics-leak-target', false);
+
+        insert into slack_sync_messages
+            (channel_id, message_ts, user_id, text)
+        values
+            ('C0DIAGNOSTICS', '1770000000.000001', 'U0DIAGNOSTICS', 'slack-secret');
         "#,
     )
     .execute(&mut *conn)
@@ -527,6 +537,36 @@ async fn assert_centaur_diagnostics_reader_security(
 
     conn.execute("reset role").await?;
 
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("discord:test-guild:C0DIAGNOSTICS:1770000000.000001")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let generic_key_slack_channel: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_slack_channel_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let generic_key_slack_message_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.slack_sync_messages")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("slack:T0HOME:C0DIAGNOSTICS:1770000000.000001")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let slack_key_channel: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_slack_channel_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let slack_key_message_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.slack_sync_messages")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
     sqlx::query("select set_config('centaur.thread_key', '', false)")
         .execute(&mut *conn)
         .await?;
@@ -590,6 +630,10 @@ async fn assert_centaur_diagnostics_reader_security(
     );
     assert!(!reader_is_operator);
     assert!(!reader_has_operator_membership);
+    assert_eq!(generic_key_slack_channel, None);
+    assert_eq!(generic_key_slack_message_count, 0);
+    assert_eq!(slack_key_channel.as_deref(), Some("C0DIAGNOSTICS"));
+    assert_eq!(slack_key_message_count, 1);
     assert_eq!(unscoped_session_count, 0);
     assert!(operator_session_count >= 2);
     assert!(operator_is_operator);
