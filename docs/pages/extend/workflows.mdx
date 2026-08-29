@@ -87,6 +87,7 @@ disabled.
 | `ctx.start_workflow(...)` | Start a child workflow and continue immediately. |
 | `ctx.agent_turn(...)` / `ctx.run_agent(...)` / `ctx.start_agent(...)` | Run one agent turn and wait for the result. |
 | `ctx.run_agents(...)` | Run a bounded group of named agent turns concurrently and wait for every outcome. |
+| `ctx.run_model_ensemble(...)` | Run replay-safe independent reviews with bounded model fallback and validated synthesis. |
 
 The handler may re-execute after a restart. Put external side effects behind
 `ctx.step(...)` so completed work is not repeated.
@@ -159,6 +160,98 @@ The principal is resolved before the session is created. An unknown or empty
 foreign ID fails the turn instead of using the thread-derived principal. If the
 session already exists under another principal, the turn returns a conflict
 instead of rebinding it.
+
+### Run a Bounded Model Ensemble
+
+Use `ctx.run_model_ensemble(...)` when independent models should review the
+same task and a final model should synthesize their evidence. The helper owns a
+hard aggregate attempt cap, per-member fallback caps, a minimum-success quorum,
+and a separate bounded synthesis chain:
+
+```python
+from api.model_ensemble import (
+    EnsembleMember,
+    EnsemblePolicy,
+    ModelTarget,
+    SynthesisSpec,
+)
+
+result = await ctx.run_model_ensemble(
+    "release-review",
+    "Review the proposed release and recommend the smallest justified changes.",
+    [
+        EnsembleMember(
+            "correctness",
+            [
+                ModelTarget(
+                    "openrouter/vendor/model-a",
+                    "bifrost",
+                ),
+                ModelTarget("vendor/model-a", "openrouter"),
+            ],
+            "Check behavior against the stated acceptance criteria.",
+        ),
+        EnsembleMember(
+            "adversarial",
+            [ModelTarget("openrouter/vendor/model-b", "bifrost")],
+            "Look for concrete counterexamples; do not invent hypothetical blockers.",
+        ),
+        EnsembleMember(
+            "simplicity",
+            [ModelTarget("openrouter/vendor/model-c", "bifrost")],
+            "Flag unnecessary machinery and prefer the narrowest sufficient fix.",
+        ),
+    ],
+    SynthesisSpec(
+        [
+            ModelTarget("openrouter/vendor/model-a", "bifrost"),
+            ModelTarget("vendor/model-b", "openrouter"),
+        ],
+        "Prefer verified evidence over majority vote.",
+    ),
+    principal="workflow-review-readonly",
+    replay_safe=True,
+    policy=EnsemblePolicy(
+        min_successes=2,
+        max_concurrency=3,
+        max_attempts_per_member=2,
+        max_synthesis_attempts=2,
+        max_total_attempts=8,
+    ),
+)
+```
+
+Targets are ordered. In the example, Centaur first uses an internal gateway and
+only bypasses it through the direct provider after that target fails. Model
+identifiers may differ between targets because each gateway owns its own naming
+contract. Every attempt records the ensemble, phase, member, target, and model
+in execution metadata.
+
+The helper is intentionally analysis-only. It requires `replay_safe=True` and
+an explicit principal, but the principal is the enforceable security boundary:
+grant that principal only read-only tools and credentials. Do not use an
+ensemble principal that can push code, post comments, mutate CRM records, or
+perform other external writes. Parallel candidates and fallbacks can replay a
+prompt even when an earlier response was lost.
+
+Candidate outputs are passed to synthesis as untrusted JSON evidence. A valid
+synthesis must return a JSON object with `answer`, `consensus`, `disagreements`,
+`caveats`, and `used_sources`; cited source names must be successful configured
+members. Invalid synthesis output advances to the next target within the same
+aggregate cap.
+
+Runtime exhaustion is a structured result, not an exception that invites an
+unbounded workflow retry:
+
+- `completed`: quorum and validated synthesis succeeded;
+- `quorum_failed`: too few independent reviews succeeded, so synthesis was not
+  attempted;
+- `synthesis_failed`: review quorum succeeded, but every permitted synthesis
+  attempt failed or returned invalid structure.
+
+Inspect `members`, `synthesis_attempts`, `total_attempts`, and `budget` before a
+later workflow performs any consequential action. Treat `answer` as a proposal;
+normal policy, schema, test, and approval gates still apply.
 
 ## Run a workflow
 
