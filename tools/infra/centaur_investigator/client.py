@@ -391,7 +391,7 @@ class CentaurInvestigatorClient:
 
         if include_observability:
             result["observability"] = self._observability(
-                thread_keys=result.get("thread_keys") or [thread_key.strip()],
+                thread_keys=result.get("thread_keys") or [],
                 execution_ids=result.get("execution_ids") or [],
                 window_hours=window_hours,
                 logs_limit=logs_limit,
@@ -742,10 +742,10 @@ class CentaurInvestigatorClient:
             thread_key_like,
             limit,
         )
-        matched_thread_keys = _dedupe(
+        visible_session_thread_keys = _dedupe(
             [str(row.get("thread_key")) for row in sessions["rows"] if row.get("thread_key")]
-            + candidates
         )
+        lookup_thread_keys = _dedupe([*visible_session_thread_keys, *candidates])
 
         executions = await self._safe_fetch(
             conn,
@@ -782,12 +782,20 @@ class CentaurInvestigatorClient:
             ORDER BY created_at DESC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
         execution_ids = _dedupe(
             [str(row.get("execution_id")) for row in executions["rows"] if row.get("execution_id")]
+        )
+        visible_thread_keys = _dedupe(
+            visible_session_thread_keys
+            + [
+                str(row.get("thread_key"))
+                for row in executions["rows"]
+                if row.get("thread_key")
+            ]
         )
         workflow_run_ids = _dedupe(
             [
@@ -848,7 +856,7 @@ class CentaurInvestigatorClient:
             ORDER BY created_at ASC, message_id ASC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -876,7 +884,7 @@ class CentaurInvestigatorClient:
             ORDER BY event_id DESC
             LIMIT $4
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             execution_ids,
             limit * 4,
@@ -903,7 +911,7 @@ class CentaurInvestigatorClient:
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -935,7 +943,7 @@ class CentaurInvestigatorClient:
             ORDER BY created_at DESC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -966,7 +974,7 @@ class CentaurInvestigatorClient:
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -986,7 +994,7 @@ class CentaurInvestigatorClient:
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -1194,7 +1202,11 @@ class CentaurInvestigatorClient:
         result = {
             "status": "ok",
             "parsed": parsed,
-            "thread_keys": matched_thread_keys,
+            # Only database-authorized rows may seed observability queries. Do
+            # not echo a caller-supplied candidate here when the scoped views
+            # rejected it, or an explicit foreign thread key could bypass the
+            # Postgres boundary through aggregate log queries.
+            "thread_keys": visible_thread_keys,
             "execution_ids": execution_ids,
             "analysis": self._summarize(
                 parsed=parsed,
@@ -1492,7 +1504,7 @@ class CentaurInvestigatorClient:
 
         if include_observability:
             result["observability"] = self._observability(
-                thread_keys=result.get("thread_keys") or parsed.get("thread_key_candidates") or [],
+                thread_keys=result.get("thread_keys") or [],
                 execution_ids=result.get("execution_ids") or [],
                 window_hours=window_hours,
                 logs_limit=logs_limit,
@@ -1688,6 +1700,12 @@ class CentaurInvestigatorClient:
             "vlogs": {"status": "skipped"},
             "vmetrics": {"status": "skipped"},
         }
+
+        # The diagnostic role is intentionally unable to see sessions outside
+        # its proxy-pinned thread. Avoid turning an unauthorized caller-supplied
+        # reference into a secondary query against the observability stores.
+        if not thread_keys and not execution_ids:
+            return result
 
         infra_dir = Path(__file__).resolve().parent.parent
         vlogs_module = _safe_load_module(

@@ -34,3 +34,6 @@ name = "centaur_diagnostics_dsn"
 database = "ai_v2"
 secret_ref = "CENTAUR_POSTGRES_DSN"
 role = "centaur_diagnostics_reader"
+settings = [
+    { name = "centaur.thread_key", value_from = { proxy_label = "centaur.thread_key" } },
+]

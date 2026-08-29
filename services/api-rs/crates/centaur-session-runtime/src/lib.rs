@@ -6823,7 +6823,10 @@ fn proxy_labels_from_session_metadata(
     thread_key: &ThreadKey,
     metadata: &Value,
 ) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
+    let mut labels = BTreeMap::from([(
+        "centaur.thread_key".to_owned(),
+        thread_key.as_str().to_owned(),
+    )]);
     insert_metadata_string_label(
         &mut labels,
         "centaur.slack_user_id",
@@ -8412,6 +8415,10 @@ mod tests {
         assert_eq!(
             labels,
             BTreeMap::from([
+                (
+                    "centaur.thread_key".to_owned(),
+                    "slack:T123:C123:1700000000.000000".to_owned(),
+                ),
                 ("centaur.slack_channel_id".to_owned(), "C456".to_owned()),
                 ("centaur.slack_team_id".to_owned(), "T123".to_owned()),
                 ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
@@ -8433,6 +8440,10 @@ mod tests {
         assert_eq!(
             labels,
             BTreeMap::from([
+                (
+                    "centaur.thread_key".to_owned(),
+                    "linear:CEN-123:s:agent-session".to_owned(),
+                ),
                 ("centaur.slack_team_id".to_owned(), "T123".to_owned()),
                 ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
             ])

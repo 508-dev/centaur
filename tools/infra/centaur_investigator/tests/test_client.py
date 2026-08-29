@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -333,6 +334,17 @@ class _RetriedWorkflowConnection(_FakeConnection):
         return await super().fetch(query, *args)
 
 
+class _RejectedForeignThreadConnection(_FakeConnection):
+    async def fetch(self, query: str, *args):
+        if (
+            "FROM centaur_diagnostics.sessions" in query
+            or "FROM centaur_diagnostics.session_executions" in query
+        ):
+            self.fetch_calls.append((query, args))
+            return []
+        return await super().fetch(query, *args)
+
+
 def test_parse_slack_permalink_prefers_thread_ts_query() -> None:
     result = parse_slack_reference(
         "Investigate https://example.slack.com/archives/C123/p1777910338403889"
@@ -520,6 +532,57 @@ def test_diagnose_without_reference_or_current_thread_fails_closed(monkeypatch) 
 
     assert result["status"] == "error"
     assert "CENTAUR_THREAD_KEY" in result["error"]
+
+
+def test_rejected_foreign_thread_never_seeds_observability(monkeypatch) -> None:
+    fake = _RejectedForeignThreadConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    class FakeVlogs:
+        def hits(self, *args, **kwargs):
+            raise AssertionError("an unauthorized thread must not reach log search")
+
+        def field_values(self, *args, **kwargs):
+            raise AssertionError("an unauthorized thread must not reach log search")
+
+        def tool_usage_by_thread(self, *args, **kwargs):
+            raise AssertionError("an unauthorized thread must not reach log search")
+
+    def fake_load_module(module_name: str, path: Path):
+        if "vlogs" in str(path):
+            return SimpleNamespace(VictoriaLogsClient=FakeVlogs)
+        return None
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(centaur_client, "_safe_load_module", fake_load_module)
+
+    result = CentaurInvestigatorClient("postgresql://example").session_state(
+        "discord:foreign:channel:thread",
+        include_observability=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["thread_keys"] == []
+    assert result["execution_ids"] == []
+    assert result["observability"]["vlogs"]["status"] == "skipped"
+    assert "thread_key" not in result["observability"]["vlogs"]
+
+
+def test_diagnostics_dsn_pins_the_proxy_thread_label() -> None:
+    config = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )
+    secret_config = config["tool"]["centaur"]["secrets"][0]
+
+    assert secret_config["role"] == "centaur_diagnostics_reader"
+    assert secret_config["settings"] == [
+        {
+            "name": "centaur.thread_key",
+            "value_from": {"proxy_label": "centaur.thread_key"},
+        }
+    ]
 
 
 def test_observability_never_requests_raw_log_context(monkeypatch) -> None:

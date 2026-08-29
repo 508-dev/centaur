@@ -12,6 +12,19 @@ begin
             noreplication
             nobypassrls;
     end if;
+
+    if not exists (
+        select 1 from pg_roles where rolname = 'centaur_diagnostics_operator'
+    ) then
+        create role centaur_diagnostics_operator
+            nologin
+            nosuperuser
+            nocreatedb
+            nocreaterole
+            noinherit
+            noreplication
+            nobypassrls;
+    end if;
 end
 $$;
 
@@ -24,15 +37,124 @@ alter role centaur_diagnostics_reader
     noreplication
     nobypassrls;
 
+alter role centaur_diagnostics_operator
+    nologin
+    nosuperuser
+    nocreatedb
+    nocreaterole
+    noinherit
+    noreplication
+    nobypassrls;
+
 -- This role is intentionally independent from the legacy broad read-only role.
 revoke centaur_readonly from centaur_diagnostics_reader;
+revoke centaur_readonly from centaur_diagnostics_operator;
 
 create schema if not exists centaur_diagnostics;
 revoke all on schema centaur_diagnostics from public;
 grant usage on schema centaur_diagnostics to centaur_diagnostics_reader;
+grant usage on schema centaur_diagnostics to centaur_diagnostics_operator;
 
 alter default privileges in schema centaur_diagnostics
     revoke all on tables from public;
+alter default privileges in schema centaur_diagnostics
+    grant select on tables to centaur_diagnostics_reader, centaur_diagnostics_operator;
+alter default privileges in schema centaur_diagnostics
+    revoke execute on functions from public;
+alter default privileges in schema centaur_diagnostics
+    grant execute on functions to centaur_diagnostics_reader, centaur_diagnostics_operator;
+
+-- iron-proxy pins centaur.thread_key from the assigned sandbox's immutable
+-- proxy label before SET ROLE. The proxy rejects client attempts to change a
+-- pinned setting. Reader views therefore fail closed when the setting is
+-- absent and expose exactly one session. Cross-session access requires a
+-- separately granted operator role; this migration deliberately grants that
+-- role to nobody.
+create or replace function centaur_diagnostics.is_operator()
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select current_user = 'centaur_diagnostics_operator'
+$$;
+
+create or replace function centaur_diagnostics.scoped_thread_key()
+returns text
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select nullif(pg_catalog.current_setting('centaur.thread_key', true), '')
+$$;
+
+create or replace function centaur_diagnostics.scoped_slack_thread_ts()
+returns text
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select (
+        pg_catalog.regexp_match(
+            coalesce(centaur_diagnostics.scoped_thread_key(), ''),
+            '([0-9]{10}\.[0-9]{1,6})$'
+        )
+    )[1]
+$$;
+
+create or replace function centaur_diagnostics.allows_thread(candidate text)
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select centaur_diagnostics.is_operator()
+        or candidate = centaur_diagnostics.scoped_thread_key()
+$$;
+
+create or replace function centaur_diagnostics.allows_slack_channel(candidate text)
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select centaur_diagnostics.is_operator()
+        or candidate = any(
+            pg_catalog.string_to_array(
+                coalesce(centaur_diagnostics.scoped_thread_key(), ''),
+                ':'
+            )
+        )
+$$;
+
+create or replace function centaur_diagnostics.allows_slack_message(
+    candidate_channel text,
+    candidate_message_ts text,
+    candidate_thread_ts text,
+    candidate_parent_message_ts text
+)
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+    select centaur_diagnostics.is_operator()
+        or (
+            centaur_diagnostics.allows_slack_channel(candidate_channel)
+            and centaur_diagnostics.scoped_slack_thread_ts() is not null
+            and centaur_diagnostics.scoped_slack_thread_ts() in (
+                candidate_message_ts,
+                candidate_thread_ts,
+                candidate_parent_message_ts
+            )
+        )
+$$;
 
 create or replace view centaur_diagnostics.sessions
 with (security_barrier = true) as
@@ -48,7 +170,8 @@ select
     metadata ->> 'thread_id' as external_thread_id,
     created_at,
     updated_at
-from public.sessions;
+from public.sessions
+where centaur_diagnostics.allows_thread(thread_key);
 
 create or replace view centaur_diagnostics.session_executions
 with (security_barrier = true) as
@@ -83,7 +206,8 @@ select
     started_at,
     completed_at,
     extract(epoch from completed_at - started_at) as duration_seconds
-from public.session_executions;
+from public.session_executions
+where centaur_diagnostics.allows_thread(thread_key);
 
 create or replace view centaur_diagnostics.session_messages
 with (security_barrier = true) as
@@ -112,7 +236,8 @@ select
     metadata ->> 'action' as action,
     metadata ->> 'user_id' as user_id,
     created_at
-from public.session_messages;
+from public.session_messages
+where centaur_diagnostics.allows_thread(thread_key);
 
 create or replace view centaur_diagnostics.session_events
 with (security_barrier = true) as
@@ -142,7 +267,8 @@ select
         '[]'::jsonb
     ) as payload_keys,
     created_at
-from public.session_events;
+from public.session_events
+where centaur_diagnostics.allows_thread(thread_key);
 
 create or replace view centaur_diagnostics.workflow_runs
 with (security_barrier = true) as
@@ -164,7 +290,17 @@ select
     available_at,
     claimed,
     cancelled_at
-from public.centaur_readonly_workflow_runs;
+from public.centaur_readonly_workflow_runs workflow_run
+where centaur_diagnostics.is_operator()
+   or exists (
+        select 1
+        from public.session_executions execution
+        where centaur_diagnostics.allows_thread(execution.thread_key)
+          and (
+              execution.metadata ->> 'workflow_run_id' = workflow_run.run_id
+              or execution.metadata ->> 'workflow_task_id' = workflow_run.task_id
+          )
+   );
 
 create or replace view centaur_diagnostics.slack_sync_channels
 with (security_barrier = true) as
@@ -177,7 +313,8 @@ select
     first_seen_at,
     last_seen_at,
     updated_at
-from public.slack_sync_channels;
+from public.slack_sync_channels
+where centaur_diagnostics.allows_slack_channel(channel_id);
 
 create or replace view centaur_diagnostics.slack_sync_checkpoints
 with (security_barrier = true) as
@@ -189,7 +326,8 @@ select
     last_error <> '' as has_error,
     created_at,
     updated_at
-from public.slack_sync_checkpoints;
+from public.slack_sync_checkpoints
+where centaur_diagnostics.allows_slack_channel(channel_id);
 
 create or replace view centaur_diagnostics.slack_sync_messages
 with (security_barrier = true) as
@@ -211,7 +349,13 @@ select
     first_seen_at,
     last_seen_at,
     updated_at
-from public.slack_sync_messages;
+from public.slack_sync_messages
+where centaur_diagnostics.allows_slack_message(
+    channel_id,
+    message_ts,
+    thread_ts,
+    parent_message_ts
+);
 
 create or replace view centaur_diagnostics.slack_sync_message_attachments
 with (security_barrier = true) as
@@ -229,7 +373,20 @@ select
     first_seen_at,
     last_seen_at,
     updated_at
-from public.slack_sync_message_attachments;
+from public.slack_sync_message_attachments attachment
+where centaur_diagnostics.is_operator()
+   or exists (
+        select 1
+        from public.slack_sync_messages message
+        where message.channel_id = attachment.channel_id
+          and message.message_ts = attachment.message_ts
+          and centaur_diagnostics.allows_slack_message(
+              message.channel_id,
+              message.message_ts,
+              message.thread_ts,
+              message.parent_message_ts
+          )
+   );
 
 create or replace view centaur_diagnostics.slack_sync_backfill_jobs
 with (security_barrier = true) as
@@ -248,7 +405,12 @@ select
     last_error <> '' as has_error,
     created_at,
     updated_at
-from public.slack_sync_backfill_jobs;
+from public.slack_sync_backfill_jobs
+where centaur_diagnostics.allows_slack_channel(channel_id)
+  and (
+      centaur_diagnostics.is_operator()
+      or payload_json ->> 'thread_ts' = centaur_diagnostics.scoped_slack_thread_ts()
+  );
 
 create or replace view centaur_diagnostics.slack_sync_runs
 with (security_barrier = true) as
@@ -270,7 +432,20 @@ select
     finished_at,
     error_text <> '' as has_error,
     metadata ->> 'source' as source
-from public.slack_sync_runs;
+from public.slack_sync_runs
+where centaur_diagnostics.is_operator()
+   or channels_requested ?| pg_catalog.string_to_array(
+       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
+   )
+   or channels_synced ?| pg_catalog.string_to_array(
+       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
+   )
+   or channels_failed ?| pg_catalog.string_to_array(
+       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
+   )
+   or channels_skipped ?| pg_catalog.string_to_array(
+       coalesce(centaur_diagnostics.scoped_thread_key(), ''), ':'
+   );
 
 do $$
 begin
@@ -291,6 +466,7 @@ begin
                 updated_at,
                 released_at
             from public.agent_runtime_assignments
+            where centaur_diagnostics.allows_thread(thread_key)
         $view$;
     end if;
 
@@ -317,6 +493,7 @@ begin
                 worker_id is not null as claimed,
                 updated_at
             from public.agent_execution_requests
+            where centaur_diagnostics.allows_thread(thread_key)
         $view$;
     end if;
 
@@ -342,6 +519,7 @@ begin
                 wire_connected_at,
                 wire_last_seen_at
             from public.sandbox_sessions
+            where centaur_diagnostics.allows_thread(thread_key)
         $view$;
     end if;
 
@@ -356,12 +534,17 @@ begin
                 created_at,
                 updated_at
             from public.thread_traces
+            where centaur_diagnostics.allows_thread(thread_key)
         $view$;
     end if;
 end
 $$;
 
 revoke all on all tables in schema centaur_diagnostics from public;
-grant select on all tables in schema centaur_diagnostics to centaur_diagnostics_reader;
+revoke all on all functions in schema centaur_diagnostics from public;
+grant select on all tables in schema centaur_diagnostics
+    to centaur_diagnostics_reader, centaur_diagnostics_operator;
+grant execute on all functions in schema centaur_diagnostics
+    to centaur_diagnostics_reader, centaur_diagnostics_operator;
 
 grant centaur_diagnostics_reader to current_user;

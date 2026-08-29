@@ -345,6 +345,8 @@ async fn assert_multiterm_granola_keyword_scope(
 async fn assert_centaur_diagnostics_reader_security(
     conn: &mut PgConnection,
 ) -> Result<(), Box<dyn Error>> {
+    conn.execute("revoke centaur_diagnostics_operator from current_user")
+        .await?;
     sqlx::raw_sql(
         r#"
         insert into sessions
@@ -355,6 +357,12 @@ async fn assert_centaur_diagnostics_reader_security(
                 'codex',
                 'idle',
                 '{"source":"discord","platform":"discord","thread_id":"test-thread"}'
+            ),
+            (
+                'discord:other-guild:other-channel:other-thread',
+                'codex',
+                'idle',
+                '{"source":"discord","platform":"discord","thread_id":"other-thread"}'
             );
 
         insert into session_messages
@@ -366,6 +374,13 @@ async fn assert_centaur_diagnostics_reader_security(
                 'user',
                 '[{"type":"text","text":"diagnostic-secret"}]',
                 '{"source":"discord","platform":"discord","user_id":"test-user"}'
+            ),
+            (
+                'msg_diagnostics_other',
+                'discord:other-guild:other-channel:other-thread',
+                'user',
+                '[{"type":"text","text":"other-session-secret"}]',
+                '{"source":"discord","platform":"discord","user_id":"other-user"}'
             );
 
         insert into session_executions
@@ -377,6 +392,15 @@ async fn assert_centaur_diagnostics_reader_security(
                 'failed',
                 '{"model":"test-model","workflow_name":"test-workflow"}',
                 'diagnostic-secret',
+                now() - interval '1 minute',
+                now()
+            ),
+            (
+                'exe_diagnostics_other',
+                'discord:other-guild:other-channel:other-thread',
+                'failed',
+                '{"model":"other-model","workflow_name":"other-workflow"}',
+                'other-session-secret',
                 now() - interval '1 minute',
                 now()
             );
@@ -395,12 +419,22 @@ async fn assert_centaur_diagnostics_reader_security(
                 'exe_diagnostics',
                 'session.output',
                 '"ordinary output"'
+            ),
+            (
+                'discord:other-guild:other-channel:other-thread',
+                'exe_diagnostics_other',
+                'session.execution_failed',
+                '{"type":"result","status":"failed","error":"other-session-secret"}'
             );
         "#,
     )
     .execute(&mut *conn)
     .await?;
 
+    sqlx::query("select set_config('centaur.thread_key', $1, false)")
+        .bind("discord:test-guild:test-channel:test-thread")
+        .execute(&mut *conn)
+        .await?;
     conn.execute("set role centaur_diagnostics_reader").await?;
 
     let current_user: String = sqlx::query_scalar("select current_user::text")
@@ -443,6 +477,38 @@ async fn assert_centaur_diagnostics_reader_security(
     )
     .fetch_one(&mut *conn)
     .await?;
+    let visible_sessions: Vec<String> = sqlx::query_scalar(
+        "select thread_key from centaur_diagnostics.sessions order by thread_key",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_executions: Vec<String> = sqlx::query_scalar(
+        "select execution_id from centaur_diagnostics.session_executions order by execution_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_messages: Vec<String> = sqlx::query_scalar(
+        "select message_id from centaur_diagnostics.session_messages order by message_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let visible_events: Vec<String> = sqlx::query_scalar(
+        "select execution_id from centaur_diagnostics.session_events order by event_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let pinned_scope: Option<String> =
+        sqlx::query_scalar("select centaur_diagnostics.scoped_thread_key()")
+            .fetch_one(&mut *conn)
+            .await?;
+    let reader_is_operator: bool = sqlx::query_scalar("select centaur_diagnostics.is_operator()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let reader_has_operator_membership: bool = sqlx::query_scalar(
+        "select pg_has_role(current_user, 'centaur_diagnostics_operator', 'member')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
 
     let raw_message = sqlx::query("select parts from public.session_messages limit 1")
         .fetch_optional(&mut *conn)
@@ -461,6 +527,37 @@ async fn assert_centaur_diagnostics_reader_security(
 
     conn.execute("reset role").await?;
 
+    sqlx::query("select set_config('centaur.thread_key', '', false)")
+        .execute(&mut *conn)
+        .await?;
+    conn.execute("set role centaur_diagnostics_reader").await?;
+    let unscoped_session_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.sessions")
+            .fetch_one(&mut *conn)
+            .await?;
+    conn.execute("reset role").await?;
+
+    conn.execute("grant centaur_diagnostics_operator to current_user")
+        .await?;
+    conn.execute("set role centaur_diagnostics_operator")
+        .await?;
+    let operator_session_count: i64 =
+        sqlx::query_scalar("select count(*) from centaur_diagnostics.sessions")
+            .fetch_one(&mut *conn)
+            .await?;
+    let operator_is_operator: bool = sqlx::query_scalar("select centaur_diagnostics.is_operator()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let operator_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, \
+         rolreplication, rolbypassrls from pg_roles where rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    conn.execute("reset role").await?;
+    conn.execute("revoke centaur_diagnostics_operator from current_user")
+        .await?;
+
     assert_eq!(current_user, "centaur_diagnostics_reader");
     assert_eq!(message_shape.0, 1);
     assert_eq!(message_shape.1, serde_json::json!(["text"]));
@@ -475,6 +572,29 @@ async fn assert_centaur_diagnostics_reader_security(
     assert!(!broad_role_member);
     assert_eq!(
         role_attributes,
+        (false, false, false, false, false, false, false)
+    );
+    assert_eq!(
+        visible_sessions,
+        vec!["discord:test-guild:test-channel:test-thread".to_owned()]
+    );
+    assert_eq!(visible_executions, vec!["exe_diagnostics".to_owned()]);
+    assert_eq!(visible_messages, vec!["msg_diagnostics".to_owned()]);
+    assert_eq!(
+        visible_events,
+        vec!["exe_diagnostics".to_owned(), "exe_diagnostics".to_owned()]
+    );
+    assert_eq!(
+        pinned_scope.as_deref(),
+        Some("discord:test-guild:test-channel:test-thread")
+    );
+    assert!(!reader_is_operator);
+    assert!(!reader_has_operator_membership);
+    assert_eq!(unscoped_session_count, 0);
+    assert!(operator_session_count >= 2);
+    assert!(operator_is_operator);
+    assert_eq!(
+        operator_attributes,
         (false, false, false, false, false, false, false)
     );
     assert_database_error_code(raw_message, "42501");
