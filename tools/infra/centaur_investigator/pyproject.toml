@@ -1,6 +1,6 @@
 [project]
 name = "centaur_investigator"
-description = "Investigate Centaur Slack threads and sessions with readonly Postgres access"
+description = "Diagnose Centaur workflow runs and sessions with sanitized read-only state"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,3 +27,13 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 hosts = []
+
+[[tool.centaur.secrets]]
+type = "pg_dsn"
+name = "centaur_diagnostics_dsn"
+database = "ai_v2"
+secret_ref = "CENTAUR_POSTGRES_DSN"
+role = "centaur_diagnostics_reader"
+settings = [
+    { name = "centaur.thread_key", value_from = { proxy_label = "centaur.thread_key" } },
+]

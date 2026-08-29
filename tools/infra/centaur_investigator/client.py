@@ -1,4 +1,4 @@
-"""Centaur readonly PostgreSQL investigation helper."""
+"""Sanitized, read-only Centaur workflow and session diagnostics."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from centaur_sdk import secret
 
 CENTAUR_POSTGRES_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 CENTAUR_INVESTIGATOR_DATABASE_ENV = "CENTAUR_INVESTIGATOR_POSTGRES_DATABASE"
+CENTAUR_THREAD_KEY_ENV = "CENTAUR_THREAD_KEY"
 DEFAULT_POSTGRES_DATABASE = "ai_v2"
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
@@ -33,6 +34,11 @@ _SLACK_THREAD_KEY_RE = re.compile(
 )
 _CHANNEL_TS_RE = re.compile(r"\b(?P<channel>[CDG][A-Z0-9]+):(?P<thread_ts>\d{10}\.\d{1,6})\b")
 _KEY_SOURCE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*:")
+_NAMESPACED_THREAD_KEY_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_.-]*:[^\s<>|]+\b")
+_WORKFLOW_RUN_ID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 
 
 def _clamp(value: int, *, minimum: int, maximum: int) -> int:
@@ -61,6 +67,11 @@ def _postgres_database_name() -> str:
     return value.strip() or DEFAULT_POSTGRES_DATABASE
 
 
+def _current_thread_key() -> str:
+    """Return the session-scoped key injected into the current sandbox."""
+    return os.getenv(CENTAUR_THREAD_KEY_ENV, "").strip()  # noqa: TID251
+
+
 def _isoformat(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -81,7 +92,8 @@ def _serialize(value: Any) -> Any:
 def _record_to_dict(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return {key: _serialize(value) for key, value in row.items()}
-    return {key: _serialize(row[key]) for key in row.keys()}
+    # asyncpg.Record iteration yields values, so explicitly iterate its column names.
+    return {key: _serialize(row[key]) for key in row.keys()}  # noqa: SIM118
 
 
 def _connection_role(connection: dict[str, Any]) -> str | None:
@@ -297,7 +309,7 @@ def _safe_load_module(module_name: str, path: Path) -> Any | None:
 
 
 class CentaurInvestigatorClient:
-    """Investigate Centaur state through readonly Postgres access."""
+    """Diagnose Centaur state through read-only Postgres access."""
 
     def __init__(self, database_url: str | None = None) -> None:
         self._database_url = (database_url or _scoped_database_url()).strip()
@@ -379,7 +391,7 @@ class CentaurInvestigatorClient:
 
         if include_observability:
             result["observability"] = self._observability(
-                thread_keys=result.get("thread_keys") or [thread_key.strip()],
+                thread_keys=result.get("thread_keys") or [],
                 execution_ids=result.get("execution_ids") or [],
                 window_hours=window_hours,
                 logs_limit=logs_limit,
@@ -399,6 +411,277 @@ class CentaurInvestigatorClient:
             return asyncio.run(
                 self._session_state_async(
                     thread_key,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_LIMIT),
+                    include_observability=include_observability,
+                    window_hours=_clamp(window_hours, minimum=1, maximum=MAX_WINDOW_HOURS),
+                    logs_limit=_clamp(logs_limit, minimum=1, maximum=MAX_LOG_LIMIT),
+                )
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    async def _workflow_executions(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        run_ids: list[str],
+        task_ids: list[str],
+        limit: int,
+    ) -> dict[str, Any]:
+        return await self._safe_fetch(
+            conn,
+            "workflow_session_executions",
+            """
+            SELECT
+                execution_id,
+                thread_key,
+                status,
+                model,
+                workflow_name,
+                workflow_task_id,
+                workflow_run_id,
+                workflow_context_phase,
+                created_at,
+                started_at,
+                completed_at,
+                extract(epoch FROM completed_at - started_at) AS duration_seconds
+            FROM centaur_diagnostics.session_executions
+            WHERE workflow_run_id = ANY($1::text[])
+               OR workflow_task_id = ANY($2::text[])
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            run_ids,
+            task_ids,
+            limit,
+        )
+
+    async def _workflow_run_state_async(
+        self,
+        reference: str,
+        *,
+        limit: int,
+        include_observability: bool,
+        window_hours: int,
+        logs_limit: int,
+    ) -> dict[str, Any]:
+        identifier = reference.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
+            return {
+                "status": "error",
+                "error": "workflow reference must be a run_id or task_id",
+            }
+
+        conn = await self._connect()
+        try:
+            connection = await self._safe_fetchrow(
+                conn,
+                "connection_role",
+                """
+                SELECT
+                    session_user,
+                    current_user,
+                    current_setting('role', true) AS active_role
+                """,
+            )
+            workflow_runs = await self._safe_fetch(
+                conn,
+                "centaur_diagnostics_workflow_runs",
+                """
+                SELECT
+                    queue_name,
+                    run_id,
+                    task_id,
+                    task_name,
+                    workflow_name,
+                    harness_type,
+                    state,
+                    attempts,
+                    max_attempts,
+                    created_at,
+                    first_started_at,
+                    started_at,
+                    completed_at,
+                    failed_at,
+                    available_at,
+                    claimed,
+                    cancelled_at
+                FROM centaur_diagnostics.workflow_runs
+                WHERE run_id = $1 OR task_id = $1
+                ORDER BY created_at DESC NULLS LAST
+                LIMIT $2
+                """,
+                identifier,
+                limit,
+            )
+            view_run_ids = _dedupe(
+                [
+                    str(row.get("run_id"))
+                    for row in workflow_runs.get("rows", [])
+                    if row.get("run_id")
+                ]
+            )
+            candidate_run_ids = _dedupe([identifier, *view_run_ids])
+            candidate_task_ids = [identifier]
+            executions = await self._workflow_executions(
+                conn,
+                run_ids=candidate_run_ids,
+                task_ids=candidate_task_ids,
+                limit=limit,
+            )
+            correlated_task_ids = _dedupe(
+                [
+                    str(row.get("workflow_task_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("workflow_task_id")
+                ]
+            )
+            if not workflow_runs.get("rows") and correlated_task_ids:
+                workflow_runs = await self._safe_fetch(
+                    conn,
+                    "centaur_diagnostics_workflow_runs_by_task",
+                    """
+                    SELECT
+                        queue_name,
+                        run_id,
+                        task_id,
+                        task_name,
+                        workflow_name,
+                        harness_type,
+                        state,
+                        attempts,
+                        max_attempts,
+                        created_at,
+                        first_started_at,
+                        started_at,
+                        completed_at,
+                        failed_at,
+                        available_at,
+                        claimed,
+                        cancelled_at
+                    FROM centaur_diagnostics.workflow_runs
+                    WHERE task_id = ANY($1::text[])
+                    ORDER BY created_at DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    correlated_task_ids,
+                    limit,
+                )
+                recovered_run_ids = _dedupe(
+                    [
+                        str(row.get("run_id"))
+                        for row in workflow_runs.get("rows", [])
+                        if row.get("run_id")
+                    ]
+                )
+                expanded_run_ids = _dedupe([*candidate_run_ids, *recovered_run_ids])
+                expanded_task_ids = _dedupe([*candidate_task_ids, *correlated_task_ids])
+                if expanded_run_ids != candidate_run_ids or expanded_task_ids != candidate_task_ids:
+                    executions = await self._workflow_executions(
+                        conn,
+                        run_ids=expanded_run_ids,
+                        task_ids=expanded_task_ids,
+                        limit=limit,
+                    )
+            run_ids = _dedupe(
+                [
+                    str(row.get("run_id"))
+                    for row in workflow_runs.get("rows", [])
+                    if row.get("run_id")
+                ]
+                + [
+                    str(row.get("workflow_run_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("workflow_run_id")
+                ]
+            )
+            execution_ids = _dedupe(
+                [
+                    str(row.get("execution_id"))
+                    for row in executions.get("rows", [])
+                    if row.get("execution_id")
+                ]
+            )
+            events = await self._safe_fetch(
+                conn,
+                "workflow_session_events",
+                """
+                SELECT
+                    event_id,
+                    thread_key,
+                    execution_id,
+                    event_type,
+                    payload_type,
+                    payload_subtype,
+                    status,
+                    has_error,
+                    error_length,
+                    created_at
+                FROM centaur_diagnostics.session_events
+                WHERE execution_id = ANY($1::text[])
+                ORDER BY event_id DESC
+                LIMIT $2
+                """,
+                execution_ids,
+                limit * 4,
+            )
+        finally:
+            await conn.close()
+
+        thread_keys = _dedupe(
+            [
+                str(row.get("thread_key"))
+                for row in executions.get("rows", [])
+                if row.get("thread_key")
+            ]
+        )
+        result = {
+            "status": "ok",
+            "kind": "workflow_run",
+            "reference": identifier,
+            "workflow_run_ids": run_ids,
+            "thread_keys": thread_keys,
+            "execution_ids": execution_ids,
+            "analysis": self._summarize_workflow_run(
+                workflow_runs=workflow_runs,
+                executions=executions,
+                events=events,
+            ),
+            "postgres": {
+                "status": "ok",
+                "role": _connection_role(connection),
+                "connection": connection,
+                "workflow_runs": workflow_runs,
+                "session_executions": executions,
+                "session_events": events,
+            },
+            "privacy_note": (
+                "Workflow diagnostics include lifecycle metadata and bounded event shape only. "
+                "Raw prompts, reasoning, tool output, failure text, and secrets are not queried."
+            ),
+        }
+        if include_observability:
+            result["observability"] = self._observability(
+                thread_keys=thread_keys,
+                execution_ids=execution_ids,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+        return result
+
+    def workflow_run_state(
+        self,
+        reference: str,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Inspect a workflow run/task using sanitized read-only state."""
+        try:
+            return asyncio.run(
+                self._workflow_run_state_async(
+                    reference,
                     limit=_clamp(limit, minimum=1, maximum=MAX_LIMIT),
                     include_observability=include_observability,
                     window_hours=_clamp(window_hours, minimum=1, maximum=MAX_WINDOW_HOURS),
@@ -444,12 +727,12 @@ class CentaurInvestigatorClient:
                 harness_thread_id,
                 persona_id,
                 status,
-                metadata ->> 'source' AS source,
-                metadata ->> 'platform' AS platform,
-                metadata ->> 'thread_id' AS external_thread_id,
+                source,
+                platform,
+                external_thread_id,
                 created_at,
                 updated_at
-            FROM sessions
+            FROM centaur_diagnostics.sessions
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY updated_at DESC NULLS LAST, created_at DESC
@@ -459,10 +742,10 @@ class CentaurInvestigatorClient:
             thread_key_like,
             limit,
         )
-        matched_thread_keys = _dedupe(
+        visible_session_thread_keys = _dedupe(
             [str(row.get("thread_key")) for row in sessions["rows"] if row.get("thread_key")]
-            + candidates
         )
+        lookup_thread_keys = _dedupe([*visible_session_thread_keys, *candidates])
 
         executions = await self._safe_fetch(
             conn,
@@ -472,39 +755,84 @@ class CentaurInvestigatorClient:
                 execution_id,
                 thread_key,
                 status,
-                metadata ->> 'model' AS model,
-                metadata ->> 'harness_run_id' AS harness_run_id,
-                metadata ->> 'base_image_ref' AS base_image_ref,
-                metadata ->> 'base_image_hash' AS base_image_hash,
-                metadata ->> 'overlay_hash' AS overlay_hash,
-                metadata ->> 'source' AS source,
-                metadata ->> 'platform' AS platform,
-                metadata ->> 'action' AS action,
-                CASE
-                    WHEN metadata ->> 'idle_timeout_ms' ~ '^[0-9]+$'
-                    THEN (metadata ->> 'idle_timeout_ms')::bigint
-                END AS idle_timeout_ms,
-                CASE
-                    WHEN metadata ->> 'max_duration_ms' ~ '^[0-9]+$'
-                    THEN (metadata ->> 'max_duration_ms')::bigint
-                END AS max_duration_ms,
+                model,
+                harness_run_id,
+                base_image_ref,
+                base_image_hash,
+                overlay_hash,
+                source,
+                platform,
+                action,
+                workflow_name,
+                workflow_task_id,
+                workflow_run_id,
+                workflow_context_phase,
+                idle_timeout_ms,
+                max_duration_ms,
+                has_error,
+                error_length,
                 created_at,
                 updated_at,
                 started_at,
                 completed_at,
                 extract(epoch FROM completed_at - started_at) AS duration_seconds
-            FROM session_executions
+            FROM centaur_diagnostics.session_executions
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY created_at DESC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
         execution_ids = _dedupe(
             [str(row.get("execution_id")) for row in executions["rows"] if row.get("execution_id")]
+        )
+        visible_thread_keys = _dedupe(
+            visible_session_thread_keys
+            + [
+                str(row.get("thread_key"))
+                for row in executions["rows"]
+                if row.get("thread_key")
+            ]
+        )
+        workflow_run_ids = _dedupe(
+            [
+                str(row.get("workflow_run_id"))
+                for row in executions["rows"]
+                if row.get("workflow_run_id")
+            ]
+        )
+        workflow_runs = await self._safe_fetch(
+            conn,
+            "centaur_diagnostics_workflow_runs",
+            """
+            SELECT
+                queue_name,
+                run_id,
+                task_id,
+                task_name,
+                workflow_name,
+                harness_type,
+                state,
+                attempts,
+                max_attempts,
+                created_at,
+                first_started_at,
+                started_at,
+                completed_at,
+                failed_at,
+                available_at,
+                claimed,
+                cancelled_at
+            FROM centaur_diagnostics.workflow_runs
+            WHERE run_id = ANY($1::text[])
+            ORDER BY created_at DESC NULLS LAST
+            LIMIT $2
+            """,
+            workflow_run_ids,
+            limit,
         )
 
         messages = await self._safe_fetch(
@@ -515,35 +843,20 @@ class CentaurInvestigatorClient:
                 message_id,
                 thread_key,
                 role,
-                CASE
-                    WHEN jsonb_typeof(parts) = 'array' THEN jsonb_array_length(parts)
-                    ELSE 0
-                END AS part_count,
-                coalesce(
-                    (
-                        SELECT jsonb_agg(distinct coalesce(part_values.part ->> 'type', 'unknown'))
-                        FROM jsonb_array_elements(
-                            CASE
-                                WHEN jsonb_typeof(parts) = 'array' THEN parts
-                                ELSE '[]'::jsonb
-                            END
-                        ) AS part_values(part)
-                    ),
-                    '[]'::jsonb
-                ) AS part_types,
-                metadata ->> 'source' AS source,
-                metadata ->> 'platform' AS platform,
-                metadata ->> 'action' AS action,
-                metadata ->> 'user_id' AS user_id,
-                metadata ->> 'user_name' AS user_name,
+                part_count,
+                part_types,
+                source,
+                platform,
+                action,
+                user_id,
                 created_at
-            FROM session_messages
+            FROM centaur_diagnostics.session_messages
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY created_at ASC, message_id ASC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -556,31 +869,22 @@ class CentaurInvestigatorClient:
                 thread_key,
                 execution_id,
                 event_type,
-                payload ->> 'type' AS payload_type,
-                payload ->> 'subtype' AS payload_subtype,
-                payload ->> 'status' AS status,
-                payload ->> 'terminal_reason' AS terminal_reason,
-                payload ->> 'turn_id' AS turn_id,
-                payload ? 'error' AS has_error,
-                CASE
-                    WHEN payload ? 'error' THEN octet_length(payload ->> 'error')
-                END AS error_length,
-                coalesce(
-                    (
-                        SELECT jsonb_agg(payload_keys.key)
-                        FROM jsonb_object_keys(payload) AS payload_keys(key)
-                    ),
-                    '[]'::jsonb
-                ) AS payload_keys,
+                payload_type,
+                payload_subtype,
+                status,
+                turn_id,
+                has_error,
+                error_length,
+                payload_keys,
                 created_at
-            FROM session_events
+            FROM centaur_diagnostics.session_events
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
                OR (execution_id = ANY($3::text[]))
-            ORDER BY event_id ASC
+            ORDER BY event_id DESC
             LIMIT $4
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             execution_ids,
             limit * 4,
@@ -596,19 +900,18 @@ class CentaurInvestigatorClient:
                 harness,
                 engine,
                 persona_id,
-                prompt_ref,
                 effective_agents_md_sha256,
                 state,
                 created_at,
                 updated_at,
                 released_at
-            FROM agent_runtime_assignments
+            FROM centaur_diagnostics.agent_runtime_assignments
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -632,16 +935,15 @@ class CentaurInvestigatorClient:
                 stream_break_count,
                 last_stream_break_at,
                 completed_at,
-                terminal_reason,
-                worker_id IS NOT NULL AS claimed,
+                claimed,
                 updated_at
-            FROM agent_execution_requests
+            FROM centaur_diagnostics.agent_execution_requests
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY created_at DESC
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -666,13 +968,13 @@ class CentaurInvestigatorClient:
                 updated_at,
                 wire_connected_at,
                 wire_last_seen_at
-            FROM sandbox_sessions
+            FROM centaur_diagnostics.sandbox_sessions
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -686,13 +988,13 @@ class CentaurInvestigatorClient:
                 root_span_id,
                 created_at,
                 updated_at
-            FROM thread_traces
+            FROM centaur_diagnostics.thread_traces
             WHERE thread_key = ANY($1::text[])
                OR ($2::text IS NOT NULL AND thread_key LIKE $2)
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $3
             """,
-            matched_thread_keys,
+            lookup_thread_keys,
             thread_key_like,
             limit,
         )
@@ -710,12 +1012,12 @@ class CentaurInvestigatorClient:
                     harness_thread_id,
                     persona_id,
                     status,
-                    metadata ->> 'source' AS source,
-                    metadata ->> 'platform' AS platform,
-                    metadata ->> 'thread_id' AS external_thread_id,
+                    source,
+                    platform,
+                    external_thread_id,
                     created_at,
                     updated_at
-                FROM sessions
+                FROM centaur_diagnostics.sessions
                 WHERE thread_key LIKE $1
                   AND created_at BETWEEN
                       ($2::timestamptz - ($3::int * interval '1 hour'))
@@ -744,7 +1046,7 @@ class CentaurInvestigatorClient:
                     first_seen_at,
                     last_seen_at,
                     updated_at
-                FROM slack_sync_channels
+                FROM centaur_diagnostics.slack_sync_channels
                 WHERE channel_id = $1
                 """,
                 channel_id,
@@ -758,10 +1060,10 @@ class CentaurInvestigatorClient:
                     watermark_ts,
                     last_run_id,
                     last_success_at,
-                    last_error <> '' AS has_error,
+                    has_error,
                     created_at,
                     updated_at
-                FROM slack_sync_checkpoints
+                FROM centaur_diagnostics.slack_sync_checkpoints
                 WHERE channel_id = $1
                 """,
                 channel_id,
@@ -778,10 +1080,9 @@ class CentaurInvestigatorClient:
                     parent_message_ts,
                     is_thread_root,
                     user_id,
-                    bot_id <> '' AS has_bot_id,
+                    has_bot_id,
                     message_type,
                     message_subtype,
-                    permalink,
                     reply_count,
                     latest_reply_ts,
                     thread_refreshed_at,
@@ -789,7 +1090,7 @@ class CentaurInvestigatorClient:
                     first_seen_at,
                     last_seen_at,
                     updated_at
-                FROM slack_sync_messages
+                FROM centaur_diagnostics.slack_sync_messages
                 WHERE channel_id = $1
                   AND (
                       $2::text IS NULL
@@ -815,20 +1116,17 @@ class CentaurInvestigatorClient:
                     channel_id,
                     message_ts,
                     slack_file_id,
-                    name,
-                    title,
                     mimetype,
                     filetype,
                     size_bytes,
-                    permalink,
                     download_status,
-                    download_error <> '' AS has_download_error,
-                    content_sha256 IS NOT NULL AS has_content_hash,
+                    has_download_error,
+                    has_content_hash,
                     source_run_id,
                     first_seen_at,
                     last_seen_at,
                     updated_at
-                FROM slack_sync_message_attachments
+                FROM centaur_diagnostics.slack_sync_message_attachments
                 WHERE channel_id = $1
                   AND message_ts = ANY($2::text[])
                 ORDER BY updated_at DESC, slack_file_id ASC
@@ -844,10 +1142,9 @@ class CentaurInvestigatorClient:
                 """
                 SELECT
                     job_id,
-                    job_key,
                     job_type,
                     channel_id,
-                    payload_json ->> 'thread_ts' AS thread_ts,
+                    thread_ts,
                     status,
                     priority,
                     attempt_count,
@@ -855,12 +1152,12 @@ class CentaurInvestigatorClient:
                     last_enqueued_at,
                     last_started_at,
                     last_completed_at,
-                    last_error <> '' AS has_error,
+                    has_error,
                     created_at,
                     updated_at
-                FROM slack_sync_backfill_jobs
+                FROM centaur_diagnostics.slack_sync_backfill_jobs
                 WHERE channel_id = $1
-                  AND ($2::text IS NULL OR payload_json ->> 'thread_ts' = $2)
+                  AND ($2::text IS NULL OR thread_ts = $2)
                 ORDER BY updated_at DESC
                 LIMIT $3
                 """,
@@ -888,9 +1185,9 @@ class CentaurInvestigatorClient:
                     replies_upserted,
                     started_at,
                     finished_at,
-                    error_text <> '' AS has_error,
-                    metadata ->> 'source' AS source
-                FROM slack_sync_runs
+                    has_error,
+                    source
+                FROM centaur_diagnostics.slack_sync_runs
                 WHERE channels_requested ? $1
                    OR channels_synced ? $1
                    OR channels_failed ? $1
@@ -905,7 +1202,11 @@ class CentaurInvestigatorClient:
         result = {
             "status": "ok",
             "parsed": parsed,
-            "thread_keys": matched_thread_keys,
+            # Only database-authorized rows may seed observability queries. Do
+            # not echo a caller-supplied candidate here when the scoped views
+            # rejected it, or an explicit foreign thread key could bypass the
+            # Postgres boundary through aggregate log queries.
+            "thread_keys": visible_thread_keys,
             "execution_ids": execution_ids,
             "analysis": self._summarize(
                 parsed=parsed,
@@ -913,6 +1214,7 @@ class CentaurInvestigatorClient:
                 executions=executions,
                 messages=messages,
                 events=events,
+                workflow_runs=workflow_runs,
                 legacy_runtime=legacy_runtime,
                 legacy_executions=legacy_executions,
                 sandbox_sessions=sandbox_sessions,
@@ -927,6 +1229,7 @@ class CentaurInvestigatorClient:
                 "session_executions": executions,
                 "session_messages": messages,
                 "session_events": events,
+                "workflow_runs": workflow_runs,
                 "legacy_agent_runtime_assignments": legacy_runtime,
                 "legacy_agent_execution_requests": legacy_executions,
                 "legacy_sandbox_sessions": sandbox_sessions,
@@ -937,6 +1240,122 @@ class CentaurInvestigatorClient:
         return result
 
     @staticmethod
+    def _summarize_workflow_run(
+        *,
+        workflow_runs: dict[str, Any],
+        executions: dict[str, Any],
+        events: dict[str, Any],
+    ) -> dict[str, Any]:
+        rows = workflow_runs.get("rows", [])
+        findings: list[str] = []
+        warnings: list[str] = []
+        next_checks: list[str] = []
+
+        if not rows:
+            execution_rows = executions.get("rows", [])
+            if execution_rows:
+                execution_states = sorted(
+                    {str(row.get("status")) for row in execution_rows if row.get("status")}
+                )
+                return {
+                    "outcome": str(execution_rows[0].get("status") or "observed").lower(),
+                    "summary": (
+                        "The current workflow queue view has no matching row, but found "
+                        f"{len(execution_rows)} correlated agent execution(s): "
+                        f"{', '.join(execution_states) or 'unknown status'}."
+                    ),
+                    "findings": [],
+                    "warnings": [
+                        "The referenced workflow attempt is no longer the task's latest queue row."
+                    ],
+                    "next_checks": [
+                        "Use the correlated task ID to inspect the latest retry state."
+                    ],
+                    "primary_source": "postgres_diagnostics_execution_metadata",
+                }
+            return {
+                "outcome": "not_found",
+                "summary": "No workflow run or task matched the supplied reference.",
+                "findings": [],
+                "warnings": ["The read-only workflow view returned no matching row."],
+                "next_checks": ["Verify the workflow run_id or task_id and retry."],
+                "primary_source": "postgres_diagnostics_workflow_view",
+            }
+
+        latest = rows[0]
+        state = str(latest.get("state") or "unknown").lower()
+        queued_states = {"pending", "queued", "ready", "scheduled", "sleeping", "retrying"}
+        if latest.get("cancelled_at") or state == "cancelled":
+            outcome = "cancelled"
+        elif state in queued_states:
+            outcome = "queued"
+        elif state in {"running", "claimed"}:
+            outcome = "running"
+        elif state == "completed" or latest.get("completed_at"):
+            outcome = "completed"
+        elif state == "failed" or latest.get("failed_at"):
+            outcome = "failed"
+        elif latest.get("claimed") or latest.get("started_at"):
+            outcome = "running"
+        else:
+            outcome = state
+
+        findings.append(
+            "Workflow "
+            f"{latest.get('workflow_name') or latest.get('task_name') or 'unknown'} "
+            f"is {outcome} in {latest.get('queue_name') or 'an unknown queue'}."
+        )
+        findings.append(
+            f"Run {latest.get('run_id') or 'not assigned'} / task {latest.get('task_id')} "
+            f"has attempted {latest.get('attempts') or 0} of {latest.get('max_attempts') or 0} times."
+        )
+
+        execution_rows = executions.get("rows", [])
+        if execution_rows:
+            execution_states = sorted(
+                {str(row.get("status")) for row in execution_rows if row.get("status")}
+            )
+            findings.append(
+                f"Found {len(execution_rows)} correlated agent execution(s): "
+                f"{', '.join(execution_states) or 'unknown status'}."
+            )
+
+        event_rows = events.get("rows", [])
+        event_errors = [row for row in event_rows if row.get("has_error")]
+        if event_rows:
+            findings.append(f"Found {len(event_rows)} sanitized correlated event(s).")
+        if event_errors:
+            warnings.append(f"{len(event_errors)} correlated event(s) carry an error field.")
+
+        if outcome == "failed":
+            warnings.append("The workflow reached a failed terminal state.")
+            next_checks.append(
+                "Use the correlated execution IDs and event types in Console or approved logs; "
+                "raw failure text is intentionally excluded from this tool."
+            )
+        elif outcome == "queued":
+            next_checks.append(
+                "Check whether the queue has an available worker and whether sandbox capacity is full."
+            )
+        elif outcome == "running":
+            next_checks.append(
+                "Compare last activity with the workflow deadline before treating the run as stalled."
+            )
+        elif outcome == "cancelled":
+            next_checks.append(
+                "Confirm the cancellation was expected before retrying the workflow."
+            )
+
+        return {
+            "outcome": outcome,
+            "summary": " ".join(findings),
+            "findings": findings,
+            "warnings": warnings,
+            "next_checks": next_checks,
+            "primary_source": "postgres_diagnostics_workflow_view",
+        }
+
+    @staticmethod
     def _summarize(
         *,
         parsed: dict[str, Any],
@@ -944,6 +1363,7 @@ class CentaurInvestigatorClient:
         executions: dict[str, Any],
         messages: dict[str, Any],
         events: dict[str, Any],
+        workflow_runs: dict[str, Any],
         legacy_runtime: dict[str, Any],
         legacy_executions: dict[str, Any],
         sandbox_sessions: dict[str, Any],
@@ -987,6 +1407,22 @@ class CentaurInvestigatorClient:
             findings.append(f"Found {len(events['rows'])} sanitized session event row(s).")
         if event_errors:
             warnings.append(f"{len(event_errors)} session event row(s) indicate an error payload.")
+
+        if workflow_runs.get("rows"):
+            states = sorted(
+                {str(row.get("state")) for row in workflow_runs["rows"] if row.get("state")}
+            )
+            findings.append(
+                f"Found {len(workflow_runs['rows'])} related workflow run row(s): "
+                f"{', '.join(states) or 'unknown state'}."
+            )
+            failed_workflows = [
+                row
+                for row in workflow_runs["rows"]
+                if row.get("failed_at") or str(row.get("state") or "").lower() == "failed"
+            ]
+            if failed_workflows:
+                warnings.append(f"{len(failed_workflows)} related workflow run(s) failed.")
 
         if messages.get("rows"):
             roles = sorted({str(row.get("role")) for row in messages["rows"] if row.get("role")})
@@ -1044,7 +1480,7 @@ class CentaurInvestigatorClient:
             ),
             "findings": findings,
             "warnings": warnings,
-            "primary_source": "postgres_readonly_tables",
+            "primary_source": "postgres_diagnostics_views",
         }
 
     async def _investigate_slack_thread_async(
@@ -1068,7 +1504,7 @@ class CentaurInvestigatorClient:
 
         if include_observability:
             result["observability"] = self._observability(
-                thread_keys=result.get("thread_keys") or parsed.get("thread_key_candidates") or [],
+                thread_keys=result.get("thread_keys") or [],
                 execution_ids=result.get("execution_ids") or [],
                 window_hours=window_hours,
                 logs_limit=logs_limit,
@@ -1129,6 +1565,59 @@ class CentaurInvestigatorClient:
             "error": "query must contain a Slack permalink or Centaur thread_key",
         }
 
+    def diagnose(
+        self,
+        reference: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Diagnose the current session, a thread key, or a workflow run/task.
+
+        When ``reference`` is omitted (or is ``current``/``this``), the tool
+        uses the session-scoped ``CENTAUR_THREAD_KEY`` injected by Centaur.
+        Results contain only sanitized lifecycle metadata and bounded aggregate
+        observability; raw prompts, reasoning, tool output, and secrets are not
+        queried.
+        """
+        value = (reference or "").strip()
+        if value.lower() in {"", "current", "this", "this workflow", "current workflow"}:
+            value = _current_thread_key()
+            if not value:
+                return {
+                    "status": "error",
+                    "error": (
+                        "no reference was supplied and CENTAUR_THREAD_KEY is unavailable; "
+                        "provide a thread_key, workflow run_id, or task_id"
+                    ),
+                }
+
+        thread_key = _NAMESPACED_THREAD_KEY_RE.search(value)
+        if thread_key:
+            return self.session_state(
+                thread_key.group(0),
+                limit=limit,
+                include_observability=include_observability,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+
+        workflow_reference = _WORKFLOW_RUN_ID_RE.search(value)
+        if workflow_reference:
+            return self.workflow_run_state(
+                workflow_reference.group(0),
+                limit=limit,
+                include_observability=include_observability,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+
+        return {
+            "status": "error",
+            "error": "reference must contain a Centaur thread_key or workflow run_id/task_id",
+        }
+
     async def _search_sessions_async(
         self,
         *,
@@ -1148,12 +1637,12 @@ class CentaurInvestigatorClient:
                     harness_thread_id,
                     persona_id,
                     status,
-                    metadata ->> 'source' AS source,
-                    metadata ->> 'platform' AS platform,
-                    metadata ->> 'thread_id' AS external_thread_id,
+                    source,
+                    platform,
+                    external_thread_id,
                     created_at,
                     updated_at
-                FROM sessions
+                FROM centaur_diagnostics.sessions
                 WHERE ($1::text = '' OR thread_key ILIKE '%' || $1 || '%')
                   AND ($2::text = '' OR thread_key LIKE '%:' || $2 || ':%')
                   AND ($3::text = '' OR status = $3)
@@ -1211,6 +1700,12 @@ class CentaurInvestigatorClient:
             "vlogs": {"status": "skipped"},
             "vmetrics": {"status": "skipped"},
         }
+
+        # The diagnostic role is intentionally unable to see sessions outside
+        # its proxy-pinned thread. Avoid turning an unauthorized caller-supplied
+        # reference into a secondary query against the observability stores.
+        if not thread_keys and not execution_ids:
+            return result
 
         infra_dir = Path(__file__).resolve().parent.parent
         vlogs_module = _safe_load_module(
