@@ -157,12 +157,15 @@ class WorkflowHostTests(unittest.TestCase):
         load_workflow_host()
 
         from api.runtime_control import ControlPlaneError, canonical_json, decode_jsonb
+        from api.model_ensemble import EnsemblePolicy, ModelTarget
         from api.workflow_engine import Delivery, WorkflowContext
 
         self.assertEqual(canonical_json({"b": 1, "a": 2}), '{"a":2,"b":1}')
         self.assertEqual(decode_jsonb('{"ok": true}', {}), {"ok": True})
         self.assertEqual(Delivery().metadata, {})
         self.assertTrue(WorkflowContext)
+        self.assertEqual(ModelTarget("model-a", "gateway").harness, "codex")
+        self.assertEqual(EnsemblePolicy().max_concurrency, 4)
 
         error = ControlPlaneError("INVALID", "bad input", 422)
         self.assertEqual(error.to_dict()["status_code"], 422)

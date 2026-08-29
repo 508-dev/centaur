@@ -6,6 +6,12 @@ import inspect
 from typing import Any
 
 from api.app import WorkflowToolManager, WorkflowTools, bind_context_rpc, reset_context_rpc
+from api.model_ensemble import (
+    EnsembleMember,
+    EnsemblePolicy,
+    SynthesisSpec,
+    run_model_ensemble,
+)
 
 
 @dataclasses.dataclass
@@ -161,6 +167,31 @@ class WorkflowContext:
         if max_concurrency is not None:
             request["max_concurrency"] = max_concurrency
         return await self._rpc.request(request)
+
+    async def run_model_ensemble(
+        self,
+        ensemble_name: str,
+        prompt: str,
+        members: list[EnsembleMember],
+        synthesis: SynthesisSpec,
+        *,
+        principal: str,
+        replay_safe: bool,
+        policy: EnsemblePolicy | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run bounded independent reviews and a validated synthesis."""
+        return await run_model_ensemble(
+            self,
+            ensemble_name,
+            prompt,
+            members,
+            synthesis,
+            principal=principal,
+            replay_safe=replay_safe,
+            policy=policy,
+            metadata=metadata,
+        )
 
     async def start_workflow(
         self,
