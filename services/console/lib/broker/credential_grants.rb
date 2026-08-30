@@ -5,15 +5,19 @@ module Broker
   module CredentialGrants
     PREQIN_TOKEN_ENDPOINT = "https://api.preqin.com/connect/token".freeze
     PREQIN_REFRESH_TOKEN_ENDPOINT = "https://api.preqin.com/connect/refresh_token".freeze
+    GITHUB_API_ENDPOINT = "https://api.github.com".freeze
 
-    GRANTS = %w[refresh_token client_credentials password preqin].freeze
-    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[client_credentials password preqin].freeze
+    GRANTS = %w[refresh_token client_credentials password preqin github_app_installation].freeze
+    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[client_credentials password preqin github_app_installation].freeze
 
     Outcome = Data.define(:result, :clear_refresh_token, :dead_reason)
 
     class << self
       def default_token_endpoint(grant)
-        PREQIN_TOKEN_ENDPOINT if grant == "preqin"
+        case grant
+        when "preqin" then PREQIN_TOKEN_ENDPOINT
+        when "github_app_installation" then GITHUB_API_ENDPOINT
+        end
       end
 
       def client_id_required?(credential)
@@ -28,6 +32,8 @@ module Broker
           validate_password(credential)
         when "preqin"
           validate_preqin(credential)
+        when "github_app_installation"
+          validate_github_app_installation(credential)
         end
       end
 
@@ -39,6 +45,8 @@ module Broker
           refresh_password(credential)
         when "preqin"
           refresh_preqin(credential)
+        when "github_app_installation"
+          refresh_github_app_installation(credential)
         else
           refresh_token(credential)
         end
@@ -127,6 +135,15 @@ module Broker
           strict_4xx: true
         )
         success(result, clear_refresh_token: clear_stale_refresh_token && result.refresh_token.blank?)
+      end
+
+      def refresh_github_app_installation(credential)
+        result = credential.github_app_installation_client.refresh(
+          client_id: credential.effective_client_id,
+          installation_id: credential.github_installation_id,
+          timeout: credential.refresh_timeout_seconds
+        )
+        success(result)
       end
 
       def oauth_refresh_token(credential)
@@ -228,6 +245,12 @@ module Broker
       def validate_preqin(credential)
         credential.errors.add(:username, "can't be blank for the Preqin broker grant") if credential.username.blank?
         credential.errors.add(:api_key, "can't be blank for the Preqin broker grant") if credential.api_key.blank?
+      end
+
+      def validate_github_app_installation(credential)
+        unless credential.github_installation_id.to_s.match?(/\A[1-9]\d*\z/)
+          credential.errors.add(:github_installation_id, "must be a positive GitHub App installation ID")
+        end
       end
 
       def password_values_present?(credential)

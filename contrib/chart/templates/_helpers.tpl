@@ -156,6 +156,21 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- end -}}
 
 {{- /*
+The GitHub App PEM is intentionally a separate secret rather than a key in the
+shared infra env Secret: it is mounted read-only into only the Console worker,
+not translated to an environment variable or exposed to Console web pods.
+*/ -}}
+{{- define "centaur.githubAppInstallationChecksum" -}}
+{{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- if $console.githubAppInstallation.enabled -}}
+{{- $name := required "console.githubAppInstallation.existingSecretName is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.existingSecretName -}}
+{{- include "centaur.secretResourceVersion" (dict "root" . "name" $name) | quote -}}
+{{- else -}}
+{{- "disabled" | quote -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 The upstream 1Password Connect subchart names its Service after
 `connect.applicationName` (default `onepassword-connect`) and exposes the
 API on `connect.api.httpPort` (default 8080). The Service is in the same

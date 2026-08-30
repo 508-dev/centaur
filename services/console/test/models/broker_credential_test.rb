@@ -100,6 +100,32 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert bc.errors[:api_key].any? { |m| m.include?("Preqin broker grant") }
   end
 
+  test "GitHub App installation grant requires an installation ID and uses GitHub's fixed endpoint" do
+    bc = build_credential(
+      grant: "github_app_installation",
+      client_id: "Iv1.0123456789abcdef",
+      github_installation_id: nil,
+      refresh_token: nil,
+      token_endpoint: "https://untrusted.example/token"
+    )
+
+    refute bc.valid?
+    assert bc.errors[:github_installation_id].any?
+    assert_equal BrokerCredential::GITHUB_API_ENDPOINT, bc.token_endpoint
+
+    bc.github_installation_id = "12345678"
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+
+    bc.client_id = "123456"
+    refute bc.valid?
+    assert bc.errors[:client_id].any? { |message| message.include?("GitHub App Client ID") }
+
+    # GitHub's Client ID format can evolve; reject the numeric App ID, but do
+    # not reject a valid newer Client ID merely because it is not `Iv1.…`.
+    bc.client_id = "Ov23li0abcDEF1234567"
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+  end
+
   # --- oauth_app provenance (flow-minted credentials) -----------------------
 
   def build_app(**overrides)
@@ -364,6 +390,32 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     refute bc.dead?
   end
 
+  test "GitHub App installation grant mints a token without a refresh token" do
+    now = Time.current
+    client = Minitest::Mock.new
+    client.expect(:refresh, result(access_token: "ghs-token", refresh_token: nil, expires_in: 3600)) do |**request|
+      assert_equal "Iv1.0123456789abcdef", request[:client_id]
+      assert_equal "12345678", request[:installation_id]
+      assert_equal 30, request[:timeout]
+      true
+    end
+    bc = create_credential(
+      grant: "github_app_installation",
+      client_id: "Iv1.0123456789abcdef",
+      github_installation_id: "12345678",
+      refresh_token: nil
+    )
+    bc.github_app_installation_client = client
+
+    bc.refresh!(now: now)
+
+    client.verify
+    bc.reload
+    assert_equal "ghs-token", bc.access_token
+    assert_nil bc.refresh_token
+    assert_in_delta (now + 3600).to_f, bc.expires_at.to_f, 1
+  end
+
   test "password grant prefers a stored refresh_token" do
     client = Minitest::Mock.new
     expect_refresh(client, returns: result(access_token: "AT", refresh_token: nil)) do |request|
@@ -560,6 +612,18 @@ class BrokerCredentialTest < ActiveSupport::TestCase
   test "refreshable includes client_credentials without a refresh_token after a prior refresh" do
     bc = create_credential(grant: "client_credentials", refresh_token: nil,
                            client_id: "cid", client_secret: "sec")
+    bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
+
+    assert_includes BrokerCredential.refreshable.pluck(:id), bc.id
+  end
+
+  test "refreshable includes GitHub App installation credentials without a refresh token" do
+    bc = create_credential(
+      grant: "github_app_installation",
+      client_id: "Iv1.0123456789abcdef",
+      github_installation_id: "12345678",
+      refresh_token: nil
+    )
     bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
 
     assert_includes BrokerCredential.refreshable.pluck(:id), bc.id

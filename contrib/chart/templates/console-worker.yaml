@@ -31,6 +31,7 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+        checksum/github-app-private-key: {{ include "centaur.githubAppInstallationChecksum" . }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console-worker") | nindent 8 }}
     spec:
@@ -164,6 +165,10 @@ spec:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sIRON_CONTROL_GOOGLE_CLIENT_SECRET" $prefix }}
 {{- end }}
+{{- if $console.githubAppInstallation.enabled }}
+            - name: CENTAUR_GITHUB_APP_PRIVATE_KEY_PATH
+              value: {{ printf "%s/%s" (required "console.githubAppInstallation.privateKeyMountPath is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.privateKeyMountPath) (required "console.githubAppInstallation.privateKeySecretKey is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.privateKeySecretKey) | quote }}
+{{- end }}
             - name: RAILS_ENV
               value: {{ $console.railsEnv | quote }}
 {{- with $console.slackDmSync.oauthAppSlug }}
@@ -182,6 +187,12 @@ spec:
             - name: CENTAUR_CONSOLE_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
 {{- end }}
+{{- if $console.githubAppInstallation.enabled }}
+          volumeMounts:
+            - name: github-app-private-key
+              mountPath: {{ required "console.githubAppInstallation.privateKeyMountPath is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.privateKeyMountPath | quote }}
+              readOnly: true
+{{- end }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
             # No readOnlyRootFilesystem — Rails writes to tmp/ at runtime.
@@ -189,6 +200,15 @@ spec:
               type: RuntimeDefault
           resources:
 {{ toYaml $console.worker.resources | nindent 12 }}
+{{- if $console.githubAppInstallation.enabled }}
+      volumes:
+        - name: github-app-private-key
+          secret:
+            secretName: {{ required "console.githubAppInstallation.existingSecretName is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.existingSecretName | quote }}
+            items:
+              - key: {{ required "console.githubAppInstallation.privateKeySecretKey is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.privateKeySecretKey | quote }}
+                path: {{ required "console.githubAppInstallation.privateKeySecretKey is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.privateKeySecretKey | quote }}
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

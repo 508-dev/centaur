@@ -40,6 +40,12 @@
           <p class="form-hint">Not secret. Not used for Preqin.</p>
         </div>
         <div>
+          <label class="form-label" for="credential_github_installation_id">GitHub installation ID<%= " *" if selected_grant == "github_app_installation" %></label>
+          <%= text_field_tag "credential[github_installation_id]", credential.github_installation_id, id: "credential_github_installation_id", class: "form-input #{field_error_class(credential, :github_installation_id)}", inputmode: "numeric", placeholder: "12345678" %>
+          <%= field_error(credential, :github_installation_id) %>
+          <p class="form-hint">Used only for the GitHub App installation grant. This is the numeric installation ID, not an App ID.</p>
+        </div>
+        <div>
           <label class="form-label" for="credential_client_secret">Client secret</label>
           <%= password_field_tag "credential[client_secret]", nil, id: "credential_client_secret", class: "form-input", autocomplete: "off", placeholder: credential.new_record? ? nil : "•••••••• (unchanged)" %>
           <p class="form-hint">Stored encrypted. Not used for Preqin.<%= " Leave blank to keep the current secret." unless credential.new_record? %></p>
@@ -100,6 +106,10 @@
 
       <div data-toggle-target="panel" data-toggle-key="client_credentials">
         <p class="form-hint">Uses the client ID and client secret above to mint each access token. No refresh token is required.</p>
+      </div>
+
+      <div data-toggle-target="panel" data-toggle-key="github_app_installation">
+        <p class="form-hint">Uses the GitHub App Client ID and installation ID above. The Console worker signs a short-lived App JWT with its read-only private-key mount, then exchanges it for an installation token. The private key is never entered or stored in this form.</p>
       </div>
 
       <div data-toggle-target="panel" data-toggle-key="refresh_token">

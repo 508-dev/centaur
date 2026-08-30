@@ -789,11 +789,11 @@ Returns `201`. Response shape (note that `credentials` echoes each source as `{ 
 
 ## Broker credentials
 
-A broker credential is an OAuth credential whose token lifecycle iron-control manages itself. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
+A broker credential is a managed token credential whose lifecycle iron-control owns. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
 
 Unlike the secret types above, a broker credential is not granted directly and is not injected on its own. It is referenced by a `token_broker` source on a grantable secret (typically a [static secret](#static-secrets)), which carries the rules and injection config. Refresh tokens, usernames, passwords, and API keys never leave iron-control.
 
-The token credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, and the `token_endpoint_headers` values are encrypted at rest and never returned.
+The token credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, and the `token_endpoint_headers` values are encrypted at rest and never returned. A GitHub App private key is not a credential field: the Console worker reads it from its deployment's read-only secret mount, signs an App JWT, and exchanges that for a short-lived installation token.
 
 ### Attributes
 
@@ -802,10 +802,11 @@ The token credentials it refreshes with are fields on the credential, resolved b
 | `foreign_id`                   | optional    | Globally unique. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `grant`                        | optional    | One of `refresh_token`, `client_credentials`, `password`, or `preqin`. Defaults to `refresh_token`. |
-| `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin`, which uses the fixed `https://api.preqin.com/connect/token` endpoint. |
+| `grant`                        | optional    | One of `refresh_token`, `client_credentials`, `password`, `preqin`, or `github_app_installation`. Defaults to `refresh_token`. |
+| `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin` and `github_app_installation`, which use fixed provider endpoints. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token`, `client_credentials`, and `password` credentials. Returned in responses. Not used for `preqin`. |
+| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token`, `client_credentials`, `password`, and `github_app_installation` credentials. For GitHub, use the GitHub App **Client ID** as the JWT issuer (not its numeric App ID). Returned in responses. Not used for `preqin`. |
+| `github_installation_id`       | conditional | Positive numeric GitHub App installation ID. Required only for `github_app_installation`; returned in responses. |
 | `client_secret`                | conditional | OAuth client secret. Required for `client_credentials`, optional for `refresh_token` and `password`, and not used for `preqin`. Write-only and encrypted at rest; omit for public clients. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
 | `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` credentials when the provider returns one. Not used by `client_credentials` credentials. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
@@ -839,6 +840,8 @@ The minted `access_token`, the `refresh_token`, `username`, `password`, `api_key
 Password-grant credentials first use the stored initial values with `grant_type=password`. If the token endpoint returns a `refresh_token`, iron-control stores it and uses `grant_type=refresh_token` on later scheduled refreshes. If that stored refresh token is rejected with an unrecoverable OAuth error, iron-control retries once with `grant_type=password`; retryable network, 5xx, rate-limit, and parse failures keep the existing backoff behavior and do not fall back to password.
 
 Client-credentials credentials use the stored `client_id` and encrypted `client_secret` with `grant_type=client_credentials` every time they mint an access token. Providers that return only `access_token`, `token_type`, and `expires_in` are supported; no `refresh_token` is required or stored.
+
+GitHub App installation credentials use the GitHub App Client ID plus a numeric installation ID. The Console worker signs an RS256 App JWT from `CENTAUR_GITHUB_APP_PRIVATE_KEY_PATH` and posts it only to GitHub's fixed `https://api.github.com/app/installations/:installation_id/access_tokens` endpoint. GitHub returns an installation token valid for about one hour; the broker refreshes it before expiry. The PEM, App JWT, and installation token never appear in Console/API responses or a sandbox.
 
 Credentials minted by the [OAuth consent flow](#oauth-consent-flow) are linked to an OAuth app and delegate their `client_id` and `client_secret` to it: rotating the app's secret applies to every credential it minted. Such a credential needs no `client_id`/`client_secret` of its own, and its `scopes` reflect exactly what the IdP granted.
 
@@ -922,6 +925,20 @@ Client-credentials providers use the same endpoint with `grant: "client_credenti
     "token_endpoint": "https://bsso.blpprofessional.com/ext/api/as/token.oauth2",
     "client_id": "client-id",
     "client_secret": "client-secret"
+  }
+}
+```
+
+GitHub App installation tokens use `grant: "github_app_installation"`. The deployment, not this request, provides the read-only private-key mount:
+
+```json
+{
+  "data": {
+    "foreign_id": "github-app-installation",
+    "name": "GitHub App installation",
+    "grant": "github_app_installation",
+    "client_id": "YOUR_GITHUB_APP_CLIENT_ID",
+    "github_installation_id": "12345678"
   }
 }
 ```

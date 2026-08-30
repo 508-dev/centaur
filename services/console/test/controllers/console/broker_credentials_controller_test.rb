@@ -128,6 +128,25 @@ module Console
       assert_equal "preqin-api-key", cred.api_key
     end
 
+    test "POST create builds a GitHub App installation credential" do
+      assert_difference -> { BrokerCredential.count } => 1 do
+        post console_broker_credentials_url, params: {
+          credential: {
+            foreign_id: "github-app-installation", name: "GitHub App installation",
+            grant: "github_app_installation", token_endpoint: "https://untrusted.example/token",
+            client_id: "Iv1.0123456789abcdef", github_installation_id: "12345678"
+          }
+        }
+      end
+
+      cred = BrokerCredential.find_by!(foreign_id: "github-app-installation")
+      assert_redirected_to console_credential_path(cred.oid)
+      assert_equal "github_app_installation", cred.grant
+      assert_equal BrokerCredential::GITHUB_API_ENDPOINT, cred.token_endpoint
+      assert_equal "12345678", cred.github_installation_id
+      assert_nil cred.refresh_token
+    end
+
     test "POST create without a token endpoint or client id is rejected without writing" do
       assert_no_difference "BrokerCredential.count" do
         post console_broker_credentials_url, params: {
@@ -159,6 +178,99 @@ module Console
       assert_equal "new-cid", cred.client_id
       assert_equal [ "only.scope" ], cred.scopes
       assert_equal({ "X-Tenant" => "acme" }, cred.token_endpoint_headers)
+    end
+
+    test "PATCH GitHub App update locks and discards a concurrently minted token" do
+      cred = BrokerCredential.create!(
+        foreign_id: "github-app-console-rotate",
+        grant: "github_app_installation",
+        client_id: "Iv1.0123456789abcdef",
+        github_installation_id: "12345678",
+        created_by: @operator
+      )
+      stale = BrokerCredential.find(cred.id)
+      BrokerCredential.find(cred.id).update!(
+        access_token: "ghs-concurrently-minted-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current
+      )
+
+      BrokerCredential.stub(:find_by_oid!, stale) do
+        patch console_broker_credential_url(cred.oid), params: {
+          credential: {
+            foreign_id: cred.foreign_id,
+            grant: "github_app_installation",
+            client_id: "Iv1.fedcba9876543210",
+            github_installation_id: "87654321"
+          }
+        }
+      end
+
+      assert_redirected_to console_credential_path(cred.oid)
+      cred.reload
+      assert_nil cred.access_token
+      assert_nil cred.expires_at
+      assert_nil cred.last_refresh
+      assert cred.next_attempt_at.present?
+    end
+
+    test "PATCH changing the GitHub App grant in either direction discards the prior token" do
+      exiting = BrokerCredential.create!(
+        foreign_id: "github-app-console-exit",
+        grant: "github_app_installation",
+        client_id: "Iv1.0123456789abcdef",
+        github_installation_id: "12345678",
+        access_token: "ghs-installation-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current,
+        created_by: @operator
+      )
+
+      patch console_broker_credential_url(exiting.oid), params: {
+        credential: {
+          foreign_id: exiting.foreign_id,
+          grant: "client_credentials",
+          token_endpoint: "https://idp.example/token",
+          client_id: "oauth-client",
+          client_secret: "oauth-secret"
+        }
+      }
+
+      assert_redirected_to console_credential_path(exiting.oid)
+      exiting.reload
+      assert_equal "client_credentials", exiting.grant
+      assert_nil exiting.access_token
+      assert_nil exiting.expires_at
+      assert_nil exiting.last_refresh
+
+      entering = BrokerCredential.create!(
+        foreign_id: "github-app-console-enter",
+        grant: "client_credentials",
+        token_endpoint: "https://idp.example/token",
+        client_id: "Iv1.0123456789abcdef",
+        client_secret: "oauth-secret",
+        github_installation_id: "12345678",
+        access_token: "oauth-access-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current,
+        created_by: @operator
+      )
+
+      patch console_broker_credential_url(entering.oid), params: {
+        credential: {
+          foreign_id: entering.foreign_id,
+          grant: "github_app_installation",
+          client_id: entering.client_id,
+          github_installation_id: entering.github_installation_id
+        }
+      }
+
+      assert_redirected_to console_credential_path(entering.oid)
+      entering.reload
+      assert_equal "github_app_installation", entering.grant
+      assert_nil entering.access_token
+      assert_nil entering.expires_at
+      assert_nil entering.last_refresh
     end
 
     test "PATCH update with blank client_secret and refresh_token leaves them in place" do
