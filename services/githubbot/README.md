@@ -188,11 +188,6 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_REPOSITORY_ALLOWLIST` | ✅ | Comma-separated exact `owner/repository` names. Empty/unset is rejected at startup; wildcards are not supported. Signed events for other repositories are acknowledged but ignored before chat state or agent work is created. |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
 
-The chart checksum includes the mounted private-key Secret's live resource
-version. Rotate the Secret through the same Helm reconcile used for deployment;
-the resulting pod-template change restarts githubbot, which reads the PEM once
-at process startup. Do not edit the Secret out of band without reconciling the
-release.
 | `GITHUBBOT_API_KEY` | — | Dedicated bearer sent to api-rs. |
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |
 | `GITHUBBOT_REVIEW_PROMPT` | — | Full review methodology, inline. Replaces the bundled default verbatim. |
@@ -222,6 +217,12 @@ release.
 | `GITHUBBOT_ESCALATION_HANDLE` | — | Fallback @handle (no leading @) tagged when the bot gives up. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
 | `GITHUBBOT_SHUTDOWN_DRAIN_MS` | — | How long to let in-flight turns finish on `SIGTERM` before exiting. Default `25000`; the chart derives it from the pod's termination grace period. |
+
+The chart checksum includes the mounted private-key Secret's live resource
+version. Rotate the Secret through the same Helm reconcile used for deployment;
+the resulting pod-template change restarts githubbot, which reads the PEM once
+at process startup. Do not edit the Secret out of band without reconciling the
+release.
 
 ## Tests
 
