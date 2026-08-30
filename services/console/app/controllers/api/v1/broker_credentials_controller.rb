@@ -49,7 +49,7 @@ module Api
 
       def assign_and_save!(ref, attrs)
         base = attrs.permit(:foreign_id, :name, :description, :token_endpoint,
-                            :grant, :client_id,
+                            :grant, :client_id, :github_installation_id,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
@@ -58,7 +58,19 @@ module Api
         base.delete(:foreign_id) if base[:foreign_id].blank? && ref.foreign_id.present?
 
         BrokerCredential.transaction do
+          # Refresh jobs update the same row under a lock. Reload it under our
+          # own lock before deciding which token fields are dirty, otherwise a
+          # stale controller instance can miss and preserve a token minted for
+          # the previous GitHub App installation.
+          ref.lock! if ref.persisted?
+          was_github_app_installation = ref.github_app_installation?
           ref.assign_attributes(base)
+          github_app_grant_changed = was_github_app_installation != ref.github_app_installation?
+          github_app_identity_changed = ref.github_app_installation? &&
+            (ref.github_installation_id_changed? || ref.client_id_changed?)
+          if github_app_grant_changed || github_app_identity_changed
+            reset_refresh_state(ref, discard_access_token: true)
+          end
           apply_client_secret(ref, attrs)
           apply_token_endpoint_headers(ref, attrs)
           apply_initial_values(ref, attrs)
@@ -105,11 +117,19 @@ module Api
         ref.next_attempt_at = Time.current
       end
 
-      def reset_refresh_state(ref)
+      def reset_refresh_state(ref, discard_access_token: false)
         ref.dead = false
         ref.dead_reason = nil
         ref.failure_count = 0
         ref.next_attempt_at = Time.current
+        return unless discard_access_token
+
+        # A token minted for a different GitHub App or installation could have
+        # a different repository scope. Do not leave it deliverable while the
+        # newly configured App identity is refreshed.
+        ref.access_token = nil
+        ref.expires_at = nil
+        ref.last_refresh = nil
       end
 
       # Observability only. The client_secret, username/password/api_key, the
@@ -127,6 +147,7 @@ module Api
           token_endpoint: ref.token_endpoint,
           scopes: ref.scopes,
           client_id: ref.client_id,
+          github_installation_id: ref.github_installation_id,
           token_endpoint_header_names: (ref.token_endpoint_headers || {}).keys,
           early_refresh_slack_seconds: ref.early_refresh_slack_seconds,
           early_refresh_fraction: ref.early_refresh_fraction,

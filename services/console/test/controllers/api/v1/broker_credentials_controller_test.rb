@@ -174,6 +174,144 @@ module Api
         assert created.next_attempt_at.present?
       end
 
+      test "create GitHub App installation grant pins GitHub's endpoint" do
+        body = {
+          data: {
+            foreign_id: "github-app-installation",
+            grant: "github_app_installation",
+            token_endpoint: "https://untrusted.example/token",
+            client_id: "Iv1.0123456789abcdef",
+            github_installation_id: "12345678"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["grant"]
+        assert_equal BrokerCredential::GITHUB_API_ENDPOINT, data["token_endpoint"]
+        assert_equal "Iv1.0123456789abcdef", data["client_id"]
+        assert_equal "12345678", data["github_installation_id"]
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_equal "12345678", created.github_installation_id
+        assert created.next_attempt_at.present?
+      end
+
+      test "updating a GitHub App identity discards a token minted for the prior installation" do
+        credential = BrokerCredential.create!(
+          foreign_id: "github-app-rotate",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          access_token: "ghs-old-installation-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: credential.oid), params: {
+          data: {
+            client_id: "Iv1.fedcba9876543210",
+            github_installation_id: "87654321"
+          }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        credential.reload
+        assert_nil credential.access_token
+        assert_nil credential.expires_at
+        assert_nil credential.last_refresh
+        assert credential.next_attempt_at.present?
+      end
+
+      test "updating a stale GitHub App record locks and discards a concurrently minted token" do
+        credential = BrokerCredential.create!(
+          foreign_id: "github-app-concurrent-rotate",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          created_by: users(:acme_admin)
+        )
+        stale = BrokerCredential.find(credential.id)
+        BrokerCredential.find(credential.id).update!(
+          access_token: "ghs-concurrently-minted-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current
+        )
+
+        BrokerCredential.stub(:find_by_oid!, stale) do
+          put api_v1_broker_credential_url(id: credential.oid), params: {
+            data: {
+              client_id: "Iv1.fedcba9876543210",
+              github_installation_id: "87654321"
+            }
+          }.to_json, headers: auth_headers
+        end
+
+        assert_response :ok
+        credential.reload
+        assert_nil credential.access_token
+        assert_nil credential.expires_at
+        assert_nil credential.last_refresh
+        assert credential.next_attempt_at.present?
+      end
+
+      test "changing the GitHub App grant in either direction discards the prior token" do
+        exiting = BrokerCredential.create!(
+          foreign_id: "github-app-exit",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          access_token: "ghs-installation-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: exiting.oid), params: {
+          data: {
+            grant: "client_credentials",
+            token_endpoint: "https://idp.example/token",
+            client_id: "oauth-client",
+            client_secret: "oauth-secret"
+          }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        exiting.reload
+        assert_equal "client_credentials", exiting.grant
+        assert_nil exiting.access_token
+        assert_nil exiting.expires_at
+        assert_nil exiting.last_refresh
+
+        entering = BrokerCredential.create!(
+          foreign_id: "github-app-enter",
+          grant: "client_credentials",
+          token_endpoint: "https://idp.example/token",
+          client_id: "Iv1.0123456789abcdef",
+          client_secret: "oauth-secret",
+          github_installation_id: "12345678",
+          access_token: "oauth-access-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: entering.oid), params: {
+          data: { grant: "github_app_installation" }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        entering.reload
+        assert_equal "github_app_installation", entering.grant
+        assert_nil entering.access_token
+        assert_nil entering.expires_at
+        assert_nil entering.last_refresh
+      end
+
       test "create rejects a missing client_id" do
         body = {
           data: {

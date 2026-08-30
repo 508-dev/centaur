@@ -30,8 +30,15 @@ module Console
     def edit; end
 
     def update
-      assign_form(@credential)
-      if @credential.save
+      saved = BrokerCredential.transaction do
+        # Refresh jobs serialize on this row. Reload it under the same lock so
+        # an App identity change cannot preserve a concurrently minted token
+        # for the previous installation.
+        @credential.lock!
+        assign_form(@credential)
+        @credential.save
+      end
+      if saved
         redirect_to console_credential_path(@credential.oid), notice: "Credential updated."
       else
         render :edit, status: :unprocessable_entity
@@ -58,11 +65,18 @@ module Console
     # mirror the API controller's handling.
     def assign_form(credential)
       fields = credential_params.permit(:foreign_id, :name, :description,
-                                        :grant, :token_endpoint, :client_id,
+                                        :grant, :token_endpoint, :client_id, :github_installation_id,
                                         :early_refresh_slack_seconds, :early_refresh_fraction,
                                         :max_refresh_interval_seconds, :refresh_timeout_seconds)
       fields[:foreign_id] = fields[:foreign_id].presence
+      was_github_app_installation = credential.github_app_installation?
       credential.assign_attributes(fields)
+      github_app_grant_changed = was_github_app_installation != credential.github_app_installation?
+      github_app_identity_changed = credential.github_app_installation? &&
+        (credential.github_installation_id_changed? || credential.client_id_changed?)
+      if github_app_grant_changed || github_app_identity_changed
+        reset_refresh_state(credential, discard_access_token: true)
+      end
       credential.scopes = scope_params
       credential.token_endpoint_headers = header_params
       credential.labels = label_params
@@ -103,11 +117,19 @@ module Console
       credential.next_attempt_at = Time.current
     end
 
-    def reset_refresh_state(credential)
+    def reset_refresh_state(credential, discard_access_token: false)
       credential.dead = false
       credential.dead_reason = nil
       credential.failure_count = 0
       credential.next_attempt_at = Time.current
+      return unless discard_access_token
+
+      # A token minted for a different GitHub App or installation could have a
+      # different repository scope. Keep it unavailable until the new identity
+      # has minted a replacement.
+      credential.access_token = nil
+      credential.expires_at = nil
+      credential.last_refresh = nil
     end
 
     def credential_params
