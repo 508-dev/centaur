@@ -29,9 +29,10 @@ export type GithubbotApiAttachment = {
   width?: number;
 };
 
-// GitHub scopes by repository (owner/repo), resolved from the thread id; the bot
-// authenticates as a single PAT/teammate, so sessions are keyed by thread id
-// alone (no per-workspace token like Slack's teamId).
+// GitHub scopes by repository (owner/repo), resolved from the thread id. The
+// controller uses one fixed GitHub identity (a preferred App installation or a
+// compatibility PAT), so sessions are keyed by thread id alone (no
+// per-workspace token like Slack's teamId).
 export type GithubbotApiMessage = {
   attachments: GithubbotApiAttachment[];
   author: GithubbotApiAuthor;
@@ -171,7 +172,26 @@ export type GithubbotOptions = {
   /** Merge method for auto-merge: "merge" | "squash" | "rebase". Default "squash". */
   mergeMethod?: "merge" | "squash" | "rebase";
   /** Personal access token for the bot's GitHub teammate account. */
-  token: string;
+  token?: string;
+  /**
+   * GitHub App Client ID used as the JWT issuer. GitHub and Octokit recommend
+   * the Client ID over the legacy numeric App ID.
+   */
+  githubAppClientId?: string;
+  /** Fixed organization/repository installation used by this bot instance. */
+  githubAppInstallationId?: number;
+  /** GitHub App PEM contents. Mount a Secret and read it at process startup. */
+  githubAppPrivateKey?: string;
+  /**
+   * Login GitHub records for actions by this identity. In App mode this is the
+   * App slug with `[bot]`; `userName` remains the mention slug.
+   */
+  botActorLogin?: string;
+  /**
+   * Label that explicitly hands a PR or issue to lifecycle automation. Defaults
+   * to `centaur-managed`; useful for Apps, which cannot be assignees.
+   */
+  ownershipLabel?: string;
   userName?: string;
   /**
    * GitHub `author_association` values allowed to drive the conversational

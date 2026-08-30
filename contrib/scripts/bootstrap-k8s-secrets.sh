@@ -39,11 +39,14 @@ Optional Linear bot bootstrap (consumed when linearbot.enabled=true):
 
 Optional GitHub ingress bootstrap (consumed when githubbot.enabled=true):
   GITHUBBOT_TOKEN              personal access token for the bot's GitHub
-                               teammate account; required together with the
-                               webhook secret (partial config fails fast). Kept
+                               teammate account in PAT mode; when set, the
+                               webhook secret is also required. Omit for App
+                               mode. Kept
                                distinct from GITHUB_TOKEN (the repo-cache /
                                sandbox tool token) so the bot acts as its own user.
-  GITHUBBOT_WEBHOOK_SECRET     signing secret from the GitHub repo/org webhook
+  GITHUBBOT_WEBHOOK_SECRET     signing secret from the GitHub repo/org webhook;
+                               seeds the shared ingress keys for either PAT or
+                               App authentication
   GITHUBBOT_API_KEY            bearer the bot sends to api-rs; auto-generated
                                when absent
 
@@ -153,11 +156,10 @@ if [[ -n "${LINEAR_ACCESS_TOKEN:-}" || -n "${LINEARBOT_WEBHOOK_SECRET:-}" ]]; th
   require_env LINEARBOT_WEBHOOK_SECRET
 fi
 
-# GitHub bot config is optional but must be complete: a PAT without the webhook
-# secret (or vice versa) deploys a githubbot that boots and then rejects every
-# delivery, which reads as silence.
-if [[ -n "${GITHUBBOT_TOKEN:-}" || -n "${GITHUBBOT_WEBHOOK_SECRET:-}" ]]; then
-  require_env GITHUBBOT_TOKEN
+# GitHub ingress shared secrets support PAT and App authentication. A PAT or an
+# explicitly supplied api-rs bearer without a webhook secret is incomplete;
+# the webhook secret alone is valid App-mode bootstrap input.
+if [[ -n "${GITHUBBOT_TOKEN:-}" || -n "${GITHUBBOT_API_KEY:-}" ]]; then
   require_env GITHUBBOT_WEBHOOK_SECRET
 fi
 
@@ -286,10 +288,12 @@ if secret_exists centaur-infra-env; then
       patch_data+=("\"LINEARBOT_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
     fi
   fi
-  # GitHub bot credentials. The PAT + webhook secret are set whenever present so
-  # they can be rotated; the api-rs bearer is generated once and kept stable.
+  # GitHub ingress shared secrets are independent of controller authentication:
+  # App mode has no PAT. Rotate supplied values; generate the api-rs bearer once.
   if [[ -n "${GITHUBBOT_TOKEN:-}" ]]; then
     patch_data+=("\"GITHUBBOT_TOKEN\":\"$(printf '%s' "$GITHUBBOT_TOKEN" | base64 | tr -d '\n')\"")
+  fi
+  if [[ -n "${GITHUBBOT_WEBHOOK_SECRET:-}" ]]; then
     patch_data+=("\"GITHUBBOT_WEBHOOK_SECRET\":\"$(printf '%s' "$GITHUBBOT_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
     if [[ -n "${GITHUBBOT_API_KEY:-}" ]]; then
       patch_data+=("\"GITHUBBOT_API_KEY\":\"$(printf '%s' "$GITHUBBOT_API_KEY" | base64 | tr -d '\n')\"")
@@ -366,6 +370,8 @@ else
   fi
   if [[ -n "${GITHUBBOT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUBBOT_TOKEN="$GITHUBBOT_TOKEN")
+  fi
+  if [[ -n "${GITHUBBOT_WEBHOOK_SECRET:-}" ]]; then
     secret_args+=(--from-literal=GITHUBBOT_WEBHOOK_SECRET="$GITHUBBOT_WEBHOOK_SECRET")
     secret_args+=(--from-literal=GITHUBBOT_API_KEY="${GITHUBBOT_API_KEY:-$(rand_hex)}")
   fi

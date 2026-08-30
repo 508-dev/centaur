@@ -1,5 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { createGitHubAdapter, type GitHubAdapter } from "@chat-adapter/github";
+import {
+  createGitHubAdapter,
+  type GitHubAdapter,
+  type GitHubAdapterAppConfig,
+  type GitHubAdapterPATConfig,
+} from "@chat-adapter/github";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import {
   Chat,
@@ -21,7 +26,7 @@ import { handleBodyMention } from "./body-mention";
 import { backgroundWaitUntil, requestContext, waitUntil } from "./context";
 import {
   handleIssueEvent,
-  isIssueAssignedToBot,
+  isIssueOwnedByBot,
   issueWorkThreadKey,
 } from "./issue-manager";
 import { extractMessageOverrides } from "./overrides";
@@ -66,11 +71,36 @@ const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 const DEDUP_WINDOW = 200;
 
+export function resolveBotActorLogin(
+  options: Pick<GithubbotOptions, "botActorLogin" | "githubAppClientId">,
+  userName: string,
+): string {
+  if (
+    options.githubAppClientId &&
+    userName.trim().toLowerCase().endsWith("[bot]")
+  ) {
+    throw new Error(
+      "GitHub App userName must be the mention slug without the [bot] suffix",
+    );
+  }
+  const actorLogin =
+    options.botActorLogin?.trim() ||
+    (options.githubAppClientId ? `${userName}[bot]` : userName);
+  if (
+    options.githubAppClientId &&
+    !actorLogin.toLowerCase().endsWith("[bot]")
+  ) {
+    throw new Error("GitHub App botActorLogin must end in [bot]");
+  }
+  return actorLogin;
+}
+
 export function createGithubbot(options: GithubbotOptions): Githubbot {
   const userName = options.userName ?? "github-bot";
+  const botActorLogin = resolveBotActorLogin(options, userName);
   const logger = options.logger ?? noopLogger;
   const github = createGitHubAdapter({
-    token: options.token,
+    ...resolveGithubAdapterAuth(options),
     webhookSecret: options.webhookSecret,
     userName,
     ...(options.botUserId ? { botUserId: Number(options.botUserId) } : {}),
@@ -135,6 +165,7 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   };
 
   const prManagerCtx: PrManagerContext = {
+    botActorLogin,
     octokit: github.octokit,
     options,
     state,
@@ -198,6 +229,7 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
     const handled = requestContext.run(context, () =>
       Promise.all([
         routeLifecycleEvent(eventType, rawBody, {
+          botActorLogin,
           botUserName: userName,
           deliveryId,
           options,
@@ -225,6 +257,49 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   }
 
   return { app, chat };
+}
+
+export function resolveGithubAdapterAuth(
+  options: Pick<
+    GithubbotOptions,
+    | "token"
+    | "githubAppClientId"
+    | "githubAppInstallationId"
+    | "githubAppPrivateKey"
+  >,
+): GitHubAdapterPATConfig | GitHubAdapterAppConfig {
+  const token = options.token?.trim();
+  const clientId = options.githubAppClientId?.trim();
+  const installationId = options.githubAppInstallationId;
+  const privateKey = options.githubAppPrivateKey?.trim();
+  const appFieldsPresent = [clientId, installationId, privateKey].filter(
+    (value) => value !== undefined && value !== "",
+  ).length;
+
+  if (token && appFieldsPresent > 0) {
+    throw new Error(
+      "GitHub PAT and GitHub App authentication are mutually exclusive",
+    );
+  }
+  if (token) return { token };
+
+  if (
+    !clientId ||
+    !privateKey ||
+    appFieldsPresent !== 3 ||
+    !Number.isSafeInteger(installationId) ||
+    (installationId ?? 0) <= 0
+  ) {
+    throw new Error(
+      "GitHub authentication requires GITHUB_TOKEN or a complete GitHub App Client ID, installation ID, and private key",
+    );
+  }
+
+  return {
+    appId: clientId,
+    installationId: installationId as number,
+    privateKey,
+  };
 }
 
 type MessageHandlerInput = {
@@ -396,7 +471,7 @@ function parseWebhookPayload(rawBody: string): unknown {
  * session key so the turn shares the sandbox/context the bot uses for it — while
  * replies still post to this thread. For an owned PR that's the management
  * session (`github-manage:…`, where it fixes CI and addresses reviews); for an
- * issue assigned to the bot it's the issue-work session (`github-issue:…`).
+ * issue owned by the bot it's the issue-work session (`github-issue:…`).
  * Returns undefined when the thread maps to neither (the turn then runs on its
  * own conversation session) or on lookup failure. The resolved key is cached on
  * the thread so follow-ups skip the lookup.
@@ -417,7 +492,7 @@ async function resolveManagementSession(
         sessionKey = managementThreadKey(ref.owner, ref.repo, ref.number);
       }
     } else if (
-      await isIssueAssignedToBot(
+      await isIssueOwnedByBot(
         input.prManagerCtx,
         ref.owner,
         ref.repo,
@@ -497,6 +572,7 @@ function routeLifecycleEvent(
   eventType: string,
   rawBody: string,
   input: {
+    botActorLogin: string;
     botUserName: string;
     deliveryId: string;
     options: GithubbotOptions;
@@ -507,6 +583,7 @@ function routeLifecycleEvent(
   if (eventType === "pull_request") {
     if (pullRequestAction(rawBody) === "review_requested") {
       return handleReviewRequest(rawBody, {
+        botActorLogin: input.botActorLogin,
         botUserName: input.botUserName,
         deliveryId: input.deliveryId,
         octokit: input.prManagerCtx.octokit,

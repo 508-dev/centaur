@@ -5,6 +5,7 @@ import {
   handleCiEvent,
   handlePullRequestEvent,
   handleReviewEvent,
+  isBotAssignmentHandoff,
   isOwnedPr,
   type PrManagerContext,
 } from "../src/pr-manager";
@@ -125,6 +126,79 @@ describe("isOwnedPr", () => {
 
   test("not owned when there are no assignees", () => {
     expect(isOwnedPr({ assignees: [], userName: "centaur-bot" })).toBe(false);
+  });
+
+  test("owned when an App-authored PR uses the separate bot actor login", () => {
+    expect(
+      isOwnedPr({
+        assignees: [],
+        author: "centaur-bot[bot]",
+        botActorLogin: "centaur-bot[bot]",
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+  });
+
+  test("does not confuse an App mention slug with its actor login", () => {
+    expect(
+      isOwnedPr({
+        assignees: [],
+        author: "centaur-bot",
+        botActorLogin: "centaur-bot[bot]",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
+  });
+
+  test("does not treat an App mention slug as an assignable account", () => {
+    expect(
+      isOwnedPr({
+        assignees: ["centaur-bot"],
+        botActorLogin: "centaur-bot[bot]",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
+  });
+
+  test("owned when the configured handoff label is present", () => {
+    expect(
+      isOwnedPr({
+        assignees: [],
+        labels: ["bug", "Centaur-Managed"],
+        ownershipLabel: "centaur-managed",
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("isBotAssignmentHandoff", () => {
+  test("accepts only an assignment of the PAT bot itself", () => {
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "Centaur-Bot",
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "alice",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
+  });
+
+  test("does not treat assignments as App-mode handoffs", () => {
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "centaur-bot",
+        botActorLogin: "centaur-bot[bot]",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
   });
 });
 

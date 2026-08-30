@@ -157,14 +157,32 @@ so the defaults are safe for repos that only carry some surfaces.
 
 {{- /*
 The GitHub App PEM is intentionally a separate secret rather than a key in the
-shared infra env Secret: it is mounted read-only into only the Console worker,
-not translated to an environment variable or exposed to Console web pods.
+shared infra env Secret: it is mounted read-only only into components that mint
+installation tokens, never translated to an environment variable, and never
+exposed to Console web pods.
 */ -}}
 {{- define "centaur.githubAppInstallationChecksum" -}}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- if $console.githubAppInstallation.enabled -}}
 {{- $name := required "console.githubAppInstallation.existingSecretName is required when GitHub App installation tokens are enabled" $console.githubAppInstallation.existingSecretName -}}
 {{- include "centaur.secretResourceVersion" (dict "root" . "name" $name) | quote -}}
+{{- else -}}
+{{- "disabled" | quote -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+The githubbot can use the same App installation identity without placing its
+PEM in an environment variable. Include both the mounted Secret generation and
+the public identity in the checksum so key/client/installation rotation rolls
+the controller immediately.
+*/ -}}
+{{- define "centaur.githubbotAppChecksum" -}}
+{{- $app := .Values.githubbot.githubApp -}}
+{{- if $app.enabled -}}
+{{- $name := required "githubbot.githubApp.existingSecretName is required when GitHub App authentication is enabled" $app.existingSecretName -}}
+{{- $payload := dict "secret" (include "centaur.secretResourceVersion" (dict "root" . "name" $name)) "clientId" (required "githubbot.githubApp.clientId is required when GitHub App authentication is enabled" $app.clientId) "installationId" (required "githubbot.githubApp.installationId is required when GitHub App authentication is enabled" $app.installationId) -}}
+{{- toJson $payload | sha256sum | quote -}}
 {{- else -}}
 {{- "disabled" | quote -}}
 {{- end -}}

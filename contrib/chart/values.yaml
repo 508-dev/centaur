@@ -655,13 +655,12 @@ linearbot:
   extraEnv: {}
   resources: {}
 
-# Chat SDK GitHub bot — GitHub teammate (PAT) ingress. Receives issue/PR comment
-# webhooks on /api/webhooks/github (the @chat-adapter/github adapter), answers in
-# the comment thread, and runs a review when the bot account is requested as a
-# reviewer. Forwards sessions to the api-rs control plane (:8080). Disabled by
-# default: requires the GITHUBBOT_TOKEN (PAT) and GITHUBBOT_WEBHOOK_SECRET secrets
-# (see contrib/scripts/bootstrap-k8s-secrets.sh). userName must be the bot
-# account's GitHub login so @-mention and review-request matching work.
+# Chat SDK GitHub ingress. Receives issue/PR comment webhooks on
+# /api/webhooks/github (the @chat-adapter/github adapter), answers in the
+# comment thread, and forwards sessions to the api-rs control plane (:8080).
+# Disabled by default: requires GITHUBBOT_WEBHOOK_SECRET plus either the
+# githubApp block or the legacy GITHUBBOT_TOKEN secret. userName is the App
+# mention slug (without [bot]) or teammate login so @-mention matching works.
 githubbot:
   enabled: false
   # Singleton controller: per-PR admission and merge gates are process-serialized.
@@ -672,7 +671,22 @@ githubbot:
     tag: latest
     pullPolicy: Always
   userName: ""
-  # v2 PR self-management (only acts on PRs assigned to the bot account).
+  # Optional exact login recorded on bot-authored events. App deployments use
+  # <slug>[bot]; when empty, githubbot derives it from userName in App mode.
+  botActorLogin: ""
+  # Prefer a GitHub App installation for production. When enabled, the PAT
+  # secret key is not referenced; the PEM is mounted read-only and Octokit
+  # transparently rotates short-lived installation tokens.
+  githubApp:
+    enabled: false
+    clientId: ""
+    installationId: ""
+    existingSecretName: ""
+    privateKeySecretKey: private-key.pem
+    privateKeyMountPath: /var/run/centaur/github-app
+  # v2 PR self-management acts on bot-authored PRs, PAT-account assignments, or
+  # subjects carrying this explicit App-compatible handoff label.
+  ownershipLabel: centaur-managed
   # Auto-merge respects branch protection and is paused per-PR by the hold label
   # / draft status.
   autoMerge: true
