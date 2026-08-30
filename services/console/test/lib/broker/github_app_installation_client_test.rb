@@ -86,6 +86,65 @@ module Broker
       end
     end
 
+    test "retries GitHub primary rate limits returned as 403" do
+      with_private_key do |path, _key|
+        http = expect_http_call(
+          status: 403,
+          headers: { "x-ratelimit-remaining" => "0" },
+          body: { message: "API rate limit exceeded" }.to_json
+        )
+        client = GithubAppInstallationClient.new(
+          http: http, private_key_path: path, clock: -> { NOW }
+        )
+
+        error = assert_raises(RefreshError) do
+          client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+        end
+
+        http.verify
+        assert error.retryable?
+        assert_equal "http_403", error.code
+      end
+    end
+
+    test "retries GitHub secondary rate limits returned as 403" do
+      with_private_key do |path, _key|
+        http = expect_http_call(
+          status: 403,
+          headers: { "retry-after" => "60" },
+          body: { message: "You have exceeded a secondary rate limit" }.to_json
+        )
+        client = GithubAppInstallationClient.new(
+          http: http, private_key_path: path, clock: -> { NOW }
+        )
+
+        error = assert_raises(RefreshError) do
+          client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+        end
+
+        http.verify
+        assert error.retryable?
+        assert_equal "http_403", error.code
+      end
+    end
+
+    test "treats GitHub permission failures returned as 403 as unrecoverable" do
+      with_private_key do |path, _key|
+        http = expect_http_call(status: 403, body: { message: "Resource not accessible by integration" }.to_json)
+        client = GithubAppInstallationClient.new(
+          http: http, private_key_path: path, clock: -> { NOW }
+        )
+
+        error = assert_raises(RefreshError) do
+          client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+        end
+
+        http.verify
+        refute error.retryable?
+        assert_equal "http_403", error.code
+      end
+    end
+
     test "retries GitHub server failures" do
       with_private_key do |path, _key|
         http = expect_http_call(status: 503, body: "temporarily unavailable")

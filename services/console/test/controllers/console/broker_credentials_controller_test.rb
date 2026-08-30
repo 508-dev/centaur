@@ -180,6 +180,40 @@ module Console
       assert_equal({ "X-Tenant" => "acme" }, cred.token_endpoint_headers)
     end
 
+    test "PATCH GitHub App update locks and discards a concurrently minted token" do
+      cred = BrokerCredential.create!(
+        foreign_id: "github-app-console-rotate",
+        grant: "github_app_installation",
+        client_id: "Iv1.0123456789abcdef",
+        github_installation_id: "12345678",
+        created_by: @operator
+      )
+      stale = BrokerCredential.find(cred.id)
+      BrokerCredential.find(cred.id).update!(
+        access_token: "ghs-concurrently-minted-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current
+      )
+
+      BrokerCredential.stub(:find_by_oid!, stale) do
+        patch console_broker_credential_url(cred.oid), params: {
+          credential: {
+            foreign_id: cred.foreign_id,
+            grant: "github_app_installation",
+            client_id: "Iv1.fedcba9876543210",
+            github_installation_id: "87654321"
+          }
+        }
+      end
+
+      assert_redirected_to console_credential_path(cred.oid)
+      cred.reload
+      assert_nil cred.access_token
+      assert_nil cred.expires_at
+      assert_nil cred.last_refresh
+      assert cred.next_attempt_at.present?
+    end
+
     test "PATCH update with blank client_secret and refresh_token leaves them in place" do
       cred = broker_credentials(:acme_managed_gmail)
       cred.update!(client_secret: "original-secret", refresh_token: "original-token", dead: true, dead_reason: "stale")

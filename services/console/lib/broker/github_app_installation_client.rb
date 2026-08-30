@@ -99,7 +99,7 @@ module Broker
     end
 
     def classify_error!(response)
-      retryable = response.status == 429 || response.status / 100 == 5
+      retryable = rate_limited?(response) || response.status / 100 == 5
       raise RefreshError.new(
         "GitHub App installation token request failed (HTTP #{response.status})",
         stage: "http",
@@ -107,6 +107,16 @@ module Broker
         status: response.status,
         retryable: retryable
       )
+    end
+
+    # GitHub uses 403 as well as 429 for rate limiting. Restrict the 403 case
+    # to explicit rate-limit headers so a structural permission/configuration
+    # error still marks the credential dead and asks for operator attention.
+    def rate_limited?(response)
+      return true if response.status == 429
+      return false unless response.status == 403
+
+      response["retry-after"].present? || response["x-ratelimit-remaining"].to_s == "0"
     end
 
     def parse_success(response)

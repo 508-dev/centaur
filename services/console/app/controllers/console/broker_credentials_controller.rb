@@ -30,8 +30,15 @@ module Console
     def edit; end
 
     def update
-      assign_form(@credential)
-      if @credential.save
+      saved = BrokerCredential.transaction do
+        # Refresh jobs serialize on this row. Reload it under the same lock so
+        # an App identity change cannot preserve a concurrently minted token
+        # for the previous installation.
+        @credential.lock!
+        assign_form(@credential)
+        @credential.save
+      end
+      if saved
         redirect_to console_credential_path(@credential.oid), notice: "Credential updated."
       else
         render :edit, status: :unprocessable_entity

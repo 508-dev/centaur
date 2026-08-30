@@ -227,6 +227,38 @@ module Api
         assert credential.next_attempt_at.present?
       end
 
+      test "updating a stale GitHub App record locks and discards a concurrently minted token" do
+        credential = BrokerCredential.create!(
+          foreign_id: "github-app-concurrent-rotate",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          created_by: users(:acme_admin)
+        )
+        stale = BrokerCredential.find(credential.id)
+        BrokerCredential.find(credential.id).update!(
+          access_token: "ghs-concurrently-minted-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current
+        )
+
+        BrokerCredential.stub(:find_by_oid!, stale) do
+          put api_v1_broker_credential_url(id: credential.oid), params: {
+            data: {
+              client_id: "Iv1.fedcba9876543210",
+              github_installation_id: "87654321"
+            }
+          }.to_json, headers: auth_headers
+        end
+
+        assert_response :ok
+        credential.reload
+        assert_nil credential.access_token
+        assert_nil credential.expires_at
+        assert_nil credential.last_refresh
+        assert credential.next_attempt_at.present?
+      end
+
       test "create rejects a missing client_id" do
         body = {
           data: {

@@ -58,6 +58,11 @@ module Api
         base.delete(:foreign_id) if base[:foreign_id].blank? && ref.foreign_id.present?
 
         BrokerCredential.transaction do
+          # Refresh jobs update the same row under a lock. Reload it under our
+          # own lock before deciding which token fields are dirty, otherwise a
+          # stale controller instance can miss and preserve a token minted for
+          # the previous GitHub App installation.
+          ref.lock! if ref.persisted?
           ref.assign_attributes(base)
           if ref.github_app_installation? && (ref.github_installation_id_changed? || ref.client_id_changed?)
             reset_refresh_state(ref, discard_access_token: true)
