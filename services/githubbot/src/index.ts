@@ -75,10 +75,24 @@ export function resolveBotActorLogin(
   options: Pick<GithubbotOptions, "botActorLogin" | "githubAppClientId">,
   userName: string,
 ): string {
-  return (
+  if (
+    options.githubAppClientId &&
+    userName.trim().toLowerCase().endsWith("[bot]")
+  ) {
+    throw new Error(
+      "GitHub App userName must be the mention slug without the [bot] suffix",
+    );
+  }
+  const actorLogin =
     options.botActorLogin?.trim() ||
-    (options.githubAppClientId ? `${userName}[bot]` : userName)
-  );
+    (options.githubAppClientId ? `${userName}[bot]` : userName);
+  if (
+    options.githubAppClientId &&
+    !actorLogin.toLowerCase().endsWith("[bot]")
+  ) {
+    throw new Error("GitHub App botActorLogin must end in [bot]");
+  }
+  return actorLogin;
 }
 
 export function createGithubbot(options: GithubbotOptions): Githubbot {

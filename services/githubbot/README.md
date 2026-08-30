@@ -37,9 +37,9 @@ Apps cannot be assignees or requested reviewers.
   thread's session as append-only context — no execution, no reply — so a follow-up like "actually,
   hold off" is seen by the next turn. The bot's own comments are skipped (loop guard) and inactive
   threads are ignored.
-- **Requesting the bot's review on a PR** (`pull_request` / `review_requested` targeting the bot
-  account — or a **team the bot belongs to**, whose membership is checked and briefly cached) → a
-  review turn runs on a **dedicated, isolated session thread**
+- **Requesting the PAT teammate bot's review on a PR** (`pull_request` / `review_requested`
+  targeting the bot account — or a **team the bot belongs to**, whose membership is checked and
+  briefly cached) → a review turn runs on a **dedicated, isolated session thread**
   (`github-review:{owner}/{repo}:{prNumber}`) — kept separate from the PR conversation so reviews
   never share a sandbox with chit-chat, but persistent per PR so a re-request builds on the prior
   review. The chat adapter only surfaces comment threads, so this lifecycle event is handled

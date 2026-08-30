@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
-import { createGithubbot, type GithubbotOptions } from "./index";
+import {
+  createGithubbot,
+  resolveBotActorLogin,
+  type GithubbotOptions,
+} from "./index";
 import { DEFAULT_OWNERSHIP_LABEL } from "./pr-manager";
 import { DEFAULT_REVIEW_RESET_LABEL } from "./review-budget";
 import { positiveIntegerValue } from "./utils";
@@ -53,12 +57,13 @@ if (!userName) {
     "GITHUB_BOT_USERNAME is required (App mention slug or PAT account login)",
   );
 }
-const botActorLogin =
-  optionalEnv("GITHUB_BOT_ACTOR_LOGIN") ??
-  (githubAppClientId ? `${userName}[bot]` : userName);
-if (githubAppClientId && !botActorLogin.toLowerCase().endsWith("[bot]")) {
-  throw new Error("GITHUB_BOT_ACTOR_LOGIN must end in [bot] for GitHub App auth");
-}
+const botActorLogin = resolveBotActorLogin(
+  {
+    botActorLogin: optionalEnv("GITHUB_BOT_ACTOR_LOGIN"),
+    githubAppClientId,
+  },
+  userName,
+);
 const ownershipLabel =
   optionalEnv("GITHUBBOT_OWNERSHIP_LABEL") ?? DEFAULT_OWNERSHIP_LABEL;
 const reviewResetLabel =

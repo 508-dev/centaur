@@ -5,6 +5,7 @@ import {
   handleCiEvent,
   handlePullRequestEvent,
   handleReviewEvent,
+  isBotAssignmentHandoff,
   isOwnedPr,
   type PrManagerContext,
 } from "../src/pr-manager";
@@ -168,6 +169,36 @@ describe("isOwnedPr", () => {
         userName: "centaur-bot",
       }),
     ).toBe(true);
+  });
+});
+
+describe("isBotAssignmentHandoff", () => {
+  test("accepts only an assignment of the PAT bot itself", () => {
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "Centaur-Bot",
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "alice",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
+  });
+
+  test("does not treat assignments as App-mode handoffs", () => {
+    expect(
+      isBotAssignmentHandoff({
+        action: "assigned",
+        assignee: "centaur-bot",
+        botActorLogin: "centaur-bot[bot]",
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
   });
 });
 

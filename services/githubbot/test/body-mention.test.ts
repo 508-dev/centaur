@@ -129,7 +129,7 @@ describe("handleBodyMention", () => {
       handleBodyMention(
         makeCtx({ reactions: 0, comments: 0 }, "centaur-bot[bot]"),
         "pull_request",
-        openedPr("@centaur-bot do it", "NONE", "centaur-bot[bot]"),
+        openedPr("@centaur-bot do it", "MEMBER", "centaur-bot[bot]"),
       ),
     ).toBeNull();
   });

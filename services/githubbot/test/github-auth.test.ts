@@ -99,4 +99,22 @@ describe("GitHub bot identity", () => {
       ),
     ).toBe("custom-app[bot]");
   });
+
+  test("rejects a suffixed App mention slug or unsuffixed actor login", () => {
+    expect(() =>
+      resolveBotActorLogin(
+        { githubAppClientId: "Iv1.example" },
+        "centaur-bot[bot]",
+      ),
+    ).toThrow("mention slug without the [bot] suffix");
+    expect(() =>
+      resolveBotActorLogin(
+        {
+          botActorLogin: "centaur-bot",
+          githubAppClientId: "Iv1.example",
+        },
+        "centaur-bot",
+      ),
+    ).toThrow("botActorLogin must end in [bot]");
+  });
 });

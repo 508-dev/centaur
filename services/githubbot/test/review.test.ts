@@ -80,13 +80,13 @@ describe("handleReviewRequest", () => {
     expect(result).not.toBeNull();
   });
 
-  test("recognizes a separately configured App actor login", () => {
+  test("does not treat an App actor as a requestable reviewer", () => {
     const result = handleReviewRequest(reviewRequestedBody("review-bot[bot]"), {
       ...input,
       botActorLogin: "review-bot[bot]",
       state: stubState(),
     });
-    expect(result).not.toBeNull();
+    expect(result).toBeNull();
   });
 
   test("de-duplicates a redelivered review request", async () => {

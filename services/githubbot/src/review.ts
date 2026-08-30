@@ -91,11 +91,13 @@ export function handleReviewRequest(
   // belongs to a requested team (resolved asynchronously below). A request that
   // names a different individual reviewer and no team is not ours.
   const reviewer = stringValue(payload.requested_reviewer?.login);
+  const directReviewSupported =
+    (input.botActorLogin ?? input.botUserName).toLowerCase() ===
+    input.botUserName.toLowerCase();
   const directMatch =
+    directReviewSupported &&
     !!reviewer &&
-    [input.botUserName, input.botActorLogin ?? input.botUserName].some(
-      (login) => reviewer.toLowerCase() === login.toLowerCase(),
-    );
+    reviewer.toLowerCase() === input.botUserName.toLowerCase();
   const teamSlug = stringValue(payload.requested_team?.slug);
   if (!directMatch && !teamSlug) return null;
 

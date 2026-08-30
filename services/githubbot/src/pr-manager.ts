@@ -96,6 +96,22 @@ export function isOwnedPr(input: {
   );
 }
 
+/** An assignment is a handoff only when GitHub assigned the PAT bot itself. */
+export function isBotAssignmentHandoff(input: {
+  action?: string;
+  assignee?: string;
+  botActorLogin?: string;
+  userName: string;
+}): boolean {
+  const mentionLogin = input.userName.toLowerCase();
+  const actorLogin = (input.botActorLogin ?? input.userName).toLowerCase();
+  return (
+    input.action === "assigned" &&
+    actorLogin === mentionLogin &&
+    input.assignee?.toLowerCase() === mentionLogin
+  );
+}
+
 export type MergeDecision =
   | "merge"
   | "resolve_conflict"
@@ -611,6 +627,10 @@ export async function handlePullRequestEvent(
 
   const labelNode = payload.label;
   const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
+  const assigneeNode = payload.assignee;
+  const assignee = isRecord(assigneeNode)
+    ? stringValue(assigneeNode.login)
+    : undefined;
   const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
   const ownershipLabel =
     ctx.options.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL;
@@ -672,7 +692,12 @@ export async function handlePullRequestEvent(
   // handoff. Evaluate CI now, forcing past human-commit back-off, so a PR that
   // was already red or green does not wait for another lifecycle event.
   if (
-    action === "assigned" ||
+    isBotAssignmentHandoff({
+      action,
+      assignee,
+      botActorLogin: ctx.botActorLogin,
+      userName: ctx.userName,
+    }) ||
     (action === "labeled" &&
       label?.toLowerCase() === ownershipLabel.toLowerCase())
   ) {
