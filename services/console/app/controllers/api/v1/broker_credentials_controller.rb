@@ -63,8 +63,12 @@ module Api
           # stale controller instance can miss and preserve a token minted for
           # the previous GitHub App installation.
           ref.lock! if ref.persisted?
+          was_github_app_installation = ref.github_app_installation?
           ref.assign_attributes(base)
-          if ref.github_app_installation? && (ref.github_installation_id_changed? || ref.client_id_changed?)
+          github_app_grant_changed = was_github_app_installation != ref.github_app_installation?
+          github_app_identity_changed = ref.github_app_installation? &&
+            (ref.github_installation_id_changed? || ref.client_id_changed?)
+          if github_app_grant_changed || github_app_identity_changed
             reset_refresh_state(ref, discard_access_token: true)
           end
           apply_client_secret(ref, attrs)

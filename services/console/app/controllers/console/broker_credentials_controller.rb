@@ -69,8 +69,12 @@ module Console
                                         :early_refresh_slack_seconds, :early_refresh_fraction,
                                         :max_refresh_interval_seconds, :refresh_timeout_seconds)
       fields[:foreign_id] = fields[:foreign_id].presence
+      was_github_app_installation = credential.github_app_installation?
       credential.assign_attributes(fields)
-      if credential.github_app_installation? && (credential.github_installation_id_changed? || credential.client_id_changed?)
+      github_app_grant_changed = was_github_app_installation != credential.github_app_installation?
+      github_app_identity_changed = credential.github_app_installation? &&
+        (credential.github_installation_id_changed? || credential.client_id_changed?)
+      if github_app_grant_changed || github_app_identity_changed
         reset_refresh_state(credential, discard_access_token: true)
       end
       credential.scopes = scope_params

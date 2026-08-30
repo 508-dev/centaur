@@ -214,6 +214,65 @@ module Console
       assert cred.next_attempt_at.present?
     end
 
+    test "PATCH changing the GitHub App grant in either direction discards the prior token" do
+      exiting = BrokerCredential.create!(
+        foreign_id: "github-app-console-exit",
+        grant: "github_app_installation",
+        client_id: "Iv1.0123456789abcdef",
+        github_installation_id: "12345678",
+        access_token: "ghs-installation-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current,
+        created_by: @operator
+      )
+
+      patch console_broker_credential_url(exiting.oid), params: {
+        credential: {
+          foreign_id: exiting.foreign_id,
+          grant: "client_credentials",
+          token_endpoint: "https://idp.example/token",
+          client_id: "oauth-client",
+          client_secret: "oauth-secret"
+        }
+      }
+
+      assert_redirected_to console_credential_path(exiting.oid)
+      exiting.reload
+      assert_equal "client_credentials", exiting.grant
+      assert_nil exiting.access_token
+      assert_nil exiting.expires_at
+      assert_nil exiting.last_refresh
+
+      entering = BrokerCredential.create!(
+        foreign_id: "github-app-console-enter",
+        grant: "client_credentials",
+        token_endpoint: "https://idp.example/token",
+        client_id: "Iv1.0123456789abcdef",
+        client_secret: "oauth-secret",
+        github_installation_id: "12345678",
+        access_token: "oauth-access-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current,
+        created_by: @operator
+      )
+
+      patch console_broker_credential_url(entering.oid), params: {
+        credential: {
+          foreign_id: entering.foreign_id,
+          grant: "github_app_installation",
+          client_id: entering.client_id,
+          github_installation_id: entering.github_installation_id
+        }
+      }
+
+      assert_redirected_to console_credential_path(entering.oid)
+      entering.reload
+      assert_equal "github_app_installation", entering.grant
+      assert_nil entering.access_token
+      assert_nil entering.expires_at
+      assert_nil entering.last_refresh
+    end
+
     test "PATCH update with blank client_secret and refresh_token leaves them in place" do
       cred = broker_credentials(:acme_managed_gmail)
       cred.update!(client_secret: "original-secret", refresh_token: "original-token", dead: true, dead_reason: "stale")

@@ -57,16 +57,37 @@ module Broker
       end
     end
 
-    test "does not call GitHub when the private key is unavailable" do
-      client = GithubAppInstallationClient.new(private_key_path: "/missing/github-app.pem", clock: -> { NOW })
+    test "retries without calling GitHub while the private key path is missing or unavailable" do
+      [ nil, "/missing/github-app.pem" ].each do |path|
+        client = GithubAppInstallationClient.new(private_key_path: path, clock: -> { NOW })
 
-      error = assert_raises(RefreshError) do
-        client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+        error = assert_raises(RefreshError) do
+          client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+        end
+
+        assert error.retryable?
+        assert_equal "github_app_private_key", error.code
+        assert_equal "configuration", error.stage
       end
+    end
 
-      refute error.retryable?
-      assert_equal "github_app_private_key", error.code
-      assert_equal "configuration", error.stage
+    test "retries without calling GitHub while the mounted private key is invalid" do
+      invalid_keys = [ "not a private key", OpenSSL::PKey::RSA.generate(2048).public_to_pem ]
+      invalid_keys.each do |invalid_key|
+        Tempfile.create([ "invalid-github-app", ".pem" ]) do |file|
+          file.write(invalid_key)
+          file.flush
+          client = GithubAppInstallationClient.new(private_key_path: file.path, clock: -> { NOW })
+
+          error = assert_raises(RefreshError) do
+            client.refresh(client_id: CLIENT_ID, installation_id: INSTALLATION_ID)
+          end
+
+          assert error.retryable?
+          assert_equal "github_app_private_key", error.code
+          assert_equal "configuration", error.stage
+        end
+      end
     end
 
     test "treats a rejected installation token request as unrecoverable" do

@@ -259,6 +259,59 @@ module Api
         assert credential.next_attempt_at.present?
       end
 
+      test "changing the GitHub App grant in either direction discards the prior token" do
+        exiting = BrokerCredential.create!(
+          foreign_id: "github-app-exit",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          access_token: "ghs-installation-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: exiting.oid), params: {
+          data: {
+            grant: "client_credentials",
+            token_endpoint: "https://idp.example/token",
+            client_id: "oauth-client",
+            client_secret: "oauth-secret"
+          }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        exiting.reload
+        assert_equal "client_credentials", exiting.grant
+        assert_nil exiting.access_token
+        assert_nil exiting.expires_at
+        assert_nil exiting.last_refresh
+
+        entering = BrokerCredential.create!(
+          foreign_id: "github-app-enter",
+          grant: "client_credentials",
+          token_endpoint: "https://idp.example/token",
+          client_id: "Iv1.0123456789abcdef",
+          client_secret: "oauth-secret",
+          github_installation_id: "12345678",
+          access_token: "oauth-access-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: entering.oid), params: {
+          data: { grant: "github_app_installation" }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        entering.reload
+        assert_equal "github_app_installation", entering.grant
+        assert_nil entering.access_token
+        assert_nil entering.expires_at
+        assert_nil entering.last_refresh
+      end
+
       test "create rejects a missing client_id" do
         body = {
           data: {

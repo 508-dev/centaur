@@ -46,8 +46,11 @@ module Broker
     rescue Broker::RefreshError
       raise
     rescue OpenSSL::PKey::PKeyError, OpenSSL::OpenSSLError, Errno::ENOENT, Errno::EACCES
+      # The PEM is an external worker mount. Missing/invalid bytes can be
+      # repaired without changing this credential, so retain it in the refresh
+      # loop with normal exponential backoff instead of marking it dead.
       raise RefreshError.new("GitHub App private key is unavailable or invalid",
-                             stage: "configuration", code: "github_app_private_key", retryable: false)
+                             stage: "configuration", code: "github_app_private_key", retryable: true)
     rescue StandardError => e
       # The endpoint is fixed, so unexpected transport errors are transient.
       # Do not include error text: libraries may embed request context in it.
@@ -79,7 +82,7 @@ module Broker
       end
       if @private_key_path.blank?
         raise RefreshError.new("GitHub App private key path is not configured",
-                               stage: "configuration", code: "github_app_private_key", retryable: false)
+                               stage: "configuration", code: "github_app_private_key", retryable: true)
       end
     end
 
@@ -87,7 +90,7 @@ module Broker
       private_key = OpenSSL::PKey.read(File.binread(@private_key_path))
       unless private_key.is_a?(OpenSSL::PKey::RSA) && private_key.private?
         raise RefreshError.new("GitHub App private key is invalid",
-                               stage: "configuration", code: "github_app_private_key", retryable: false)
+                               stage: "configuration", code: "github_app_private_key", retryable: true)
       end
 
       issued_at = @clock.call.to_i - JWT_BACKDATE_SECONDS
