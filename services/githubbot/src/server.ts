@@ -6,9 +6,32 @@ import { createGithubbot, type GithubbotOptions } from "./index";
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
 
-// Personal access token for the bot's GitHub teammate account (the bot acts as a
-// real GitHub user — it can be requested as a reviewer, @-mentioned, assigned).
-const token = requiredEnv("GITHUB_TOKEN");
+// Use either a teammate PAT or a fixed GitHub App installation. The App path
+// reads its PEM from a mounted Secret and lets Octokit rotate the one-hour
+// installation token transparently; the PEM never enters the pod environment.
+const token = optionalEnv("GITHUB_TOKEN");
+const githubAppClientId =
+  optionalEnv("GITHUB_APP_CLIENT_ID") ?? optionalEnv("GITHUB_APP_ID");
+const githubAppInstallationId = optionalNumberEnv("GITHUB_INSTALLATION_ID");
+const githubAppPrivateKeyInline = optionalEnv("GITHUB_PRIVATE_KEY");
+const githubAppPrivateKeyFile = optionalEnv("GITHUB_PRIVATE_KEY_FILE");
+if (githubAppPrivateKeyInline && githubAppPrivateKeyFile) {
+  throw new Error(
+    "GITHUB_PRIVATE_KEY and GITHUB_PRIVATE_KEY_FILE are mutually exclusive",
+  );
+}
+let githubAppPrivateKey = githubAppPrivateKeyInline;
+if (!githubAppPrivateKey && githubAppPrivateKeyFile) {
+  try {
+    githubAppPrivateKey = readFileSync(githubAppPrivateKeyFile, "utf8");
+  } catch (error) {
+    throw new Error(
+      `GITHUB_PRIVATE_KEY_FILE (${githubAppPrivateKeyFile}) could not be read: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
 
 // Signing secret configured on the GitHub repo/org webhook. The adapter verifies
 // comment webhooks; githubbot verifies the pull_request (review-request) webhook.
@@ -18,8 +41,8 @@ if (!webhookSecret) {
   throw new Error("GITHUB_WEBHOOK_SECRET (or GITHUBBOT_WEBHOOK_SECRET) is required");
 }
 
-// The bot account's GitHub login. Drives @-mention detection and matching the
-// requested reviewer on review-request webhooks, so it must be the real login.
+// The bot's mention name. For an App this is its slug without the `[bot]`
+// suffix; for PAT mode it is the teammate account login.
 const userName =
   optionalEnv("GITHUB_BOT_USERNAME") ?? optionalEnv("GITHUBBOT_USER_NAME");
 if (!userName) {
@@ -150,6 +173,9 @@ const options: GithubbotOptions = {
   ),
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
+  githubAppClientId,
+  githubAppInstallationId,
+  githubAppPrivateKey,
   userName,
   webhookSecret,
   logger: consoleLogger,

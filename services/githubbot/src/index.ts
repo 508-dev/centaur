@@ -1,5 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { createGitHubAdapter, type GitHubAdapter } from "@chat-adapter/github";
+import {
+  createGitHubAdapter,
+  type GitHubAdapter,
+  type GitHubAdapterAppConfig,
+  type GitHubAdapterPATConfig,
+} from "@chat-adapter/github";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import {
   Chat,
@@ -70,7 +75,7 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   const userName = options.userName ?? "github-bot";
   const logger = options.logger ?? noopLogger;
   const github = createGitHubAdapter({
-    token: options.token,
+    ...resolveGithubAdapterAuth(options),
     webhookSecret: options.webhookSecret,
     userName,
     ...(options.botUserId ? { botUserId: Number(options.botUserId) } : {}),
@@ -225,6 +230,49 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   }
 
   return { app, chat };
+}
+
+export function resolveGithubAdapterAuth(
+  options: Pick<
+    GithubbotOptions,
+    | "token"
+    | "githubAppClientId"
+    | "githubAppInstallationId"
+    | "githubAppPrivateKey"
+  >,
+): GitHubAdapterPATConfig | GitHubAdapterAppConfig {
+  const token = options.token?.trim();
+  const clientId = options.githubAppClientId?.trim();
+  const installationId = options.githubAppInstallationId;
+  const privateKey = options.githubAppPrivateKey?.trim();
+  const appFieldsPresent = [clientId, installationId, privateKey].filter(
+    (value) => value !== undefined && value !== "",
+  ).length;
+
+  if (token && appFieldsPresent > 0) {
+    throw new Error(
+      "GitHub PAT and GitHub App authentication are mutually exclusive",
+    );
+  }
+  if (token) return { token };
+
+  if (
+    !clientId ||
+    !privateKey ||
+    appFieldsPresent !== 3 ||
+    !Number.isSafeInteger(installationId) ||
+    (installationId ?? 0) <= 0
+  ) {
+    throw new Error(
+      "GitHub authentication requires GITHUB_TOKEN or a complete GitHub App Client ID, installation ID, and private key",
+    );
+  }
+
+  return {
+    appId: clientId,
+    installationId: installationId as number,
+    privateKey,
+  };
 }
 
 type MessageHandlerInput = {

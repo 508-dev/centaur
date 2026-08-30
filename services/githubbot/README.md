@@ -153,17 +153,21 @@ the same shutdown drain rather than being treated as completed work.
 
 ## Auth
 
-A personal access token for the bot's GitHub teammate account is required (`GITHUB_TOKEN`). As a
-normal user account it is natively mentionable, assignable, and requestable as a reviewer, and the
-token inherits that user's permissions. Scopes: **`repo`** (read PRs/issues, post and edit comments,
-add reactions) — and, when the agent pushes branches or opens PRs from its sandbox, **`workflow`**.
+Use exactly one controller identity:
 
-Keep this distinct from the `GITHUB_TOKEN` used by the repo-cache / sandbox tooling — that one is the
-agent's git-operations token; this one is the bot's own identity. The chart wires githubbot's token
-from a separate `GITHUBBOT_TOKEN` secret key to avoid collision.
+- Preferred for production: a fixed GitHub App installation. Set
+  `GITHUB_APP_CLIENT_ID`, `GITHUB_INSTALLATION_ID`, and either
+  `GITHUB_PRIVATE_KEY_FILE` or `GITHUB_PRIVATE_KEY`. The Client ID is passed as
+  the JWT issuer, and Octokit transparently mints and refreshes short-lived
+  installation tokens. The chart mounts the PEM from a dedicated Secret rather
+  than placing it in an environment variable.
+- Compatibility mode: a personal access token for a bot teammate account in
+  `GITHUB_TOKEN`. Keep it distinct from any repo-cache or sandbox token.
 
-GitHub App auth is also supported by the adapter (`GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY`), but the
-PAT-teammate model is what we run.
+Do not configure both modes. The bot fails startup on missing, partial, or mixed
+credentials. GitHub Apps are not normal user accounts, so assignment and
+requested-review flows may require a teammate PAT; signed comment mentions and
+PR/issue lifecycle management work with the App installation identity.
 
 Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Issues**, **Pull
 requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Workflow runs**
@@ -173,9 +177,13 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `GITHUB_TOKEN` | ✅ | PAT for the bot's teammate account. |
+| `GITHUB_TOKEN` | one auth mode | PAT for the bot's teammate account. |
+| `GITHUB_APP_CLIENT_ID` | one auth mode | Recommended GitHub App JWT issuer (legacy `GITHUB_APP_ID` is accepted). |
+| `GITHUB_INSTALLATION_ID` | App mode | Fixed positive installation ID. |
+| `GITHUB_PRIVATE_KEY_FILE` | App mode | Preferred path to a mounted PEM; mutually exclusive with `GITHUB_PRIVATE_KEY`. |
+| `GITHUB_PRIVATE_KEY` | App mode | Inline PEM compatibility input. |
 | `GITHUB_WEBHOOK_SECRET` | ✅ | Webhook signing secret (or `GITHUBBOT_WEBHOOK_SECRET`). |
-| `GITHUB_BOT_USERNAME` | ✅ | The bot account's GitHub login — drives `@`-mention and requested-reviewer matching (or `GITHUBBOT_USER_NAME`). |
+| `GITHUB_BOT_USERNAME` | ✅ | Mention name used by the bot. For an App, use its slug without the `[bot]` suffix; for a teammate PAT, use the account login (or `GITHUBBOT_USER_NAME`). |
 | `GITHUBBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL` / `POSTGRES_URL`). |
 | `GITHUBBOT_REPOSITORY_ALLOWLIST` | ✅ | Comma-separated exact `owner/repository` names. Empty/unset is rejected at startup; wildcards are not supported. Signed events for other repositories are acknowledged but ignored before chat state or agent work is created. |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
