@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
+import { positiveIntegerValue } from "./utils";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -263,11 +264,7 @@ function mergeMethodEnv(): "merge" | "squash" | "rebase" | undefined {
 function optionalNumberEnv(name: string): number | undefined {
   const value = optionalEnv(name);
   if (!value) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-  return parsed;
+  return positiveIntegerValue(value, name);
 }
 
 function log(

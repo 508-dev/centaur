@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { resolveGithubAdapterAuth } from "../src/index";
+import { positiveIntegerValue } from "../src/utils";
 
 describe("GitHub authentication", () => {
   test("keeps the existing PAT mode", () => {
@@ -47,5 +48,28 @@ describe("GitHub authentication", () => {
     expect(() => resolveGithubAdapterAuth({})).toThrow(
       "GitHub authentication requires",
     );
+  });
+});
+
+describe("GitHub installation ID parsing", () => {
+  test("accepts a complete safe positive decimal integer", () => {
+    expect(positiveIntegerValue("157611530", "GITHUB_INSTALLATION_ID")).toBe(
+      157611530,
+    );
+  });
+
+  test("rejects prefixes, fractions, scientific notation, and unsafe values", () => {
+    for (const value of [
+      "123oops",
+      "123.5",
+      "1e3",
+      "0",
+      "-1",
+      "9007199254740992",
+    ]) {
+      expect(() =>
+        positiveIntegerValue(value, "GITHUB_INSTALLATION_ID"),
+      ).toThrow("positive decimal integer");
+    }
   });
 });
