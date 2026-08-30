@@ -80,6 +80,15 @@ describe("handleReviewRequest", () => {
     expect(result).not.toBeNull();
   });
 
+  test("recognizes a separately configured App actor login", () => {
+    const result = handleReviewRequest(reviewRequestedBody("review-bot[bot]"), {
+      ...input,
+      botActorLogin: "review-bot[bot]",
+      state: stubState(),
+    });
+    expect(result).not.toBeNull();
+  });
+
   test("de-duplicates a redelivered review request", async () => {
     const state = stubState();
     // First delivery claims the dedup key; second (same id) finds it taken.

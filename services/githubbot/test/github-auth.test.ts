@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { resolveGithubAdapterAuth } from "../src/index";
+import {
+  resolveBotActorLogin,
+  resolveGithubAdapterAuth,
+} from "../src/index";
 import { positiveIntegerValue } from "../src/utils";
 
 describe("GitHub authentication", () => {
@@ -71,5 +74,29 @@ describe("GitHub installation ID parsing", () => {
         positiveIntegerValue(value, "GITHUB_INSTALLATION_ID"),
       ).toThrow("positive decimal integer");
     }
+  });
+});
+
+describe("GitHub bot identity", () => {
+  test("keeps mention and actor logins separate for Apps", () => {
+    expect(
+      resolveBotActorLogin(
+        { githubAppClientId: "Iv1.example" },
+        "centaur-bot",
+      ),
+    ).toBe("centaur-bot[bot]");
+  });
+
+  test("uses the PAT login directly and honors an explicit actor", () => {
+    expect(resolveBotActorLogin({}, "centaur-bot")).toBe("centaur-bot");
+    expect(
+      resolveBotActorLogin(
+        {
+          botActorLogin: "custom-app[bot]",
+          githubAppClientId: "Iv1.example",
+        },
+        "centaur-bot",
+      ),
+    ).toBe("custom-app[bot]");
   });
 });

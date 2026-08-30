@@ -104,7 +104,11 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
             - name: GITHUB_BOT_USERNAME
-              value: {{ required "githubbot.userName is required (the bot account's GitHub login)" .Values.githubbot.userName | quote }}
+              value: {{ required "githubbot.userName is required (App mention slug or PAT account login)" .Values.githubbot.userName | quote }}
+{{- if .Values.githubbot.botActorLogin }}
+            - name: GITHUB_BOT_ACTOR_LOGIN
+              value: {{ .Values.githubbot.botActorLogin | quote }}
+{{- end }}
             - name: GITHUBBOT_REPOSITORY_ALLOWLIST
               value: {{ required "githubbot.repositoryAllowlist is required when githubbot is enabled" .Values.githubbot.repositoryAllowlist | quote }}
             # v2 PR self-management knobs.
@@ -112,6 +116,8 @@ spec:
               value: {{ .Values.githubbot.autoMerge | quote }}
             - name: GITHUBBOT_MERGE_METHOD
               value: {{ .Values.githubbot.mergeMethod | quote }}
+            - name: GITHUBBOT_OWNERSHIP_LABEL
+              value: {{ required "githubbot.ownershipLabel is required when githubbot is enabled" .Values.githubbot.ownershipLabel | quote }}
             - name: GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH
               value: {{ .Values.githubbot.reviewMaxRoundsPerEpoch | quote }}
             - name: GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH

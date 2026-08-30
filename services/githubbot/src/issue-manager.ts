@@ -1,6 +1,9 @@
 import { backgroundWaitUntil } from "./context";
 import { DEFAULT_ISSUE_PROMPT } from "./issue-prompt";
-import type { PrManagerContext } from "./pr-manager";
+import {
+  DEFAULT_OWNERSHIP_LABEL,
+  type PrManagerContext,
+} from "./pr-manager";
 import { reactWorkingOnSubject, settleSubjectReaction } from "./reactions";
 import { runTurnStream } from "./turn";
 import type {
@@ -11,17 +14,17 @@ import type {
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
 /**
- * Issues, like PRs, are worked on assignment: assigning an issue to the bot is
- * the signal to pick it up. On the `issues` `assigned` webhook (when the bot is
- * among the assignees), the bot runs an autonomous work turn — read the issue,
- * implement a fix, and open a PR (self-assigning that PR so it then drives it to
- * merge via the PR-management flow). The methodology is the bundled
+ * Issues, like PRs, are worked after an explicit ownership handoff: assignment
+ * to a PAT-backed teammate or the configured App-compatible ownership label.
+ * The bot runs an autonomous work turn — read the issue, implement a fix, and
+ * open a PR marked with that ownership label so PR management continues it.
+ * The methodology is the bundled
  * DEFAULT_ISSUE_PROMPT unless the deployment fully replaces it via
  * options.issuePrompt.
  *
  * The work runs on its own isolated session thread (`github-issue:{owner}/{repo}:
  * {n}`), kept separate from the issue's conversation thread so a work run never
- * shares a sandbox with chit-chat — but persistent per issue, so a re-assignment
+ * shares a sandbox with chit-chat — but persistent per issue, so a fresh handoff
  * builds on the prior attempt. The agent does all GitHub I/O via `gh`, so the bot
  * does not post through the adapter.
  */
@@ -33,7 +36,7 @@ type IssueManagerContext = PrManagerContext;
 // Assignment webhooks are de-duplicated by delivery id for a week — long enough
 // to cover GitHub's redelivery window without growing state unboundedly.
 const ISSUE_WORK_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const ASSIGNED_CACHE_TTL_MS = 10 * 60 * 1000;
+const OWNED_CACHE_TTL_MS = 10 * 60 * 1000;
 
 export function issueWorkThreadKey(
   owner: string,
@@ -43,7 +46,7 @@ export function issueWorkThreadKey(
   return `github-issue:${owner}/${repo}:${n}`;
 }
 
-/** `issues` lifecycle: on `assigned` to the bot, run an autonomous work turn. */
+/** `issues` lifecycle: on an explicit ownership handoff, run an autonomous turn. */
 export function handleIssueEvent(
   ctx: IssueManagerContext,
   rawBody: string,
@@ -51,15 +54,29 @@ export function handleIssueEvent(
 ): Promise<void> | null {
   const payload = parseJson(rawBody);
   if (!payload) return null;
-  if (stringValue(payload.action) !== "assigned") return null;
+  const action = stringValue(payload.action);
   const issue = isRecord(payload.issue) ? payload.issue : null;
   const repo = repoFromPayload(payload);
   if (!issue || !repo) return null;
   const number = numberValue(issue.number);
   if (number === undefined) return null;
   if (stringValue(issue.state) !== "open") return null;
-  if (!isAssignedToBot(assigneeLogins(issue.assignees), ctx.userName)) {
-    // A different assignee — not ours to act on.
+  const ownershipLabel =
+    ctx.options.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL;
+  const eventLabel = stringValue(
+    isRecord(payload.label) ? payload.label.name : undefined,
+  );
+  if (
+    !isIssueWorkSignal({
+      action,
+      assignees: assigneeLogins(issue.assignees),
+      botActorLogin: ctx.botActorLogin,
+      eventLabel,
+      labels: labelNames(issue.labels),
+      ownershipLabel,
+      userName: ctx.userName,
+    })
+  ) {
     return null;
   }
 
@@ -68,7 +85,7 @@ export function handleIssueEvent(
   const url =
     stringValue(issue.html_url) ??
     `https://github.com/${repo.owner}/${repo.repo}/issues/${number}`;
-  const assigner =
+  const requester =
     stringValue(isRecord(payload.sender) ? payload.sender.login : undefined) ??
     "a teammate";
   const threadKey = issueWorkThreadKey(repo.owner, repo.repo, number);
@@ -105,11 +122,12 @@ export function handleIssueEvent(
       });
       return;
     }
-    traceLog(options, "githubbot_issue_assigned", trace, {
-      assigner,
+    traceLog(options, "githubbot_issue_work_requested", trace, {
       issue: `${repo.owner}/${repo.repo}#${number}`,
+      requester,
+      signal: action,
     });
-    // No triggering comment on an assignment, so ack on the issue itself —
+    // No triggering comment on a lifecycle handoff, so ack on the issue itself —
     // instant 👀, settled to 🚀/😕 when the work turn finishes.
     await reactWorkingOnSubject(ctx.octokit, repo.owner, repo.repo, number, logger);
 
@@ -121,11 +139,12 @@ export function handleIssueEvent(
       contextPreamble: options.issuePrompt ?? DEFAULT_ISSUE_PROMPT,
       conversationName: `${repo.owner}/${repo.repo}#${number}: ${title}`,
       executeMessage: issueTriggerMessage({
-        assigner,
         deliveryId,
         number,
+        ownershipLabel,
         owner: repo.owner,
         repo: repo.repo,
+        requester,
         threadKey,
         title,
         url,
@@ -174,17 +193,17 @@ export function handleIssueEvent(
 }
 
 /**
- * Whether an issue is assigned to the bot, cached briefly so the conversational
+ * Whether an issue is owned by the bot, cached briefly so the conversational
  * path doesn't hit the API on every comment. Mirrors the PR manager's isPrOwned;
  * a stale result only affects which session a reply shares context with.
  */
-export async function isIssueAssignedToBot(
+export async function isIssueOwnedByBot(
   ctx: IssueManagerContext,
   owner: string,
   repo: string,
   number: number,
 ): Promise<boolean> {
-  const cacheKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:issue-assigned-cache:${owner}/${repo}#${number}`;
+  const cacheKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:issue-owned-cache:${owner}/${repo}#${number}`;
   try {
     const cached = await ctx.state.get<string>(cacheKey);
     if (cached === "1") return true;
@@ -192,46 +211,51 @@ export async function isIssueAssignedToBot(
   } catch {
     // fall through to a live lookup
   }
-  let assigned = false;
+  let owned = false;
   try {
     const { data } = await ctx.octokit.rest.issues.get({
       owner,
       repo,
       issue_number: number,
     });
-    assigned = isAssignedToBot(
-      assigneeLogins(data.assignees),
-      ctx.userName,
-    );
+    owned = isIssueOwned({
+      assignees: assigneeLogins(data.assignees),
+      botActorLogin: ctx.botActorLogin,
+      labels: labelNames(data.labels),
+      ownershipLabel: ctx.options.ownershipLabel,
+      userName: ctx.userName,
+    });
   } catch (error) {
     (ctx.options.logger ?? noopLogger).debug(
-      "githubbot_issue_assignment_lookup_failed",
+      "githubbot_issue_ownership_lookup_failed",
       { error: errorMessage(error) },
     );
     return false;
   }
   try {
-    await ctx.state.set(cacheKey, assigned ? "1" : "0", ASSIGNED_CACHE_TTL_MS);
+    await ctx.state.set(cacheKey, owned ? "1" : "0", OWNED_CACHE_TTL_MS);
   } catch {
     // best-effort cache
   }
-  return assigned;
+  return owned;
 }
 
 function issueTriggerMessage(input: {
-  assigner: string;
   deliveryId: string;
   number: number;
+  ownershipLabel: string;
   owner: string;
   repo: string;
+  requester: string;
   threadKey: string;
   title: string;
   url: string;
 }): GithubbotApiMessage {
   const text =
-    `You have been assigned GitHub issue ${input.owner}/${input.repo}#${input.number} — ` +
-    `"${input.title}" (${input.url}) by @${input.assigner}. Work it now, following ` +
-    `your guidance above, using the gh CLI and git in your sandbox.`;
+    `Centaur work was requested for GitHub issue ${input.owner}/${input.repo}#${input.number} — ` +
+    `"${input.title}" (${input.url}) by @${input.requester}. Work it now, following ` +
+    `your guidance above, using the gh CLI and git in your sandbox. Mark the resulting ` +
+    `pull request with the exact ownership label ${JSON.stringify(input.ownershipLabel)}.`;
   return {
     attachments: [],
     author: {
@@ -241,8 +265,8 @@ function issueTriggerMessage(input: {
       userId: "github-issue",
       userName: "github-issue",
     },
-    // Keyed by delivery id so a fresh assignment re-executes (the state claim
-    // dedupes a redelivery of the same assignment).
+    // Keyed by delivery id so a fresh handoff re-executes (the state claim
+    // dedupes a redelivery of the same lifecycle event).
     id: `issue-${input.threadKey}-${input.deliveryId}`,
     isMention: true,
     raw: { githubbotIssueWork: true, url: input.url },
@@ -263,6 +287,52 @@ export function isAssignedToBot(assignees: string[], userName: string): boolean 
   return assignees.some((login) => login.toLowerCase() === target);
 }
 
+export function isIssueOwned(input: {
+  assignees: string[];
+  botActorLogin?: string;
+  labels: string[];
+  ownershipLabel?: string;
+  userName: string;
+}): boolean {
+  const ownershipLabel = (
+    input.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL
+  ).toLowerCase();
+  const assignmentSupported =
+    (input.botActorLogin ?? input.userName).toLowerCase() ===
+    input.userName.toLowerCase();
+  return (
+    (assignmentSupported &&
+      isAssignedToBot(input.assignees, input.userName)) ||
+    input.labels.some((label) => label.toLowerCase() === ownershipLabel)
+  );
+}
+
+export function isIssueWorkSignal(input: {
+  action?: string;
+  assignees: string[];
+  botActorLogin?: string;
+  eventLabel?: string;
+  labels: string[];
+  ownershipLabel?: string;
+  userName: string;
+}): boolean {
+  if (
+    input.action === "assigned" &&
+    (input.botActorLogin ?? input.userName).toLowerCase() ===
+      input.userName.toLowerCase() &&
+    isAssignedToBot(input.assignees, input.userName)
+  ) {
+    return true;
+  }
+  const ownershipLabel =
+    input.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL;
+  return (
+    input.action === "labeled" &&
+    input.eventLabel?.toLowerCase() === ownershipLabel.toLowerCase() &&
+    isIssueOwned(input)
+  );
+}
+
 export function assigneeLogins(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const logins: string[] = [];
@@ -271,6 +341,20 @@ export function assigneeLogins(value: unknown): string[] {
     if (login) logins.push(login);
   }
   return logins;
+}
+
+export function labelNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const labels: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string" && entry) {
+      labels.push(entry);
+      continue;
+    }
+    const name = isRecord(entry) ? stringValue(entry.name) : undefined;
+    if (name) labels.push(name);
+  }
+  return labels;
 }
 
 function isRecord(value: unknown): value is JsonRecord {

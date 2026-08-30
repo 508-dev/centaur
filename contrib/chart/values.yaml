@@ -659,8 +659,8 @@ linearbot:
 # /api/webhooks/github (the @chat-adapter/github adapter), answers in the
 # comment thread, and forwards sessions to the api-rs control plane (:8080).
 # Disabled by default: requires GITHUBBOT_WEBHOOK_SECRET plus either the
-# githubApp block or the legacy GITHUBBOT_TOKEN secret. userName must match the
-# App bot or teammate login so @-mention matching works.
+# githubApp block or the legacy GITHUBBOT_TOKEN secret. userName is the App
+# mention slug (without [bot]) or teammate login so @-mention matching works.
 githubbot:
   enabled: false
   # Singleton controller: per-PR admission and merge gates are process-serialized.
@@ -671,6 +671,9 @@ githubbot:
     tag: latest
     pullPolicy: Always
   userName: ""
+  # Optional exact login recorded on bot-authored events. App deployments use
+  # <slug>[bot]; when empty, githubbot derives it from userName in App mode.
+  botActorLogin: ""
   # Prefer a GitHub App installation for production. When enabled, the PAT
   # secret key is not referenced; the PEM is mounted read-only and Octokit
   # transparently rotates short-lived installation tokens.
@@ -681,7 +684,9 @@ githubbot:
     existingSecretName: ""
     privateKeySecretKey: private-key.pem
     privateKeyMountPath: /var/run/centaur/github-app
-  # v2 PR self-management (only acts on PRs assigned to the bot account).
+  # v2 PR self-management acts on bot-authored PRs, PAT-account assignments, or
+  # subjects carrying this explicit App-compatible handoff label.
+  ownershipLabel: centaur-managed
   # Auto-merge respects branch protection and is paused per-PR by the hold label
   # / draft status.
   autoMerge: true

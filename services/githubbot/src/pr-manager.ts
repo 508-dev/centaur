@@ -52,12 +52,16 @@ export type PrManagerContext = {
   octokit: Octokit;
   options: GithubbotOptions;
   state: StateAdapter;
+  /** App actor login (`slug[bot]`) or the PAT account login. */
+  botActorLogin?: string;
+  /** Mention slug for App mode, or the PAT account login. */
   userName: string;
 };
 
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+export const DEFAULT_OWNERSHIP_LABEL = "centaur-managed";
 const REVIEW_STATE_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
 
 // ---------------------------------------------------------------------------
@@ -65,16 +69,31 @@ const REVIEW_STATE_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000]
 // ---------------------------------------------------------------------------
 
 /**
- * A PR is bot-owned when the bot is one of its assignees. Ownership is purely an
- * assignment mechanism: assign the PR to the bot to have it manage the PR toward
- * merge (and unassign to hand it back).
+ * A PR is bot-owned when the bot authored it, is an assignee (PAT mode), or the
+ * configured ownership label is present (the explicit App-compatible handoff).
  */
 export function isOwnedPr(input: {
   assignees: string[];
+  author?: string;
+  botActorLogin?: string;
+  labels?: string[];
+  ownershipLabel?: string;
   userName: string;
 }): boolean {
-  const target = input.userName.toLowerCase();
-  return input.assignees.some((login) => login.toLowerCase() === target);
+  const mentionLogin = input.userName.toLowerCase();
+  const actorLogin = (input.botActorLogin ?? input.userName).toLowerCase();
+  const assignmentSupported = actorLogin === mentionLogin;
+  const ownershipLabel = (
+    input.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL
+  ).toLowerCase();
+  return (
+    (assignmentSupported &&
+      input.assignees.some((login) => login.toLowerCase() === mentionLogin)) ||
+    input.author?.toLowerCase() === actorLogin ||
+    (input.labels ?? []).some(
+      (label) => label.toLowerCase() === ownershipLabel,
+    )
+  );
 }
 
 export type MergeDecision =
@@ -452,6 +471,7 @@ function logger(ctx: PrManagerContext) {
 
 type PullRequestSummary = {
   assignees: string[];
+  author: string | null;
   draft: boolean;
   headRef: string;
   headRepoFullName: string | null;
@@ -481,9 +501,11 @@ function summarizePr(pr: {
   state: string;
   title: string;
   assignees?: ({ login?: string } | null)[] | null;
+  user?: { login?: string | null } | null;
 }): PullRequestSummary {
   return {
     assignees: assigneeLogins(pr.assignees),
+    author: pr.user?.login ?? null,
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headRepoFullName: pr.head.repo?.full_name ?? null,
@@ -551,7 +573,14 @@ export async function isPrOwned(
 }
 
 function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {
-  return isOwnedPr({ assignees: pr.assignees, userName: ctx.userName });
+  return isOwnedPr({
+    assignees: pr.assignees,
+    author: pr.author ?? undefined,
+    botActorLogin: ctx.botActorLogin,
+    labels: pr.labels,
+    ownershipLabel: ctx.options.ownershipLabel,
+    userName: ctx.userName,
+  });
 }
 
 function reviewBudgetReviewerKey(user?: JsonRecord): string {
@@ -583,6 +612,8 @@ export async function handlePullRequestEvent(
   const labelNode = payload.label;
   const label = isRecord(labelNode) ? stringValue(labelNode.name) : undefined;
   const resetLabel = ctx.options.reviewResetLabel ?? DEFAULT_REVIEW_RESET_LABEL;
+  const ownershipLabel =
+    ctx.options.ownershipLabel ?? DEFAULT_OWNERSHIP_LABEL;
   if (
     action === "labeled" &&
     label?.toLowerCase() === resetLabel.toLowerCase()
@@ -637,12 +668,14 @@ export async function handlePullRequestEvent(
     );
     return;
   }
-  // Being assigned the PR is the explicit signal to take it over: evaluate CI now
-  // (forcing past the human-commit back-off — the assignment is a human handing
-  // it to us) so an already-red or already-green PR is acted on immediately,
-  // rather than only on the next lifecycle event. processCi fixes red CI or merges
-  // when green.
-  if (action === "assigned") {
+  // Assignment (PAT mode) or the ownership label (App/PAT mode) is an explicit
+  // handoff. Evaluate CI now, forcing past human-commit back-off, so a PR that
+  // was already red or green does not wait for another lifecycle event.
+  if (
+    action === "assigned" ||
+    (action === "labeled" &&
+      label?.toLowerCase() === ownershipLabel.toLowerCase())
+  ) {
     await processCi(ctx, repo.owner, repo.repo, number, pr.headSha, true);
     return;
   }
@@ -672,7 +705,13 @@ export async function handleReviewEvent(
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
   // Submitted reviews on public repositories are not collaborator-only by
   // default. Gate before workflow emission, claims, or write-capable turns.
-  if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
+  if (
+    reviewer &&
+    reviewer.toLowerCase() ===
+      (ctx.botActorLogin ?? ctx.userName).toLowerCase()
+  ) {
+    return;
+  }
   if (!isReviewAuthorAllowed(payload, ctx.options)) {
     logger(ctx).warn("githubbot_review_author_denied", {
       pr: `${repo.owner}/${repo.repo}#${number}`,
@@ -827,7 +866,8 @@ async function maybeRecordReviewResetApproval(
   if (
     !sender ||
     senderType !== "user" ||
-    sender.toLowerCase() === ctx.userName.toLowerCase()
+    sender.toLowerCase() ===
+      (ctx.botActorLogin ?? ctx.userName).toLowerCase()
   ) {
     logger(ctx).warn("githubbot_review_reset_denied", {
       pr: `${owner}/${repo}#${pr.number}`,
@@ -995,7 +1035,9 @@ async function compareReviewChange(
     const totalCommits =
       typeof data.total_commits === "number" ? data.total_commits : commits.length;
     const kinds = new Set(
-      commits.map((commit) => commitActorKind(commit, ctx.userName)),
+      commits.map((commit) =>
+        commitActorKind(commit, ctx.botActorLogin ?? ctx.userName),
+      ),
     );
     let actor: ReviewChangeActor = "unknown";
     if (totalCommits === commits.length && !kinds.has("unknown")) {
@@ -1407,11 +1449,15 @@ async function processCi(
   }
 
   // Red: back off if a human pushed the failing commit (don't step on them) —
-  // unless this is a forced takeover (the PR was just assigned to us, so the
-  // human has explicitly handed it over and we fix it regardless of who pushed).
+  // unless this is a forced takeover (assignment or the ownership label is an
+  // explicit handoff, so we fix it regardless of who pushed).
   if (!force) {
     const headAuthor = await commitAuthor(ctx, owner, repo, headSha);
-    if (headAuthor && headAuthor.toLowerCase() !== ctx.userName.toLowerCase()) {
+    if (
+      headAuthor &&
+      headAuthor.toLowerCase() !==
+        (ctx.botActorLogin ?? ctx.userName).toLowerCase()
+    ) {
       traceLog(ctx.options, "githubbot_ci_human_commit_skipped", trace, {
         author: headAuthor,
       });

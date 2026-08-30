@@ -182,6 +182,16 @@ export type GithubbotOptions = {
   githubAppInstallationId?: number;
   /** GitHub App PEM contents. Mount a Secret and read it at process startup. */
   githubAppPrivateKey?: string;
+  /**
+   * Login GitHub records for actions by this identity. In App mode this is the
+   * App slug with `[bot]`; `userName` remains the mention slug.
+   */
+  botActorLogin?: string;
+  /**
+   * Label that explicitly hands a PR or issue to lifecycle automation. Defaults
+   * to `centaur-managed`; useful for Apps, which cannot be assignees.
+   */
+  ownershipLabel?: string;
   userName?: string;
   /**
    * GitHub `author_association` values allowed to drive the conversational

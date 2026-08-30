@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
+import { DEFAULT_OWNERSHIP_LABEL } from "./pr-manager";
+import { DEFAULT_REVIEW_RESET_LABEL } from "./review-budget";
 import { positiveIntegerValue } from "./utils";
 
 const port = numberEnv("PORT", 3001);
@@ -42,12 +44,29 @@ if (!webhookSecret) {
   throw new Error("GITHUB_WEBHOOK_SECRET (or GITHUBBOT_WEBHOOK_SECRET) is required");
 }
 
-// The bot's mention name. For an App this is its slug without the `[bot]`
-// suffix; for PAT mode it is the teammate account login.
+// Keep the human-facing mention slug separate from the actor login GitHub puts
+// on App-authored events. Apps are mentioned as @slug but act as slug[bot].
 const userName =
   optionalEnv("GITHUB_BOT_USERNAME") ?? optionalEnv("GITHUBBOT_USER_NAME");
 if (!userName) {
-  throw new Error("GITHUB_BOT_USERNAME is required (the bot account's GitHub login)");
+  throw new Error(
+    "GITHUB_BOT_USERNAME is required (App mention slug or PAT account login)",
+  );
+}
+const botActorLogin =
+  optionalEnv("GITHUB_BOT_ACTOR_LOGIN") ??
+  (githubAppClientId ? `${userName}[bot]` : userName);
+if (githubAppClientId && !botActorLogin.toLowerCase().endsWith("[bot]")) {
+  throw new Error("GITHUB_BOT_ACTOR_LOGIN must end in [bot] for GitHub App auth");
+}
+const ownershipLabel =
+  optionalEnv("GITHUBBOT_OWNERSHIP_LABEL") ?? DEFAULT_OWNERSHIP_LABEL;
+const reviewResetLabel =
+  optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL") ?? DEFAULT_REVIEW_RESET_LABEL;
+if (ownershipLabel.toLowerCase() === reviewResetLabel.toLowerCase()) {
+  throw new Error(
+    "GITHUBBOT_OWNERSHIP_LABEL and GITHUBBOT_REVIEW_RESET_LABEL must differ",
+  );
 }
 
 // Full review methodology override. Inline wins; otherwise a mounted file (the
@@ -139,6 +158,7 @@ const options: GithubbotOptions = {
   allowedAuthorAssociations: listEnv("GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS"),
   apiKey: optionalEnv("GITHUBBOT_API_KEY"),
   autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
+  botActorLogin,
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
   ciFixMaxAttempts: optionalNumberEnv("GITHUBBOT_CI_FIX_MAX_ATTEMPTS"),
   reviewMaxRoundsPerEpoch: optionalNumberEnv(
@@ -155,7 +175,7 @@ const options: GithubbotOptions = {
     "GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES",
   ),
   reviewAuthorAllowlist: listEnv("GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST"),
-  reviewResetLabel: optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL"),
+  reviewResetLabel,
   workflowEvents: boolEnv("GITHUBBOT_WORKFLOW_EVENTS", false),
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
   escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
@@ -169,6 +189,7 @@ const options: GithubbotOptions = {
   reviewPrompt,
   issuePrompt,
   managementPrompt,
+  ownershipLabel,
   repositoryAllowlist: requireRepositoryAllowlist(
     listEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
   ),
