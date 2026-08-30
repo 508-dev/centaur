@@ -22,6 +22,7 @@ class BrokerCredential < ApplicationRecord
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
   PREQIN_TOKEN_ENDPOINT = Broker::CredentialGrants::PREQIN_TOKEN_ENDPOINT
+  GITHUB_API_ENDPOINT = Broker::CredentialGrants::GITHUB_API_ENDPOINT
   GRANTS = Broker::CredentialGrants::GRANTS
 
   # The access token must keep at least this much life past the scheduled
@@ -47,14 +48,14 @@ class BrokerCredential < ApplicationRecord
   # source still references the credential.
   has_one :static_secret, dependent: :nullify
 
-  attr_writer :refresh_client
+  attr_writer :refresh_client, :github_app_installation_client
 
   # Refuse to delete a credential that token_broker sources still reference: there
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
   # undeliverable. The operator must remove the references first.
   before_destroy :ensure_not_referenced
   after_commit :auto_grant_matching_principals, on: %i[create update], if: :oauth_app_id?
-  before_validation :default_preqin_token_endpoint
+  before_validation :default_fixed_token_endpoint
   before_commit :bump_referencing_principal_sync_config_versions, if: :sync_config_relevant_change?
 
   serialize :token_endpoint_headers, coder: JSON
@@ -84,6 +85,11 @@ class BrokerCredential < ApplicationRecord
   validates :client_id, presence: true, if: -> { Broker::CredentialGrants.client_id_required?(self) }
   validates :external_user_key, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE },
             length: { maximum: 128 }, allow_nil: true
+  validates :github_installation_id, format: { with: /\A[1-9]\d*\z/ },
+                                    if: :github_app_installation?
+  validates :client_id, format: { with: /\A[A-Za-z][A-Za-z0-9._-]*\z/,
+                                  message: "must be a non-numeric GitHub App Client ID" },
+                        if: :github_app_installation?
   validates :early_refresh_fraction,
             numericality: { greater_than_or_equal_to: 0, less_than: 1 }
   validates :early_refresh_slack_seconds, :max_refresh_interval_seconds, :refresh_timeout_seconds,
@@ -108,11 +114,19 @@ class BrokerCredential < ApplicationRecord
   end
 
   def preqin? = grant == "preqin"
+  def github_app_installation? = grant == "github_app_installation"
 
   # Used by broker grant strategies. Kept public so tests can inject a stub via
   # attr_writer and the strategy registry can stay outside the ActiveRecord model.
   def refresh_client
     @refresh_client ||= Broker::RefreshClient.new
+  end
+
+  # The GitHub App PEM is deliberately not stored in this record. The control
+  # plane worker reads it from the deployment's read-only secret mount, so it
+  # never reaches a proxy or sandbox and does not pass through the API/UI.
+  def github_app_installation_client
+    @github_app_installation_client ||= Broker::GithubAppInstallationClient.new
   end
 
   def refresh_scopes_for_provider
@@ -265,9 +279,11 @@ class BrokerCredential < ApplicationRecord
     errors.add(:token_endpoint_headers, "must be an object mapping header names to string values") unless valid
   end
 
-  def default_preqin_token_endpoint
-    return unless grant == "preqin"
+  def default_fixed_token_endpoint
+    return unless %w[preqin github_app_installation].include?(grant)
 
+    # These grants authenticate to provider-specific fixed endpoints. Do not
+    # allow a configurable endpoint to receive a GitHub App JWT.
     self.token_endpoint = Broker::CredentialGrants.default_token_endpoint(grant)
   end
 end

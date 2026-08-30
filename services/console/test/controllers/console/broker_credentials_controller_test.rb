@@ -128,6 +128,25 @@ module Console
       assert_equal "preqin-api-key", cred.api_key
     end
 
+    test "POST create builds a GitHub App installation credential" do
+      assert_difference -> { BrokerCredential.count } => 1 do
+        post console_broker_credentials_url, params: {
+          credential: {
+            foreign_id: "github-app-installation", name: "GitHub App installation",
+            grant: "github_app_installation", token_endpoint: "https://untrusted.example/token",
+            client_id: "Iv1.0123456789abcdef", github_installation_id: "12345678"
+          }
+        }
+      end
+
+      cred = BrokerCredential.find_by!(foreign_id: "github-app-installation")
+      assert_redirected_to console_credential_path(cred.oid)
+      assert_equal "github_app_installation", cred.grant
+      assert_equal BrokerCredential::GITHUB_API_ENDPOINT, cred.token_endpoint
+      assert_equal "12345678", cred.github_installation_id
+      assert_nil cred.refresh_token
+    end
+
     test "POST create without a token endpoint or client id is rejected without writing" do
       assert_no_difference "BrokerCredential.count" do
         post console_broker_credentials_url, params: {

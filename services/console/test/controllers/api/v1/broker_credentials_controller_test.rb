@@ -174,6 +174,59 @@ module Api
         assert created.next_attempt_at.present?
       end
 
+      test "create GitHub App installation grant pins GitHub's endpoint" do
+        body = {
+          data: {
+            foreign_id: "github-app-installation",
+            grant: "github_app_installation",
+            token_endpoint: "https://untrusted.example/token",
+            client_id: "Iv1.0123456789abcdef",
+            github_installation_id: "12345678"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["grant"]
+        assert_equal BrokerCredential::GITHUB_API_ENDPOINT, data["token_endpoint"]
+        assert_equal "Iv1.0123456789abcdef", data["client_id"]
+        assert_equal "12345678", data["github_installation_id"]
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_equal "12345678", created.github_installation_id
+        assert created.next_attempt_at.present?
+      end
+
+      test "updating a GitHub App identity discards a token minted for the prior installation" do
+        credential = BrokerCredential.create!(
+          foreign_id: "github-app-rotate",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          access_token: "ghs-old-installation-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: credential.oid), params: {
+          data: {
+            client_id: "Iv1.fedcba9876543210",
+            github_installation_id: "87654321"
+          }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        credential.reload
+        assert_nil credential.access_token
+        assert_nil credential.expires_at
+        assert_nil credential.last_refresh
+        assert credential.next_attempt_at.present?
+      end
+
       test "create rejects a missing client_id" do
         body = {
           data: {

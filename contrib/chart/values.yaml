@@ -168,6 +168,15 @@ console:
   # This does not disable Google OAuth or remove previously indexed content.
   googleDocsSync:
     enabled: false
+  # Optional GitHub App installation-token broker. When enabled, only the
+  # Console *worker* mounts this PEM and mints one-hour installation tokens.
+  # The App Client ID and installation ID live on a BrokerCredential; sandboxes
+  # receive only the short-lived token through a token_broker source.
+  githubAppInstallation:
+    enabled: false
+    existingSecretName: ""
+    privateKeySecretKey: private-key.pem
+    privateKeyMountPath: /var/run/centaur/github-app
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale

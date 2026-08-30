@@ -58,11 +58,14 @@ module Console
     # mirror the API controller's handling.
     def assign_form(credential)
       fields = credential_params.permit(:foreign_id, :name, :description,
-                                        :grant, :token_endpoint, :client_id,
+                                        :grant, :token_endpoint, :client_id, :github_installation_id,
                                         :early_refresh_slack_seconds, :early_refresh_fraction,
                                         :max_refresh_interval_seconds, :refresh_timeout_seconds)
       fields[:foreign_id] = fields[:foreign_id].presence
       credential.assign_attributes(fields)
+      if credential.github_app_installation? && (credential.github_installation_id_changed? || credential.client_id_changed?)
+        reset_refresh_state(credential, discard_access_token: true)
+      end
       credential.scopes = scope_params
       credential.token_endpoint_headers = header_params
       credential.labels = label_params
@@ -103,11 +106,19 @@ module Console
       credential.next_attempt_at = Time.current
     end
 
-    def reset_refresh_state(credential)
+    def reset_refresh_state(credential, discard_access_token: false)
       credential.dead = false
       credential.dead_reason = nil
       credential.failure_count = 0
       credential.next_attempt_at = Time.current
+      return unless discard_access_token
+
+      # A token minted for a different GitHub App or installation could have a
+      # different repository scope. Keep it unavailable until the new identity
+      # has minted a replacement.
+      credential.access_token = nil
+      credential.expires_at = nil
+      credential.last_refresh = nil
     end
 
     def credential_params
