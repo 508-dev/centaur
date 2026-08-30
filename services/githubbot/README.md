@@ -7,9 +7,10 @@ and the bot answers *in the thread* with a comment. It's built on the official
 the session logic (`session-api.ts`) and rendering are the same as the other bots; the Rust `api-rs`
 control plane is unchanged (`github:…` thread keys flow through identically).
 
-The bot acts as a **real GitHub teammate**: it authenticates with a personal access token on a
-dedicated machine-user account, so it can be `@`-mentioned, assigned, and **requested as a
-reviewer** like any other collaborator.
+The bot authenticates as either a preferred GitHub App installation or a dedicated
+machine-user PAT. Both identities can be `@`-mentioned. PAT accounts can also be assigned and
+requested as reviewers; App deployments use the explicit `centaur-managed` ownership label because
+Apps cannot be assignees or requested reviewers.
 
 ## Behavior
 
@@ -26,7 +27,7 @@ reviewer** like any other collaborator.
   a turn — the agent runs in a write-capable sandbox and posts its transcript back, so untrusted
   commenters can't steer it. Widen or open it with `GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS` (`*` allows
   everyone, e.g. a fully-private repo). Every path also requires an exact match in
-  `GITHUBBOT_REPOSITORY_ALLOWLIST`; lifecycle triggers (assignment, review-request) are gated by the
+  `GITHUBBOT_REPOSITORY_ALLOWLIST`; lifecycle triggers (ownership handoff, review-request) are gated by the
   same repository boundary plus GitHub permissions.
 - **`@`-mentioning the bot in the body of a newly-opened issue or PR** (the description, not a
   comment) → the same conversational turn runs, keyed to that issue/PR thread, with the reply posted
@@ -36,9 +37,9 @@ reviewer** like any other collaborator.
   thread's session as append-only context — no execution, no reply — so a follow-up like "actually,
   hold off" is seen by the next turn. The bot's own comments are skipped (loop guard) and inactive
   threads are ignored.
-- **Requesting the bot's review on a PR** (`pull_request` / `review_requested` targeting the bot
-  account — or a **team the bot belongs to**, whose membership is checked and briefly cached) → a
-  review turn runs on a **dedicated, isolated session thread**
+- **Requesting the PAT teammate bot's review on a PR** (`pull_request` / `review_requested`
+  targeting the bot account — or a **team the bot belongs to**, whose membership is checked and
+  briefly cached) → a review turn runs on a **dedicated, isolated session thread**
   (`github-review:{owner}/{repo}:{prNumber}`) — kept separate from the PR conversation so reviews
   never share a sandbox with chit-chat, but persistent per PR so a re-request builds on the prior
   review. The chat adapter only surfaces comment threads, so this lifecycle event is handled
@@ -48,10 +49,11 @@ reviewer** like any other collaborator.
   deployment can **fully replace** via `GITHUBBOT_REVIEW_PROMPT` / `GITHUBBOT_REVIEW_PROMPT_FILE`
   (the override is used verbatim, so org conventions supersede ours wholesale; for Splits this is
   where the overlay supplies its review guide). Webhook redeliveries are de-duplicated by delivery id.
-- **Assigning an issue to the bot** (`issues` / `assigned` to the bot account) → an autonomous work
+- **Handing an issue to the bot** (assigning the PAT account, or applying the configured ownership
+  label in App or PAT mode) → an autonomous work
   turn runs on a **dedicated, isolated session thread** (`github-issue:{owner}/{repo}:{n}`): the agent
-  reads the issue, implements a fix in its sandbox, and opens a PR (self-assigning it so it then
-  manages that PR toward merge). Like reviews, this lifecycle event is handled directly (githubbot
+  reads the issue, implements a fix in its sandbox, and opens a PR carrying the same ownership label
+  so it then manages that PR toward merge. Like reviews, this lifecycle event is handled directly (githubbot
   verifies the signature) and de-duplicated by delivery id. The **issue-work methodology** is a
   bundled, standalone default (`src/issue-prompt.ts`) that a deployment can **fully replace** via
   `GITHUBBOT_ISSUE_PROMPT` / `GITHUBBOT_ISSUE_PROMPT_FILE` (used verbatim, like the review prompt).
@@ -62,12 +64,14 @@ reviewer** like any other collaborator.
 
 ## PR self-management (v2)
 
-For PRs the bot **owns** — i.e. **assigned to the bot account** — githubbot drives the PR toward merge
-by reacting to lifecycle webhooks. Ownership is purely an assignment mechanism: assign a PR to the bot
-to have it take over, and unassign to hand it back. It only ever acts on owned PRs, and on a dedicated
-management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHub writes via `gh`.
+For PRs the bot **owns**—authored by its exact actor login, assigned to its PAT account, or carrying
+the configured ownership label—githubbot drives the PR toward merge by reacting to lifecycle
+webhooks. Remove the ownership label (and PAT assignment, if present) to hand a human-authored PR
+back. It only ever acts on owned PRs, and on a dedicated management thread
+(`github-manage:{owner}/{repo}:{n}`); the agent does its GitHub writes via `gh`.
 
-- **Take over on assign.** Being assigned a PR is the explicit signal to take it over, so the bot
+- **Take over on handoff.** Assignment or application of the ownership label is an explicit signal,
+  so the bot
   immediately evaluates CI (fixing red or merging green) rather than waiting for the next lifecycle
   event.
 - **Fix CI.** When **all** checks for a head SHA are settled (not per failing job — interwoven jobs
@@ -75,7 +79,7 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` consecutive attempts (default 3, reset when CI goes green); on
   exhaustion the bot comments tagging a human and stops. On the steady-state CI path it backs off if
   the failing head commit was authored by a human (it won't step on someone mid-edit) — except right
-  after assignment, where being assigned is an explicit hand-off, so it fixes the PR regardless of who
+  after an explicit handoff, when it fixes the PR regardless of who
   pushed last.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
   turn that reads all the feedback, validates each finding against reachable code
@@ -120,7 +124,7 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
 - **Owned-PR conversation.** An @-mention in an owned PR's conversation (or a review-comment thread)
   runs in that PR's management session too — so the bot answers with the context of the CI fixes and
   review work it's been doing on the PR — while the rendered reply still posts to the comment thread.
-  An @-mention in the conversation of an **issue assigned to the bot** likewise runs in that issue's
+  An @-mention in the conversation of an **issue owned by the bot** likewise runs in that issue's
   work session (`github-issue:…`), so the bot replies with the context of the work it's doing on it.
 
 > **Scope.** v2 targets **same-repo PRs on repos you control** (where you own the webhook). The
@@ -153,29 +157,41 @@ the same shutdown drain rather than being treated as completed work.
 
 ## Auth
 
-A personal access token for the bot's GitHub teammate account is required (`GITHUB_TOKEN`). As a
-normal user account it is natively mentionable, assignable, and requestable as a reviewer, and the
-token inherits that user's permissions. Scopes: **`repo`** (read PRs/issues, post and edit comments,
-add reactions) — and, when the agent pushes branches or opens PRs from its sandbox, **`workflow`**.
+Use exactly one controller identity:
 
-Keep this distinct from the `GITHUB_TOKEN` used by the repo-cache / sandbox tooling — that one is the
-agent's git-operations token; this one is the bot's own identity. The chart wires githubbot's token
-from a separate `GITHUBBOT_TOKEN` secret key to avoid collision.
+- Preferred for production: a fixed GitHub App installation. Set
+  `GITHUB_APP_CLIENT_ID`, `GITHUB_INSTALLATION_ID`, and either
+  `GITHUB_PRIVATE_KEY_FILE` or `GITHUB_PRIVATE_KEY`. The Client ID is passed as
+  the JWT issuer, and Octokit transparently mints and refreshes short-lived
+  installation tokens. The chart mounts the PEM from a dedicated Secret rather
+  than placing it in an environment variable.
+- Compatibility mode: a personal access token for a bot teammate account in
+  `GITHUB_TOKEN`. Keep it distinct from any repo-cache or sandbox token.
 
-GitHub App auth is also supported by the adapter (`GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY`), but the
-PAT-teammate model is what we run.
+Do not configure both modes. The bot fails startup on missing, partial, or mixed
+credentials. In App mode, `GITHUB_BOT_USERNAME` is the mention slug and the
+controller separately recognizes the event actor as `slug[bot]` (override with
+`GITHUB_BOT_ACTOR_LOGIN` only when needed). Because Apps are not normal user
+accounts, assignment and requested-review flows require a teammate PAT. App
+deployments use `GITHUBBOT_OWNERSHIP_LABEL` for explicit PR/issue handoff, and
+App-authored PRs are owned automatically.
 
 Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Issues**, **Pull
 requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Workflow runs**
-(**Issues** drives issue-work-on-assignment; the last four drive v2 PR self-management).
+(**Issues** drives assignment/ownership-label issue work; the last four drive v2 PR self-management).
 
 ## Environment
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `GITHUB_TOKEN` | ✅ | PAT for the bot's teammate account. |
+| `GITHUB_TOKEN` | one auth mode | PAT for the bot's teammate account. |
+| `GITHUB_APP_CLIENT_ID` | one auth mode | Recommended GitHub App JWT issuer (legacy `GITHUB_APP_ID` is accepted). |
+| `GITHUB_INSTALLATION_ID` | App mode | Fixed positive installation ID. |
+| `GITHUB_PRIVATE_KEY_FILE` | App mode | Preferred path to a mounted PEM; mutually exclusive with `GITHUB_PRIVATE_KEY`. |
+| `GITHUB_PRIVATE_KEY` | App mode | Inline PEM compatibility input. |
 | `GITHUB_WEBHOOK_SECRET` | ✅ | Webhook signing secret (or `GITHUBBOT_WEBHOOK_SECRET`). |
-| `GITHUB_BOT_USERNAME` | ✅ | The bot account's GitHub login — drives `@`-mention and requested-reviewer matching (or `GITHUBBOT_USER_NAME`). |
+| `GITHUB_BOT_USERNAME` | ✅ | Mention name used by the bot. For an App, use its slug without the `[bot]` suffix; for a teammate PAT, use the account login (or `GITHUBBOT_USER_NAME`). |
+| `GITHUB_BOT_ACTOR_LOGIN` | — | Exact login on bot-authored events. Defaults to `GITHUB_BOT_USERNAME[bot]` in App mode and `GITHUB_BOT_USERNAME` in PAT mode. |
 | `GITHUBBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL` / `POSTGRES_URL`). |
 | `GITHUBBOT_REPOSITORY_ALLOWLIST` | ✅ | Comma-separated exact `owner/repository` names. Empty/unset is rejected at startup; wildcards are not supported. Signed events for other repositories are acknowledged but ignored before chat state or agent work is created. |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
@@ -194,6 +210,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
 | `GITHUBBOT_AUTO_MERGE` | — | Auto-merge owned PRs when mergeable. Default `true`. |
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
+| `GITHUBBOT_OWNERSHIP_LABEL` | — | Exact App-compatible PR/issue handoff label. Default `centaur-managed`; must differ from the review-reset label. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
 | `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
 | `GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH` | — | Review heads handled per reviewer within one epoch. Default 3 (initial review plus two validations). |
@@ -209,10 +226,16 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
 | `GITHUBBOT_SHUTDOWN_DRAIN_MS` | — | How long to let in-flight turns finish on `SIGTERM` before exiting. Default `25000`; the chart derives it from the pod's termination grace period. |
 
+The chart checksum includes the mounted private-key Secret's live resource
+version. Rotate the Secret through the same Helm reconcile used for deployment;
+the resulting pod-template change restarts githubbot, which reads the PEM once
+at process startup. Do not edit the Secret out of band without reconciling the
+release.
+
 ## Tests
 
 `bun test test` — unit tests for the override flag parser, the GitHub thread-key parsing / context
-preamble, the review-request trigger gating (incl. team requests), the issue-assignment gating, the
-v2 PR-manager decision logic (CI evaluation, assignment-based ownership, merge gating, the CI-fix
+preamble, the review-request trigger gating (incl. team requests), the issue-ownership handoff, the
+v2 PR-manager decision logic (CI evaluation, actor/label/assignment ownership, merge gating, the CI-fix
 counter / escalation, and the merge-claim release-on-failure), the author-association gate, body
 mentions, and the per-session serialization queue.

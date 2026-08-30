@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   assigneeLogins,
   isAssignedToBot,
+  isIssueOwned,
+  isIssueWorkSignal,
   issueWorkThreadKey,
+  labelNames,
 } from "../src/issue-manager";
 
 describe("isAssignedToBot", () => {
@@ -38,6 +41,73 @@ describe("assigneeLogins", () => {
     expect(assigneeLogins(undefined)).toEqual([]);
     expect(assigneeLogins(null)).toEqual([]);
     expect(assigneeLogins("nope")).toEqual([]);
+  });
+});
+
+describe("App-compatible issue ownership", () => {
+  test("recognizes the configured label case-insensitively", () => {
+    expect(
+      isIssueOwned({
+        assignees: [],
+        labels: ["Centaur-Managed"],
+        ownershipLabel: "centaur-managed",
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+  });
+
+  test("only a matching labeled event starts label-based work", () => {
+    const base = {
+      assignees: [] as string[],
+      labels: ["centaur-managed"],
+      ownershipLabel: "centaur-managed",
+      userName: "centaur-bot",
+    };
+    expect(
+      isIssueWorkSignal({
+        ...base,
+        action: "labeled",
+        eventLabel: "Centaur-Managed",
+      }),
+    ).toBe(true);
+    expect(
+      isIssueWorkSignal({ ...base, action: "opened", eventLabel: "centaur-managed" }),
+    ).toBe(false);
+    expect(
+      isIssueWorkSignal({ ...base, action: "labeled", eventLabel: "bug" }),
+    ).toBe(false);
+  });
+
+  test("retains PAT assignment as an explicit work signal", () => {
+    expect(
+      isIssueWorkSignal({
+        action: "assigned",
+        assignees: ["Centaur-Bot"],
+        labels: [],
+        userName: "centaur-bot",
+      }),
+    ).toBe(true);
+  });
+
+  test("does not treat an App mention slug as an assignable account", () => {
+    expect(
+      isIssueWorkSignal({
+        action: "assigned",
+        assignees: ["centaur-bot"],
+        botActorLogin: "centaur-bot[bot]",
+        labels: [],
+        userName: "centaur-bot",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("labelNames", () => {
+  test("accepts GitHub's string and object label shapes", () => {
+    expect(labelNames(["bug", { name: "centaur-managed" }, null, {}])).toEqual([
+      "bug",
+      "centaur-managed",
+    ]);
   });
 });
 

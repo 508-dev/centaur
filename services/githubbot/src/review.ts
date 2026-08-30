@@ -13,6 +13,7 @@ import type {
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
 type ReviewHandlerInput = {
+  botActorLogin?: string;
   botUserName: string;
   deliveryId: string;
   octokit: GitHubAdapter["octokit"];
@@ -90,8 +91,13 @@ export function handleReviewRequest(
   // belongs to a requested team (resolved asynchronously below). A request that
   // names a different individual reviewer and no team is not ours.
   const reviewer = stringValue(payload.requested_reviewer?.login);
+  const directReviewSupported =
+    (input.botActorLogin ?? input.botUserName).toLowerCase() ===
+    input.botUserName.toLowerCase();
   const directMatch =
-    !!reviewer && reviewer.toLowerCase() === input.botUserName.toLowerCase();
+    directReviewSupported &&
+    !!reviewer &&
+    reviewer.toLowerCase() === input.botUserName.toLowerCase();
   const teamSlug = stringValue(payload.requested_team?.slug);
   if (!directMatch && !teamSlug) return null;
 

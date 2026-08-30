@@ -48,6 +48,17 @@ export function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+export function positiveIntegerValue(value: string, name: string): number {
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(`${name} must be a positive decimal integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a safe positive decimal integer`);
+  }
+  return parsed;
+}
+
 export function isJsonObject(value: unknown): value is JsonObject {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

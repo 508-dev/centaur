@@ -18,7 +18,7 @@ describe("mentionsBot", () => {
 
 type Spies = { reactions: number; comments: number };
 
-function makeCtx(spies: Spies): PrManagerContext {
+function makeCtx(spies: Spies, botActorLogin?: string): PrManagerContext {
   const m = new Map<string, unknown>();
   const state = {
     get: async (k: string) => m.get(k),
@@ -32,6 +32,7 @@ function makeCtx(spies: Spies): PrManagerContext {
     },
   };
   return {
+    botActorLogin,
     octokit: {
       rest: {
         reactions: {
@@ -119,6 +120,16 @@ describe("handleBodyMention", () => {
         makeCtx({ reactions: 0, comments: 0 }),
         "pull_request",
         openedPr("@centaur-bot do it", "MEMBER", "centaur-bot"),
+      ),
+    ).toBeNull();
+  });
+
+  test("ignores an App-authored subject using the actor login", () => {
+    expect(
+      handleBodyMention(
+        makeCtx({ reactions: 0, comments: 0 }, "centaur-bot[bot]"),
+        "pull_request",
+        openedPr("@centaur-bot do it", "MEMBER", "centaur-bot[bot]"),
       ),
     ).toBeNull();
   });

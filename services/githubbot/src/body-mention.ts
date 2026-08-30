@@ -49,7 +49,13 @@ export function handleBodyMention(
 
   // Never act on the bot's own issue/PR (it opens PRs during issue work).
   const author = stringValue(isRecord(node.user) ? node.user.login : undefined);
-  if (author && author.toLowerCase() === ctx.userName.toLowerCase()) return null;
+  if (
+    author &&
+    author.toLowerCase() ===
+      (ctx.botActorLogin ?? ctx.userName).toLowerCase()
+  ) {
+    return null;
+  }
 
   // Same trust gate as the comment path, read from the issue/PR author.
   const allowed = resolveAllowedAuthorAssociations(

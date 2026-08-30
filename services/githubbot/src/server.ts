@@ -1,14 +1,44 @@
 import { readFileSync } from "node:fs";
 import { requireRepositoryAllowlist } from "./authorization";
 import { drainBackgroundWork } from "./context";
-import { createGithubbot, type GithubbotOptions } from "./index";
+import {
+  createGithubbot,
+  resolveBotActorLogin,
+  type GithubbotOptions,
+} from "./index";
+import { DEFAULT_OWNERSHIP_LABEL } from "./pr-manager";
+import { DEFAULT_REVIEW_RESET_LABEL } from "./review-budget";
+import { positiveIntegerValue } from "./utils";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
 
-// Personal access token for the bot's GitHub teammate account (the bot acts as a
-// real GitHub user — it can be requested as a reviewer, @-mentioned, assigned).
-const token = requiredEnv("GITHUB_TOKEN");
+// Use either a teammate PAT or a fixed GitHub App installation. The App path
+// reads its PEM from a mounted Secret and lets Octokit rotate the one-hour
+// installation token transparently; the PEM never enters the pod environment.
+const token = optionalEnv("GITHUB_TOKEN");
+const githubAppClientId =
+  optionalEnv("GITHUB_APP_CLIENT_ID") ?? optionalEnv("GITHUB_APP_ID");
+const githubAppInstallationId = optionalNumberEnv("GITHUB_INSTALLATION_ID");
+const githubAppPrivateKeyInline = optionalEnv("GITHUB_PRIVATE_KEY");
+const githubAppPrivateKeyFile = optionalEnv("GITHUB_PRIVATE_KEY_FILE");
+if (githubAppPrivateKeyInline && githubAppPrivateKeyFile) {
+  throw new Error(
+    "GITHUB_PRIVATE_KEY and GITHUB_PRIVATE_KEY_FILE are mutually exclusive",
+  );
+}
+let githubAppPrivateKey = githubAppPrivateKeyInline;
+if (!githubAppPrivateKey && githubAppPrivateKeyFile) {
+  try {
+    githubAppPrivateKey = readFileSync(githubAppPrivateKeyFile, "utf8");
+  } catch (error) {
+    throw new Error(
+      `GITHUB_PRIVATE_KEY_FILE (${githubAppPrivateKeyFile}) could not be read: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
 
 // Signing secret configured on the GitHub repo/org webhook. The adapter verifies
 // comment webhooks; githubbot verifies the pull_request (review-request) webhook.
@@ -18,12 +48,30 @@ if (!webhookSecret) {
   throw new Error("GITHUB_WEBHOOK_SECRET (or GITHUBBOT_WEBHOOK_SECRET) is required");
 }
 
-// The bot account's GitHub login. Drives @-mention detection and matching the
-// requested reviewer on review-request webhooks, so it must be the real login.
+// Keep the human-facing mention slug separate from the actor login GitHub puts
+// on App-authored events. Apps are mentioned as @slug but act as slug[bot].
 const userName =
   optionalEnv("GITHUB_BOT_USERNAME") ?? optionalEnv("GITHUBBOT_USER_NAME");
 if (!userName) {
-  throw new Error("GITHUB_BOT_USERNAME is required (the bot account's GitHub login)");
+  throw new Error(
+    "GITHUB_BOT_USERNAME is required (App mention slug or PAT account login)",
+  );
+}
+const botActorLogin = resolveBotActorLogin(
+  {
+    botActorLogin: optionalEnv("GITHUB_BOT_ACTOR_LOGIN"),
+    githubAppClientId,
+  },
+  userName,
+);
+const ownershipLabel =
+  optionalEnv("GITHUBBOT_OWNERSHIP_LABEL") ?? DEFAULT_OWNERSHIP_LABEL;
+const reviewResetLabel =
+  optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL") ?? DEFAULT_REVIEW_RESET_LABEL;
+if (ownershipLabel.toLowerCase() === reviewResetLabel.toLowerCase()) {
+  throw new Error(
+    "GITHUBBOT_OWNERSHIP_LABEL and GITHUBBOT_REVIEW_RESET_LABEL must differ",
+  );
 }
 
 // Full review methodology override. Inline wins; otherwise a mounted file (the
@@ -115,6 +163,7 @@ const options: GithubbotOptions = {
   allowedAuthorAssociations: listEnv("GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS"),
   apiKey: optionalEnv("GITHUBBOT_API_KEY"),
   autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
+  botActorLogin,
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
   ciFixMaxAttempts: optionalNumberEnv("GITHUBBOT_CI_FIX_MAX_ATTEMPTS"),
   reviewMaxRoundsPerEpoch: optionalNumberEnv(
@@ -131,7 +180,7 @@ const options: GithubbotOptions = {
     "GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES",
   ),
   reviewAuthorAllowlist: listEnv("GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST"),
-  reviewResetLabel: optionalEnv("GITHUBBOT_REVIEW_RESET_LABEL"),
+  reviewResetLabel,
   workflowEvents: boolEnv("GITHUBBOT_WORKFLOW_EVENTS", false),
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
   escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
@@ -145,11 +194,15 @@ const options: GithubbotOptions = {
   reviewPrompt,
   issuePrompt,
   managementPrompt,
+  ownershipLabel,
   repositoryAllowlist: requireRepositoryAllowlist(
     listEnv("GITHUBBOT_REPOSITORY_ALLOWLIST"),
   ),
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
+  githubAppClientId,
+  githubAppInstallationId,
+  githubAppPrivateKey,
   userName,
   webhookSecret,
   logger: consoleLogger,
@@ -237,11 +290,7 @@ function mergeMethodEnv(): "merge" | "squash" | "rebase" | undefined {
 function optionalNumberEnv(name: string): number | undefined {
   const value = optionalEnv(name);
   if (!value) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-  return parsed;
+  return positiveIntegerValue(value, name);
 }
 
 function log(

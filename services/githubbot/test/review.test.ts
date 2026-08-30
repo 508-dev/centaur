@@ -80,6 +80,15 @@ describe("handleReviewRequest", () => {
     expect(result).not.toBeNull();
   });
 
+  test("does not treat an App actor as a requestable reviewer", () => {
+    const result = handleReviewRequest(reviewRequestedBody("review-bot[bot]"), {
+      ...input,
+      botActorLogin: "review-bot[bot]",
+      state: stubState(),
+    });
+    expect(result).toBeNull();
+  });
+
   test("de-duplicates a redelivered review request", async () => {
     const state = stubState();
     // First delivery claims the dedup key; second (same id) finds it taken.
