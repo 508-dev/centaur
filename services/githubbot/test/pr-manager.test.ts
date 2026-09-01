@@ -4,6 +4,7 @@ import {
   decideMerge,
   handleCiEvent,
   handlePullRequestEvent,
+  handleReviewFindingDispositionComment,
   handleReviewEvent,
   isBotAssignmentHandoff,
   isOwnedPr,
@@ -531,6 +532,7 @@ describe("bounded review epochs", () => {
 
   function budgetCtx(input?: {
     actor?: "bot" | "human";
+    comparisonCommitMessage?: string | (() => string);
     comparisonFile?: string;
     comments?: string[];
     headSha?: string;
@@ -540,6 +542,16 @@ describe("bounded review epochs", () => {
     permission?: string;
     removedLabels?: string[];
     reviewAuthorAllowlist?: string[];
+    reviewFindings?: Record<
+      number,
+      Array<{
+        body: string;
+        diff_hunk?: string;
+        id: number;
+        line?: number;
+        path?: string;
+      }>
+    >;
     state?: ReturnType<typeof makeState>;
   }): PrManagerContext {
     let headSha = input?.headSha ?? "head-1";
@@ -570,6 +582,17 @@ describe("bounded review epochs", () => {
               if (input?.merges) input.merges.count += 1;
               return { data: {} };
             },
+            listCommentsForReview: async (request: { review_id: number }) => ({
+              data: input?.reviewFindings?.[request.review_id] ?? [
+                {
+                  body: `finding-${request.review_id}`,
+                  diff_hunk: "@@ -1 +1 @@\n-old\n+new",
+                  id: request.review_id * 10,
+                  line: 10,
+                  path: "src/implementation.ts",
+                },
+              ],
+            }),
           },
           repos: {
             compareCommitsWithBasehead: async (request: {
@@ -586,9 +609,12 @@ describe("bounded review epochs", () => {
                           : { login: "alice", type: "User" },
                       commit: {
                         message:
-                          actor === "bot"
-                            ? "fix review\n\nCentaur-Automation: true"
-                            : "revise implementation",
+                          typeof input?.comparisonCommitMessage === "function"
+                            ? input.comparisonCommitMessage()
+                            : input?.comparisonCommitMessage ??
+                              (actor === "bot"
+                                ? "fix review\n\nCentaur-Automation: true"
+                                : "revise implementation"),
                       },
                     },
                   ],
@@ -688,6 +714,149 @@ describe("bounded review epochs", () => {
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({ roundsUsed: 1 });
+  });
+
+  test("does not spend another round rediscovering an evidence-rejected finding", async () => {
+    const state = makeState();
+    const sharedFinding = {
+      body: "The repository allowlist is not checked before token minting.",
+      diff_hunk: "@@ -1 +1 @@\n-unchecked\n+checked",
+      line: 20,
+      path: "src/policy.ts",
+    };
+    const ctx = budgetCtx({
+      reviewFindings: {
+        40: [{ ...sharedFinding, id: 400 }],
+        41: [{ ...sharedFinding, id: 410, line: 25 }],
+      },
+      state,
+    });
+
+    await handleReviewEvent(ctx, submittedReview(40, "head-1"));
+    const initial = (await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    )) as { findingLedger: Record<string, unknown>; roundsUsed: number };
+    const fingerprint = Object.keys(initial.findingLedger)[0];
+    expect(fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+    if (!fingerprint) throw new Error("missing finding fingerprint");
+
+    expect(
+      await handleReviewFindingDispositionComment(
+        ctx,
+        JSON.stringify({
+          action: "created",
+          comment: {
+            body:
+              "Centaur-Finding-Evidence: repository-token broker middleware rejects every unlisted repository ID.\n\n" +
+              `<!-- centaur-review-finding ${fingerprint} review:40 rejected -->`,
+            id: 401,
+            in_reply_to_id: 400,
+            user: { login: "centaur-bot" },
+          },
+          pull_request: { number: 7 },
+          repository: { full_name: "base/repo" },
+        }),
+      ),
+    ).toBe(true);
+
+    await handleReviewEvent(
+      ctx,
+      submittedReview(41, "head-1", {
+        id: 202,
+        login: "second-reviewer",
+      }),
+    );
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      findingLedger: {
+        [fingerprint]: {
+          disposition: "rejected",
+          dispositionCommentId: 401,
+        },
+      },
+      reviewerRoundsUsed: { "github-user:101": 1 },
+      roundsUsed: 1,
+    });
+  });
+
+  test("ignores an accepted marker until a descendant repair is proven", async () => {
+    const state = makeState();
+    const ctx = budgetCtx({ state });
+    await handleReviewEvent(ctx, submittedReview(42, "head-1"));
+    const initial = (await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    )) as { findingLedger: Record<string, { disposition: string }> };
+    const fingerprint = Object.keys(initial.findingLedger)[0];
+    if (!fingerprint) throw new Error("missing finding fingerprint");
+
+    expect(
+      await handleReviewFindingDispositionComment(
+        ctx,
+        JSON.stringify({
+          action: "created",
+          comment: {
+            body: `<!-- centaur-review-finding ${fingerprint} review:42 accepted -->`,
+            id: 421,
+            in_reply_to_id: 420,
+            user: { login: "centaur-bot" },
+          },
+          pull_request: { number: 7 },
+          repository: { full_name: "base/repo" },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      findingLedger: { [fingerprint]: { disposition: "pending" } },
+    });
+  });
+
+  test("accepts a finding only after an exact-path repair with its trailer", async () => {
+    const state = makeState();
+    let fingerprint = "";
+    const ctx = budgetCtx({
+      comparisonCommitMessage: () =>
+        `fix review\n\nCentaur-Automation: true\nCentaur-Review-Finding: ${fingerprint}`,
+      comparisonFile: "src/implementation.ts",
+      state,
+    });
+    await handleReviewEvent(ctx, submittedReview(43, "head-1"));
+    const initial = (await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    )) as { findingLedger: Record<string, { disposition: string }> };
+    fingerprint = Object.keys(initial.findingLedger)[0] ?? "";
+    if (!fingerprint) throw new Error("missing finding fingerprint");
+    setHeadSha(ctx, "head-2");
+
+    await handleReviewFindingDispositionComment(
+      ctx,
+      JSON.stringify({
+        action: "created",
+        comment: {
+          body: `<!-- centaur-review-finding ${fingerprint} review:43 accepted -->`,
+          id: 431,
+          in_reply_to_id: 430,
+          user: { login: "centaur-bot" },
+        },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+      }),
+    );
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      findingLedger: {
+        [fingerprint]: {
+          disposition: "accepted",
+          dispositionCommentId: 431,
+        },
+      },
+    });
   });
 
   test("admits the final review round but pauses merge before its descendant", async () => {
@@ -932,7 +1101,7 @@ describe("bounded review epochs", () => {
     });
   });
 
-  test("uses the latest reviewed range for authorship while keeping cumulative materiality", async () => {
+  test("uses the latest reviewed range for risk and authorship", async () => {
     const state = makeState();
     await state.set("centaur-githubbot:review-budget:base/repo#7", {
       anchorHeadSha: "head-1",
@@ -984,7 +1153,7 @@ describe("bounded review epochs", () => {
     await handleReviewEvent(ctx, submittedReview(8, "head-3"));
     await drainBackgroundWork(5_000);
 
-    expect(compared).toEqual(["head-1...head-3", "head-2...head-3"]);
+    expect(compared).toEqual(["head-2...head-3"]);
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
@@ -1063,7 +1232,7 @@ describe("bounded review epochs", () => {
     await handleReviewEvent(ctx, submittedReview(34, "head-3"));
     await drainBackgroundWork(5_000);
 
-    expect(compared).toEqual(["head-1...head-3", "head-2...head-3"]);
+    expect(compared).toEqual(["head-2...head-3"]);
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
@@ -1121,7 +1290,7 @@ describe("bounded review epochs", () => {
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({
       pausedHeadSha: "head-2",
-      pauseReason: "reviewer_round_budget_exhausted",
+      pauseReason: "automation_material_change_requires_reset",
     });
   });
 
@@ -2528,6 +2697,17 @@ describe("management turn reaction ack", () => {
           pulls: {
             get: async () => ({
               data: prPayload({ headRepoFullName: "base/repo" }),
+            }),
+            listCommentsForReview: async () => ({
+              data: [
+                {
+                  body: "A concrete review finding.",
+                  diff_hunk: "@@ -1 +1 @@\n-old\n+new",
+                  id: 550,
+                  line: 1,
+                  path: "src/implementation.ts",
+                },
+              ],
             }),
             merge: async () => ({ data: {} }),
           },

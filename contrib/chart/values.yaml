@@ -698,6 +698,10 @@ githubbot:
   reviewMaxRoundsPerEpoch: 3
   reviewMaxTotalRoundsPerEpoch: 6
   reviewMaxEpochs: 3
+  # One concrete inline P0/security finding may interrupt an exhausted PR-wide
+  # or inconclusive budget without resetting an epoch. Hard-capped at 16;
+  # further interrupts require a human reset.
+  reviewMaxSecurityInterruptsPerPr: 1
   reviewMaterialChangeLines: 200
   reviewMaterialChangeFiles: 8
   # Exact, comma-separated GitHub logins for trusted reviewer bots whose
