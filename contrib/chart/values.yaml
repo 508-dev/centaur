@@ -768,9 +768,12 @@ discordbot:
   continuationTtlMs: 86400000
   ingressMaxEventAgeMs: 300000
   ingressDeliveryTtlMs: 604800000
-  # Bot user/application/webhook IDs explicitly admitted at the transport
-  # boundary. A matching bot still needs a reviewed role binding; empty denies.
-  triggerBotAllowlist: ""
+  # Exact non-human identities bound to an existing, non-approver role policy.
+  # A bare bot/webhook allowlist is intentionally insufficient: the identity
+  # must select one reviewed bundle and cannot approve a proposal.
+  triggerBotBindings: []
+  # - identity_id: "100000000000000001" # bot user, application, or webhook ID
+  #   role_id: "100000000000000002"     # one entry in roleBindings
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.

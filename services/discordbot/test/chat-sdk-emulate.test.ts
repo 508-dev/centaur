@@ -51,6 +51,7 @@ const USER_ID = "100000000000000001";
 const OTHER_USER_ID = "100000000000000002";
 const TRIGGER_BOT_ID = "400000000000000001";
 const TRIGGER_BOT_APPLICATION_ID = "400000000000000002";
+const TRIGGER_BOT_WEBHOOK_ID = "400000000000000003";
 const GUILD_ID = "200000000000000001";
 const CHANNEL_ID = "300000000000000001";
 const TRIGGER_ROLE_ID = "500000000000000001";
@@ -1423,9 +1424,13 @@ describe("discordbot", () => {
     expect(codexApi.creates).toHaveLength(0);
     expect(codexApi.executes).toHaveLength(0);
 
-    // Bot-authored messages need both the explicit immutable bot allowlist and
-    // the same reviewed role capability policy as a human actor.
-    bot = createTestBot({ triggerBotAllowlist: [TRIGGER_BOT_ID] });
+    // A bot's exact identity, not fabricated member.roles, selects its static
+    // reviewed permission bundle.
+    bot = createTestBot({
+      triggerBotBindings: [
+        { identityId: TRIGGER_BOT_ID, roleId: TRIGGER_ROLE_ID },
+      ],
+    });
     const threadId = discordApi.nextId();
     discordApi.seedThreadChannel(threadId, CHANNEL_ID);
     const allowedBotMentionId = await dispatchMessage({
@@ -1434,16 +1439,22 @@ describe("discordbot", () => {
       channelId: threadId,
       content: `<@${APP_ID}> from another bot`,
       mention: true,
+      roleIds: [],
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitForSettle(threadId, allowedBotMentionId);
     expect(codexApi.executes).toHaveLength(1);
     codexApi.reset();
 
-    // Application and webhook IDs accepted by durable admission must survive
-    // the adapter's later bot-forwarding hook as the same policy identity.
+    // Application and webhook identities use that same explicit static bundle
+    // with no human role fixture.
     bot = createTestBot({
-      triggerBotAllowlist: [TRIGGER_BOT_APPLICATION_ID],
+      triggerBotBindings: [
+        {
+          identityId: TRIGGER_BOT_APPLICATION_ID,
+          roleId: TRIGGER_ROLE_ID,
+        },
+      ],
     });
     const applicationThreadId = discordApi.nextId();
     discordApi.seedThreadChannel(applicationThreadId, CHANNEL_ID);
@@ -1454,9 +1465,31 @@ describe("discordbot", () => {
       channelId: applicationThreadId,
       content: `<@${APP_ID}> from an allowlisted application`,
       mention: true,
+      roleIds: [],
       thread: { id: applicationThreadId, parentId: CHANNEL_ID },
     });
     await waitForSettle(applicationThreadId, applicationBotMentionId);
+    expect(codexApi.executes).toHaveLength(1);
+    codexApi.reset();
+
+    bot = createTestBot({
+      triggerBotBindings: [
+        { identityId: TRIGGER_BOT_WEBHOOK_ID, roleId: TRIGGER_ROLE_ID },
+      ],
+    });
+    const webhookThreadId = discordApi.nextId();
+    discordApi.seedThreadChannel(webhookThreadId, CHANNEL_ID);
+    const webhookMentionId = await dispatchMessage({
+      authorBot: true,
+      authorId: TRIGGER_BOT_ID,
+      channelId: webhookThreadId,
+      content: `<@${APP_ID}> from an allowlisted webhook`,
+      mention: true,
+      roleIds: [],
+      thread: { id: webhookThreadId, parentId: CHANNEL_ID },
+      webhookId: TRIGGER_BOT_WEBHOOK_ID,
+    });
+    await waitForSettle(webhookThreadId, webhookMentionId);
     expect(codexApi.executes).toHaveLength(1);
     codexApi.reset();
 

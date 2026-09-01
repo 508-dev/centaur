@@ -147,8 +147,13 @@ export type DiscordbotOptions = {
   state?: StateAdapter;
   stateKeyPrefix?: string;
   /**
-   * Discord delta (mirrors slackbotv2's `triggerBotAllowlist`): bot user ids
-   * whose messages may trigger/append despite being bot-authored.
+   * Exact bot/application/webhook identities bound to an existing, non-approver
+   * Discord permission bundle. Empty is deny-by-default.
+   */
+  triggerBotBindings?: readonly DiscordTriggerBotBinding[];
+  /**
+   * @deprecated An identity allowlist without a reviewed policy bundle never
+   * authorizes bot work. Use `triggerBotBindings` instead.
    */
   triggerBotAllowlist?: readonly string[];
   /**
@@ -173,6 +178,14 @@ export type DiscordRoleBinding = {
   /** Exact owner/repository names; wildcards are forbidden. */
   repositoryScope: readonly string[];
   /** Immutable numeric Discord role ID. */
+  roleId: string;
+};
+
+/** A verified non-human Discord identity bound to one existing role policy. */
+export type DiscordTriggerBotBinding = {
+  /** Immutable bot user, application, or webhook snowflake. */
+  identityId: string;
+  /** Existing reviewed Discord role binding that supplies the exact bundle. */
   roleId: string;
 };
 

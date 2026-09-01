@@ -78,9 +78,9 @@ spec:
               value: {{ $channelAllowlist | quote }}
             - name: DISCORDBOT_ROLE_BINDINGS_JSON
               value: {{ $roleBindings | toJson | quote }}
-{{- if .Values.discordbot.triggerBotAllowlist }}
-            - name: DISCORDBOT_TRIGGER_BOT_ALLOWLIST
-              value: {{ .Values.discordbot.triggerBotAllowlist | quote }}
+{{- if gt (len .Values.discordbot.triggerBotBindings) 0 }}
+            - name: DISCORDBOT_TRIGGER_BOT_BINDINGS_JSON
+              value: {{ .Values.discordbot.triggerBotBindings | toJson | quote }}
 {{- end }}
             - name: DISCORDBOT_CONTINUATION_TTL_MS
               value: {{ .Values.discordbot.continuationTtlMs | quote }}

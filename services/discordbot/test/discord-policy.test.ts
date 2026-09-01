@@ -1,12 +1,20 @@
 import { describe, expect, it } from "bun:test";
 import {
   parseDiscordRoleBindings,
+  parseDiscordTriggerBotBindings,
   resolveDiscordPermissionBundle,
+  resolveDiscordTriggerBotPermissionBundle,
 } from "../src/discord-policy";
-import type { DiscordbotOptions, DiscordRoleBinding } from "../src/types";
+import type {
+  DiscordbotOptions,
+  DiscordRoleBinding,
+  DiscordTriggerBotBinding,
+} from "../src/types";
 
 const ROLE_A = "500000000000000001";
 const ROLE_B = "500000000000000002";
+const BOT_ID = "600000000000000001";
+const APPLICATION_ID = "600000000000000002";
 
 function binding(
   overrides: Partial<DiscordRoleBinding> = {},
@@ -179,5 +187,76 @@ describe("resolveDiscordPermissionBundle", () => {
       decision: "deny",
       reason: "role_policy_ambiguous",
     });
+  });
+});
+
+describe("trigger bot policy bindings", () => {
+  function triggerBinding(
+    overrides: Partial<DiscordTriggerBotBinding> = {},
+  ): DiscordTriggerBotBinding {
+    return { identityId: BOT_ID, roleId: ROLE_A, ...overrides };
+  }
+
+  it("binds an exact non-human identity to one existing non-approver bundle", () => {
+    const parsed = parseDiscordTriggerBotBindings(
+      JSON.stringify([{ identity_id: BOT_ID, role_id: ROLE_A }]),
+      [binding()],
+    );
+    expect(parsed).toEqual([triggerBinding()]);
+
+    const resolution = resolveDiscordTriggerBotPermissionBundle(
+      { applicationId: APPLICATION_ID, authorId: BOT_ID },
+      { ...options([binding()]), triggerBotBindings: parsed },
+    );
+    expect(resolution).toEqual({
+      decision: "allow",
+      bundle: expect.objectContaining({
+        principalRole: "discord-observer",
+        sourceRoleId: ROLE_A,
+      }),
+    });
+  });
+
+  it("rejects malformed, ambiguous, unknown, and approver bot bindings", () => {
+    const invalid = [
+      "not-json",
+      "[]",
+      JSON.stringify([{ identity_id: BOT_ID, role_id: ROLE_B }]),
+      JSON.stringify([{ identity_id: BOT_ID, role_id: ROLE_A, extra: true }]),
+      JSON.stringify([
+        { identity_id: BOT_ID, role_id: ROLE_A },
+        { identity_id: BOT_ID, role_id: ROLE_A },
+      ]),
+    ];
+    for (const raw of invalid) {
+      expect(() => parseDiscordTriggerBotBindings(raw, [binding()])).toThrow();
+    }
+    expect(() =>
+      parseDiscordTriggerBotBindings(
+        JSON.stringify([{ identity_id: BOT_ID, role_id: ROLE_A }]),
+        [binding({ canApprove: true })],
+      ),
+    ).toThrow(/cannot authorize proposal approval/);
+    expect(
+      resolveDiscordTriggerBotPermissionBundle(
+        { authorId: BOT_ID, webhookId: APPLICATION_ID },
+        {
+          ...options([binding(), binding({ roleId: ROLE_B })]),
+          triggerBotBindings: [
+            triggerBinding(),
+            triggerBinding({ identityId: APPLICATION_ID, roleId: ROLE_B }),
+          ],
+        },
+      ),
+    ).toEqual({ decision: "deny", reason: "role_policy_ambiguous" });
+    expect(
+      resolveDiscordTriggerBotPermissionBundle(
+        { authorId: BOT_ID },
+        {
+          ...options([binding({ canApprove: true })]),
+          triggerBotBindings: [triggerBinding()],
+        },
+      ),
+    ).toEqual({ decision: "deny", reason: "role_not_authorized" });
   });
 });

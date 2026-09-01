@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
-import type { DiscordbotOptions, DiscordRoleBinding } from "./types";
+import type {
+  DiscordbotOptions,
+  DiscordRoleBinding,
+  DiscordTriggerBotBinding,
+} from "./types";
 
 const CAPABILITY_CLASS = /^[a-z][a-z0-9:_-]{0,63}$/;
 const PRINCIPAL_ROLE = /^[a-z0-9][a-z0-9._:-]{0,127}$/i;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const PROJECT = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MAX_SCOPE_ENTRIES = 64;
+const DISCORD_SNOWFLAKE = /^\d{16,22}$/;
 
 export type DiscordPermissionBundle = {
   canApprove: boolean;
@@ -54,7 +59,7 @@ export function parseDiscordRoleBindings(
       record.principal_role,
       `binding ${index} principal_role`,
     );
-    if (!/^\d{16,22}$/.test(roleId)) {
+    if (!DISCORD_SNOWFLAKE.test(roleId)) {
       throw new Error(`binding ${index} role_id must be a numeric Discord ID`);
     }
     if (roleIds.has(roleId)) {
@@ -78,6 +83,74 @@ export function parseDiscordRoleBindings(
       repositoryScope: repositoryArray(record.repository_scope, index),
       roleId,
     };
+  });
+}
+
+/**
+ * Parse exact non-human identity bindings. The referenced role is reused as
+ * the capability bundle, rather than treating a bot/webhook as a member with
+ * caller-supplied roles. Bot identities cannot receive proposal approval.
+ */
+export function parseDiscordTriggerBotBindings(
+  raw: string | undefined,
+  roleBindings: readonly DiscordRoleBinding[] | undefined,
+): DiscordTriggerBotBinding[] | undefined {
+  if (!raw?.trim()) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("DISCORDBOT_TRIGGER_BOT_BINDINGS_JSON must be valid JSON");
+  }
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(
+      "DISCORDBOT_TRIGGER_BOT_BINDINGS_JSON must be a non-empty array",
+    );
+  }
+  const roleById = new Map(roleBindings?.map((binding) => [binding.roleId, binding]));
+  if (roleById.size === 0) {
+    throw new Error("trigger bot bindings require reviewed Discord role bindings");
+  }
+  const identityIds = new Set<string>();
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`trigger bot binding ${index} must be an object`);
+    }
+    const record = item as Record<string, unknown>;
+    if (
+      Object.keys(record).length !== 2 ||
+      !Object.hasOwn(record, "identity_id") ||
+      !Object.hasOwn(record, "role_id")
+    ) {
+      throw new Error(
+        `trigger bot binding ${index} must contain only identity_id and role_id`,
+      );
+    }
+    const identityId = requiredString(
+      record.identity_id,
+      `trigger bot binding ${index} identity_id`,
+    );
+    const roleId = requiredString(
+      record.role_id,
+      `trigger bot binding ${index} role_id`,
+    );
+    if (!DISCORD_SNOWFLAKE.test(identityId) || !DISCORD_SNOWFLAKE.test(roleId)) {
+      throw new Error(`trigger bot binding ${index} must use numeric Discord IDs`);
+    }
+    if (identityIds.has(identityId)) {
+      throw new Error(`Discord trigger bot identity ${identityId} has more than one binding`);
+    }
+    identityIds.add(identityId);
+    const policy = roleById.get(roleId);
+    if (!policy) {
+      throw new Error(
+        `trigger bot binding ${index} references an unknown reviewed role`,
+      );
+    }
+    if (policy.canApprove) {
+      throw new Error("trigger bot bindings cannot authorize proposal approval");
+    }
+    return { identityId, roleId };
   });
 }
 
@@ -132,10 +205,57 @@ export function resolveDiscordPermissionBundle(
   };
 }
 
+/**
+ * Resolve a verified bot/application/webhook identity through a reviewed,
+ * static binding. Its empty `member.roles` data is never treated as authority.
+ */
+export function resolveDiscordTriggerBotPermissionBundle(
+  identities: {
+    applicationId?: string;
+    authorId: string;
+    webhookId?: string;
+  },
+  options: Pick<DiscordbotOptions, "roleBindings" | "triggerBotBindings">,
+): DiscordPolicyResolution {
+  const held = new Set(
+    [identities.authorId, identities.applicationId, identities.webhookId]
+      .filter((identity): identity is string =>
+        typeof identity === "string" && DISCORD_SNOWFLAKE.test(identity),
+      ),
+  );
+  const matches = options.triggerBotBindings?.filter((binding) =>
+    held.has(binding.identityId),
+  ) ?? [];
+  if (matches.length === 0) {
+    return { decision: "deny", reason: "role_not_authorized" };
+  }
+  // Runtime callers may construct options without the server parser. Never
+  // infer an identity policy from overlapping bindings in that case.
+  if (matches.length !== 1) {
+    return { decision: "deny", reason: "role_policy_ambiguous" };
+  }
+  const selected = matches[0];
+  if (!selected) return { decision: "deny", reason: "role_not_authorized" };
+  const resolution = resolveDiscordPermissionBundle([selected.roleId], options);
+  if (resolution.decision === "allow" && resolution.bundle.canApprove) {
+    return { decision: "deny", reason: "role_not_authorized" };
+  }
+  return resolution;
+}
+
 export function configuredDiscordRoleIds(
   options: Pick<DiscordbotOptions, "roleBindings">,
 ): string[] {
   return options.roleBindings?.map((binding) => binding.roleId) ?? [];
+}
+
+/** Exact transport identities that may reach the durable bot-policy gate. */
+export function configuredDiscordTriggerBotIds(
+  options: Pick<DiscordbotOptions, "triggerBotBindings">,
+): string[] {
+  return [
+    ...new Set(options.triggerBotBindings?.map((binding) => binding.identityId) ?? []),
+  ].sort();
 }
 
 function bindingSemanticKey(binding: DiscordRoleBinding): string {
