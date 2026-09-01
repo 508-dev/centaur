@@ -1340,12 +1340,30 @@ Assign and unassign roles on a principal. The assignment endpoints are nested un
 { "data": { "role_id": "role_..." } }
 ```
 
-Returns `201` with the assigned role's representation. Assigning an already assigned role returns `422`. An unknown principal or role returns `404`.
+Returns `201` with the assigned role's representation. Assigning an already assigned role is idempotent and returns `200`. An unknown principal or role returns `404`.
+
+`PUT` replaces the complete role set and sandbox capability policy in one
+principal-row-locked transaction. Supply every field; partial or unknown policy
+documents fail closed:
+
+```json
+{
+  "data": {
+    "role_ids": ["role_..."],
+    "sandbox_repo_cache": "all",
+    "sandbox_observability_enabled": true,
+    "sandbox_sessions_read_enabled": false,
+    "sandbox_workflows_read_enabled": true,
+    "sandbox_workflows_write_enabled": true
+  }
+}
+```
 
 | Method   | Path | Notes |
 | -------- | ---- | ----- |
 | `GET`    | `/api/v1/principals/:principal_id/roles` | List the roles assigned to the principal. |
 | `POST`   | `/api/v1/principals/:principal_id/roles` | Assign a role (`data: { role_id }`). |
+| `PUT`    | `/api/v1/principals/:principal_id/roles` | Atomically replace the complete role and sandbox-policy tuple. |
 | `DELETE` | `/api/v1/principals/:principal_id/roles/:id` | Unassign the role with OID `:id`. Returns `204`; `404` if not assigned. |
 
 ## Grants

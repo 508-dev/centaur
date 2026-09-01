@@ -1088,6 +1088,7 @@ fn strict_str_array(table: &toml::Table, name: &str, key: &str) -> Result<Vec<St
         .map(|value| {
             value
                 .as_str()
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
                 .ok_or_else(|| {

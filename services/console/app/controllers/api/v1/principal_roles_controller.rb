@@ -3,8 +3,19 @@ module Api
     # Manages role assignments for a principal:
     #   GET    /api/v1/principals/:principal_id/roles
     #   POST   /api/v1/principals/:principal_id/roles      (body: data: { role_id })
+    #   PUT    /api/v1/principals/:principal_id/roles      (atomic roles + sandbox policy)
     #   DELETE /api/v1/principals/:principal_id/roles/:id  (:id is the role oid)
     class PrincipalRolesController < Api::BaseController
+      POLICY_KEYS = %w[
+        role_ids
+        sandbox_repo_cache
+        sandbox_observability_enabled
+        sandbox_sessions_read_enabled
+        sandbox_workflows_read_enabled
+        sandbox_workflows_write_enabled
+      ].freeze
+      BOOLEAN_POLICY_KEYS = (POLICY_KEYS - %w[role_ids sandbox_repo_cache]).freeze
+
       def index
         principal = Principal.find_by_oid!(params[:principal_id])
         roles = principal.roles.includes(:slack_channel_permissions).order(:id)
@@ -27,6 +38,16 @@ module Api
         render_validation_error(e.record)
       end
 
+      def replace
+        principal = Principal.find_by_oid!(params[:principal_id])
+        policy = replacement_policy
+        roles = policy.delete(:role_ids).map { |role_id| Role.find_by_oid!(role_id) }
+        principal.replace_roles_and_sandbox_policy!(roles:, **policy)
+        render json: { data: roles.map { |role| role_payload(role) } }
+      rescue ActiveRecord::RecordInvalid => e
+        render_validation_error(e.record)
+      end
+
       def destroy
         principal = Principal.find_by_oid!(params[:principal_id])
         role = Role.find_by_oid!(params[:id])
@@ -36,6 +57,26 @@ module Api
       end
 
       private
+
+      def replacement_policy
+        raw = data_params.to_unsafe_h.stringify_keys
+        unless raw.keys.sort == POLICY_KEYS.sort
+          raise ActionController::BadRequest, "atomic principal policy has invalid fields"
+        end
+        role_ids = raw.fetch("role_ids")
+        unless role_ids.is_a?(Array) && role_ids.length.between?(1, 16) &&
+               role_ids.all? { |role_id| role_id.is_a?(String) && role_id.match?(/\Arole_[A-Za-z0-9_-]+\z/) } &&
+               role_ids.uniq.length == role_ids.length
+          raise ActionController::BadRequest, "role_ids must contain unique role OIDs"
+        end
+        unless Principal::SANDBOX_REPO_CACHE_VALUES.include?(raw.fetch("sandbox_repo_cache"))
+          raise ActionController::BadRequest, "sandbox_repo_cache is invalid"
+        end
+        unless BOOLEAN_POLICY_KEYS.all? { |key| [ true, false ].include?(raw.fetch(key)) }
+          raise ActionController::BadRequest, "sandbox capability values must be booleans"
+        end
+        raw.symbolize_keys
+      end
 
       def role_payload(role)
         {

@@ -136,6 +136,59 @@ describe("Discord Gateway admission", () => {
     ]);
   });
 
+  it("releases only its provisional delivery claim after transient state failures", async () => {
+    for (const failure of ["evaluation", "final_write"] as const) {
+      const { audits, logger, state } = await harness();
+      let failOnce = true;
+      const flaky = new Proxy(state, {
+        get(target, property) {
+          if (property === "get") {
+            return async (key: string) => {
+              if (
+                failure === "evaluation" &&
+                failOnce &&
+                key.startsWith("discordbot:ingress:root:")
+              ) {
+                failOnce = false;
+                throw new Error("transient read failure");
+              }
+              return target.get(key);
+            };
+          }
+          if (property === "set") {
+            return async (key: string, value: unknown, ttlMs?: number) => {
+              if (
+                failure === "final_write" &&
+                failOnce &&
+                key.startsWith("discordbot:ingress:delivery:")
+              ) {
+                failOnce = false;
+                throw new Error("transient write failure");
+              }
+              return target.set(key, value, ttlMs);
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as StateAdapter;
+      const message = event(
+        failure === "evaluation"
+          ? "600000000000000002"
+          : "600000000000000003",
+      );
+
+      expect(
+        await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
+      ).toBeNull();
+      expect(audits.at(-1)?.data.reason).toBe("state_unavailable");
+      expect(
+        await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
+      ).toEqual(expect.objectContaining({ decision: "allow" }));
+      expect(audits.at(-1)?.data.reason).toBe("accepted");
+    }
+  });
+
   it("rejects unauthenticated, stale, replay-like, DM, and malformed transport data", async () => {
     const cases: Array<[string, Partial<DiscordGatewayMessageEvent>, number?]> = [
       ["gateway_identity_unverified", { gatewayIdentityVerified: false }],

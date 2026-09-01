@@ -148,6 +148,21 @@ class Principal < ApplicationRecord
     end
   end
 
+  # Replace the complete role and sandbox-capability tuple while holding the
+  # principal row lock. Concurrent policy refreshes therefore commit as one
+  # ordered state rather than interleaving into a union of privileged roles.
+  def replace_roles_and_sandbox_policy!(roles:, **capabilities)
+    desired_roles = Array(roles).uniq(&:id)
+    with_lock do
+      update!(capabilities)
+      desired_ids = desired_roles.map(&:id)
+      principal_roles.where.not(role_id: desired_ids).destroy_all
+      desired_roles.each { |role| principal_roles.find_or_create_by!(role:) }
+    end
+    self.roles.reset
+    desired_roles
+  end
+
   # Slackbot only sends a DM partner's email when that user belongs to the
   # bot's home workspace. Treat an explicitly supplied email as a trusted
   # bridge to the corresponding Console account. This is called from the API

@@ -147,7 +147,9 @@ export async function admitDiscordGatewayMessage(
   try {
     record = await evaluateAdmission(event, options, state, now);
   } catch {
-    record = { ...pending, reason: "state_unavailable" };
+    await releasePendingDeliveryClaim(state, pending);
+    audit(logger, pending);
+    return null;
   }
   try {
     await state.set(
@@ -156,7 +158,15 @@ export async function admitDiscordGatewayMessage(
       options.ingressDeliveryTtlMs ?? DEFAULT_DELIVERY_TTL_MS,
     );
   } catch {
-    record = { ...pending, reason: "state_unavailable" };
+    const persisted = await recoverPersistedAdmissionOrReleaseClaim(
+      state,
+      pending,
+      record,
+    );
+    if (!persisted) {
+      audit(logger, pending);
+      return null;
+    }
   }
   audit(logger, record);
   return record.decision === "allow" ? record : null;
@@ -404,6 +414,68 @@ function validEventIds(event: DiscordGatewayMessageEvent): boolean {
 
 function deliveryKey(messageId: string): string {
   return `discordbot:ingress:delivery:${messageId}`;
+}
+
+async function releasePendingDeliveryClaim(
+  state: StateAdapter,
+  pending: DiscordDeniedAdmission,
+): Promise<void> {
+  try {
+    const current = await state.get<unknown>(deliveryKey(pending.messageId));
+    if (sameAdmissionRecord(current, pending)) {
+      await state.delete(deliveryKey(pending.messageId));
+    }
+  } catch {
+    // The audit still reports state_unavailable. A backend that cannot read or
+    // delete its provisional claim remains fail-closed until its TTL expires.
+  }
+}
+
+async function recoverPersistedAdmissionOrReleaseClaim(
+  state: StateAdapter,
+  pending: DiscordDeniedAdmission,
+  expected: DiscordAdmissionRecord,
+): Promise<boolean> {
+  try {
+    const current = await state.get<unknown>(deliveryKey(pending.messageId));
+    if (sameAdmissionRecord(current, expected)) return true;
+    if (sameAdmissionRecord(current, pending)) {
+      await state.delete(deliveryKey(pending.messageId));
+    }
+  } catch {
+    // Return fail-closed when the final write outcome cannot be proven.
+  }
+  return false;
+}
+
+function sameAdmissionRecord(
+  value: unknown,
+  expected: DiscordAdmissionRecord,
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<DiscordAdmissionRecord>;
+  if (
+    record.version !== expected.version ||
+    record.decision !== expected.decision ||
+    record.reason !== expected.reason ||
+    record.actorId !== expected.actorId ||
+    record.channelId !== expected.channelId ||
+    record.guildId !== expected.guildId ||
+    record.messageId !== expected.messageId ||
+    record.receivedAt !== expected.receivedAt ||
+    record.threadId !== expected.threadId
+  ) {
+    return false;
+  }
+  if (expected.decision === "deny") return record.decision === "deny";
+  if (record.decision !== "allow") return false;
+  const acceptedRecord = record as Partial<DiscordAcceptedAdmission>;
+  return (
+    acceptedRecord.control === expected.control &&
+    acceptedRecord.proposalFingerprint === expected.proposalFingerprint &&
+    acceptedRecord.rootMessageId === expected.rootMessageId &&
+    acceptedRecord.policy?.fingerprint === expected.policy.fingerprint
+  );
 }
 
 function rootKey(guildId: string, channelId: string, threadId: string): string {
