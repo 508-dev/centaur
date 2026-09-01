@@ -5,7 +5,11 @@ import {
   admitDiscordGatewayMessage,
   type DiscordGatewayMessageEvent,
 } from "../src/discord-ingress";
-import type { DiscordbotOptions, DiscordRoleBinding } from "../src/types";
+import type {
+  DiscordbotOptions,
+  DiscordRoleBinding,
+  DiscordTriggerBotBinding,
+} from "../src/types";
 
 const NOW = Date.now();
 const APP = "900000000000000001";
@@ -32,6 +36,12 @@ function binding(
     roleId: ROLE,
     ...overrides,
   };
+}
+
+function triggerBotBinding(
+  overrides: Partial<DiscordTriggerBotBinding> = {},
+): DiscordTriggerBotBinding {
+  return { identityId: USER, roleId: ROLE, ...overrides };
 }
 
 function options(overrides: Partial<DiscordbotOptions> = {}): DiscordbotOptions {
@@ -226,11 +236,11 @@ describe("Discord Gateway admission", () => {
     }
   });
 
-  it("requires both an explicit bot identity and a reviewed role capability", async () => {
-    const configured = options({ triggerBotAllowlist: [USER] });
+  it("binds an explicitly reviewed bot or webhook identity to one static bundle", async () => {
+    const configured = options({ triggerBotBindings: [triggerBotBinding()] });
     expect(
       await reasonFor(
-        event("600000000000000045", { authorIsBot: true }),
+        event("600000000000000045", { authorIsBot: true, roleIds: [] }),
         configured,
       ),
     ).toBe("accepted");
@@ -238,18 +248,23 @@ describe("Discord Gateway admission", () => {
       await reasonFor(
         event("600000000000000046", {
           authorIsBot: true,
-          roleIds: [],
+          roleIds: [ROLE],
         }),
-        configured,
+        options({ triggerBotAllowlist: [USER] }),
       ),
-    ).toBe("role_not_authorized");
+    ).toBe("bot_message");
     expect(
       await reasonFor(
         event("600000000000000047", {
           authorIsBot: true,
+          roleIds: [],
           webhookId: "700000000000000001",
         }),
-        options({ triggerBotAllowlist: ["700000000000000001"] }),
+        options({
+          triggerBotBindings: [
+            triggerBotBinding({ identityId: "700000000000000001" }),
+          ],
+        }),
       ),
     ).toBe("accepted");
   });

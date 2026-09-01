@@ -3,10 +3,10 @@ import {
   parseDiscordThreadKey,
   resolveChannelAllowlist,
   resolveGuildAllowlist,
-  resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import {
   resolveDiscordPermissionBundle,
+  resolveDiscordTriggerBotPermissionBundle,
   type DiscordPermissionBundle,
 } from "./discord-policy";
 import { discordMentionRoutingDecision } from "./discord-mention-routing";
@@ -270,14 +270,6 @@ async function evaluateAdmission(
     return deny("stale_delivery");
   }
   if (event.authorIsSelf) return deny("self_message");
-  const triggerBotAllowlist = new Set(resolveTriggerBotAllowlist(options));
-  const explicitlyAllowedBot = [
-    event.authorId,
-    event.applicationId,
-    event.webhookId,
-  ].some((id) => id !== undefined && triggerBotAllowlist.has(id));
-  if (event.webhookId && !explicitlyAllowedBot) return deny("webhook_message");
-  if (event.authorIsBot && !explicitlyAllowedBot) return deny("bot_message");
   if (!SUPPORTED_MESSAGE_TYPES.has(event.messageType)) {
     return deny("unsupported_message_type");
   }
@@ -287,8 +279,24 @@ async function evaluateAdmission(
   if (!resolveChannelAllowlist(options).includes(event.channelId)) {
     return deny("channel_not_allowlisted");
   }
-  const resolution = resolveDiscordPermissionBundle(event.roleIds, options);
-  if (resolution.decision === "deny") return deny(resolution.reason);
+  const isNonHumanIdentity = event.authorIsBot || event.webhookId !== undefined;
+  const resolution = isNonHumanIdentity
+    ? resolveDiscordTriggerBotPermissionBundle(
+        {
+          applicationId: event.applicationId,
+          authorId: event.authorId,
+          webhookId: event.webhookId,
+        },
+        options,
+      )
+    : resolveDiscordPermissionBundle(event.roleIds, options);
+  if (resolution.decision === "deny") {
+    // Do not leak whether a configured integration identity or its bundle was
+    // absent. Human role failures retain their precise audit reason.
+    if (event.webhookId !== undefined) return deny("webhook_message");
+    if (event.authorIsBot) return deny("bot_message");
+    return deny(resolution.reason);
+  }
   const policy = resolution.bundle;
   const threadId = event.threadId ?? event.messageId;
   const key = rootKey(event.guildId, event.channelId, threadId);
@@ -427,6 +435,8 @@ function validEventIds(event: DiscordGatewayMessageEvent): boolean {
       (value) => typeof value === "string" && snowflake.test(value),
     ) &&
     (event.threadId === undefined || snowflake.test(event.threadId)) &&
+    (event.applicationId === undefined || snowflake.test(event.applicationId)) &&
+    (event.webhookId === undefined || snowflake.test(event.webhookId)) &&
     Array.isArray(event.roleIds) &&
     event.roleIds.every((roleId) => snowflake.test(roleId)) &&
     typeof event.content === "string" &&

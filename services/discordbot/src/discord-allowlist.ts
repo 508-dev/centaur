@@ -1,6 +1,9 @@
 import type { Logger, Message } from "chat";
 import type { DiscordbotOptions } from "./types";
-import { configuredDiscordRoleIds } from "./discord-policy";
+import {
+  configuredDiscordRoleIds,
+  configuredDiscordTriggerBotIds,
+} from "./discord-policy";
 
 export type DiscordIngressContext = {
   authorIsBot: boolean;
@@ -47,12 +50,9 @@ export function isAllowedDiscordMessage(
   if (message.author.isMe === true) {
     return false;
   }
-  // Discord delta (mirrors slackbotv2's trigger-bot allowlist semantics):
-  // bot-authored messages are rejected unless the bot is explicitly
-  // allowlisted. The gateway only forwards bot messages that pass the
-  // adapter's `shouldForwardBotMessage` hook (wired at the adapter
-  // construction site); this gate re-checks with the full payload, where
-  // application_id/webhook_id matching is possible.
+  // Bot-authored messages are denied unless a reviewed identity binding maps
+  // the exact author/application/webhook ID to a static policy bundle. The
+  // adapter and durable ingress both evaluate the same identifiers.
   if (message.author.isBot === true) {
     if (
       !isAllowedTriggerBotMessage(message, resolveTriggerBotAllowlist(options))
@@ -92,8 +92,8 @@ export function isAllowedDiscordMessage(
 /**
  * Return the deterministic denial reason for a Discord ingress context.
  * Bot-authored messages still require guild + channel admission, but their
- * identity is controlled by the separate trigger-bot allowlist rather than a
- * human member role.
+ * identity is controlled by a separate reviewed bot binding rather than human
+ * member roles.
  */
 export function discordIngressDenialReason(
   context: DiscordIngressContext,
@@ -221,14 +221,15 @@ export function resolveGuildAllowlist(options: DiscordbotOptions): string[] {
   ];
 }
 
-/** Resolved trigger-bot allowlist (options first, env fallback). */
+/**
+ * Resolved bot transport identities. A legacy bare allowlist deliberately does
+ * not reach this gate: every non-human sender must also select a reviewed,
+ * non-approver policy bundle through `triggerBotBindings`.
+ */
 export function resolveTriggerBotAllowlist(
   options: DiscordbotOptions,
 ): string[] {
-  return [
-    ...(options.triggerBotAllowlist ??
-      splitEnvList(process.env.DISCORDBOT_TRIGGER_BOT_ALLOWLIST)),
-  ];
+  return configuredDiscordTriggerBotIds(options);
 }
 
 /** Resolved human trigger-role allowlist (options first, env fallback). */

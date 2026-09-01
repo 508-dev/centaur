@@ -1,6 +1,9 @@
 import { createGatewayController } from "./gateway";
 import { createDiscordbot, type DiscordbotOptions } from "./index";
-import { parseDiscordRoleBindings } from "./discord-policy";
+import {
+  parseDiscordRoleBindings,
+  parseDiscordTriggerBotBindings,
+} from "./discord-policy";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -10,11 +13,16 @@ const applicationId = requiredEnv("DISCORD_APPLICATION_ID");
 const guildAllowlist = optionalList("DISCORDBOT_GUILD_ALLOWLIST");
 const channelAllowlist = optionalList("DISCORDBOT_CHANNEL_ALLOWLIST");
 const mentionRoleIds = optionalList("DISCORD_MENTION_ROLE_IDS");
-const triggerBotAllowlist = optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST");
 validateDiscordIds("DISCORDBOT_GUILD_ALLOWLIST", guildAllowlist);
 validateDiscordIds("DISCORDBOT_CHANNEL_ALLOWLIST", channelAllowlist);
 validateDiscordIds("DISCORD_MENTION_ROLE_IDS", mentionRoleIds);
-validateDiscordIds("DISCORDBOT_TRIGGER_BOT_ALLOWLIST", triggerBotAllowlist);
+const roleBindings = parseDiscordRoleBindings(
+  optionalEnv("DISCORDBOT_ROLE_BINDINGS_JSON"),
+);
+const triggerBotBindings = parseDiscordTriggerBotBindings(
+  optionalEnv("DISCORDBOT_TRIGGER_BOT_BINDINGS_JSON"),
+  roleBindings,
+);
 
 const consoleLogger = {
   debug: (message: string, data?: unknown) => log("debug", message, data),
@@ -62,11 +70,9 @@ const options: DiscordbotOptions = {
   mentionRoleIds,
   nameThreads: optionalEnv("DISCORDBOT_NAME_THREADS") !== "false",
   postgresUrl,
-  roleBindings: parseDiscordRoleBindings(
-    optionalEnv("DISCORDBOT_ROLE_BINDINGS_JSON"),
-  ),
+  roleBindings,
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
-  triggerBotAllowlist,
+  triggerBotBindings,
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),
   logger: consoleLogger,
 };
