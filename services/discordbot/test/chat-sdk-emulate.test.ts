@@ -48,6 +48,7 @@ import { admitDiscordGatewayMessage } from "../src/discord-ingress";
 const BOT_TOKEN = "discordbot-emulate-token";
 const APP_ID = "900000000000000001";
 const USER_ID = "100000000000000001";
+const OTHER_USER_ID = "100000000000000002";
 const TRIGGER_BOT_ID = "400000000000000001";
 const TRIGGER_BOT_APPLICATION_ID = "400000000000000002";
 const GUILD_ID = "200000000000000001";
@@ -253,6 +254,53 @@ describe("discordbot", () => {
         renderObligation: null,
       }),
     );
+  });
+
+  it("does not route an unmentioned reply addressed to another member but honors a direct bot mention", async () => {
+    const threadId = discordApi.nextId();
+    discordApi.seedThreadChannel(threadId, CHANNEL_ID);
+
+    const rootMentionId = await dispatchMessage({
+      channelId: threadId,
+      content: `<@${APP_ID}> establish the routing test thread`,
+      mention: true,
+      thread: { id: threadId, parentId: CHANNEL_ID },
+    });
+    await waitForSettle(threadId, rootMentionId);
+    const appendCount = codexApi.appends.length;
+    const executeCount = codexApi.executes.length;
+
+    const addressedElsewhere =
+      `<@${OTHER_USER_ID}> great. Can you write a small summary of where the service is at?`;
+    await dispatchMessage({
+      channelId: threadId,
+      content: addressedElsewhere,
+      mentionedUserIds: [OTHER_USER_ID],
+      thread: { id: threadId, parentId: CHANNEL_ID },
+    });
+    await sleep(50);
+    expect(codexApi.appends).toHaveLength(appendCount);
+    expect(codexApi.executes).toHaveLength(executeCount);
+
+    const directMentionId = await dispatchMessage({
+      channelId: threadId,
+      content:
+        `<@${APP_ID}> ask <@${OTHER_USER_ID}> for context, then write the summary`,
+      mention: true,
+      mentionedUserIds: [APP_ID, OTHER_USER_ID],
+      thread: { id: threadId, parentId: CHANNEL_ID },
+    });
+    await waitForSettle(threadId, directMentionId);
+    expect(codexApi.appends).toHaveLength(appendCount + 1);
+    expect(codexApi.executes).toHaveLength(executeCount + 1);
+    expect(codexApi.executes.at(-1)?.body.idempotency_key).toBe(
+      directMentionId,
+    );
+    expect(
+      codexApi.appends.flatMap((append) =>
+        sessionMessageTexts(append.body.messages),
+      ),
+    ).not.toContain(addressedElsewhere);
   });
 
   it("creates, names, and answers in a bot-created thread for a channel mention", async () => {
@@ -1490,6 +1538,7 @@ async function dispatchMessage(input: {
   content: string;
   guildId?: string;
   mention?: boolean;
+  mentionedUserIds?: string[];
   /** Existing-thread tests seed the durable root production creates upstream. */
   preauthorizeRoot?: boolean;
   roleIds?: string[];
@@ -1540,7 +1589,9 @@ async function dispatchMessage(input: {
     guild_id: input.guildId ?? GUILD_ID,
     member: { roles: input.roleIds ?? [TRIGGER_ROLE_ID] },
     mention_roles: [],
-    mentions: input.mention ? [{ id: APP_ID }] : [],
+    mentions: (
+      input.mentionedUserIds ?? (input.mention ? [APP_ID] : [])
+    ).map((id) => ({ id })),
     ...(input.thread
       ? { thread: { id: input.thread.id, parent_id: input.thread.parentId } }
       : {}),

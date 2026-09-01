@@ -13,7 +13,10 @@ iron-control principal; it is never attached to the channel principal.
   keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an authorized thread** append to the same session without a re-mention
-  only for the original actor, while the root TTL and their current role policy remain valid.
+  only for the original actor, while the root TTL and their current role policy remain valid. An
+  unmentioned reply with a canonical `<@user-id>` / `<@!user-id>` mention of another member is
+  ignored instead of steering Centaur; a direct Centaur mention keeps its normal behavior even if
+  another member is also named.
 - **`@centaur stop`** interrupts only the active execution attached to that authorized thread.
 - **`@centaur approve sha256:…`** atomically consumes one exact, unexpired workflow proposal
   when the actor's reviewed role is permitted to approve it. It does not create a coding session.
