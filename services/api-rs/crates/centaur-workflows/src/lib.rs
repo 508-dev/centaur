@@ -40,7 +40,7 @@ mod action_proposals;
 pub use action_proposals::{
     ActionProposal, ActionProposalState, ApproveActionProposalRequest,
     ApproveActionProposalResponse, NotificationTransitionRequest, NotificationTransitionResponse,
-    ProposalEvidence, ProposalValidation, PutActionProposalRequest,
+    ProposalEvidence, ProposalValidation, PutActionProposalRequest, normalize_exact_repository,
 };
 
 pub const WORKFLOW_QUEUE: &str = "centaur_workflows";

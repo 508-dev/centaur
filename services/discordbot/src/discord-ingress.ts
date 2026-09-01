@@ -3,6 +3,7 @@ import {
   parseDiscordThreadKey,
   resolveChannelAllowlist,
   resolveGuildAllowlist,
+  resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import {
   resolveDiscordPermissionBundle,
@@ -253,8 +254,14 @@ async function evaluateAdmission(
     return deny("stale_delivery");
   }
   if (event.authorIsSelf) return deny("self_message");
-  if (event.webhookId) return deny("webhook_message");
-  if (event.authorIsBot) return deny("bot_message");
+  const triggerBotAllowlist = new Set(resolveTriggerBotAllowlist(options));
+  const explicitlyAllowedBot = [
+    event.authorId,
+    event.applicationId,
+    event.webhookId,
+  ].some((id) => id !== undefined && triggerBotAllowlist.has(id));
+  if (event.webhookId && !explicitlyAllowedBot) return deny("webhook_message");
+  if (event.authorIsBot && !explicitlyAllowedBot) return deny("bot_message");
   if (!SUPPORTED_MESSAGE_TYPES.has(event.messageType)) {
     return deny("unsupported_message_type");
   }

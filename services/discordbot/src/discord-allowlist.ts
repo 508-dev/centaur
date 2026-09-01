@@ -219,7 +219,10 @@ export function resolveTriggerRoleAllowlist(
   options: DiscordbotOptions,
 ): string[] {
   const policyRoleIds = configuredDiscordRoleIds(options);
-  if (policyRoleIds.length > 0) return policyRoleIds;
+  // An explicitly configured policy list, including [], opts into the actor-
+  // scoped policy contract. Never let the legacy role allowlist reactivate an
+  // intentionally empty reviewed policy.
+  if (options.roleBindings !== undefined) return policyRoleIds;
   return [
     ...(options.triggerRoleAllowlist ??
       splitEnvList(process.env.DISCORDBOT_TRIGGER_ROLE_ALLOWLIST)),

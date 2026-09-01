@@ -1,7 +1,7 @@
 import type { ChatSDKStreamChunk } from "@centaur/rendering";
 import type { Logger, Thread } from "chat";
+import { resolveDiscordApiBase } from "./discord-api";
 import { parseDiscordThreadKey } from "./discord-allowlist";
-import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotApiMessage, DiscordbotOptions } from "./types";
 import { errorMessage } from "./utils";
 
@@ -151,9 +151,10 @@ async function discordReactionRequest(
   const { emoji, messageId, method } = input;
   try {
     const fetchFn = botOptions.fetch ?? fetch;
-    const apiBase = (
-      botOptions.discordApiUrl ?? DEFAULT_DISCORD_API_URL
-    ).replace(/\/$/, "");
+    const apiBase = resolveDiscordApiBase(
+      botOptions.discordApiUrl,
+      botOptions.allowInProcessGatewayEmulation === true,
+    );
     const response = await fetchFn(
       `${apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
       {

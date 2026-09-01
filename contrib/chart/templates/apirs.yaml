@@ -251,6 +251,8 @@ spec:
             - name: DISCORDBOT_APPROVAL_ROLE_ALLOWLIST
               value: {{ join "," ($discordApprovalRoles | uniq) | quote }}
 {{- end }}
+            - name: CENTAUR_ACTION_PROPOSAL_BINDINGS_JSON
+              value: {{ .Values.apiRs.actionProposalBindings | toJson | quote }}
             - name: BIND_ADDR
               value: {{ printf "0.0.0.0:%v" .Values.apiRs.port | quote }}
             - name: SLACK_BOT_TOKEN

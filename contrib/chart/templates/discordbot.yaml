@@ -3,6 +3,9 @@
 {{- $guildAllowlist := required "discordbot.guildAllowlist is required when discordbot is enabled" .Values.discordbot.guildAllowlist -}}
 {{- $channelAllowlist := required "discordbot.channelAllowlist is required when discordbot is enabled" .Values.discordbot.channelAllowlist -}}
 {{- $roleBindings := required "discordbot.roleBindings must contain reviewed role policy when discordbot is enabled" .Values.discordbot.roleBindings -}}
+{{- if eq (len $roleBindings) 0 -}}
+{{- fail "discordbot.roleBindings must contain reviewed role policy when discordbot is enabled" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -75,6 +78,10 @@ spec:
               value: {{ $channelAllowlist | quote }}
             - name: DISCORDBOT_ROLE_BINDINGS_JSON
               value: {{ $roleBindings | toJson | quote }}
+{{- if .Values.discordbot.triggerBotAllowlist }}
+            - name: DISCORDBOT_TRIGGER_BOT_ALLOWLIST
+              value: {{ .Values.discordbot.triggerBotAllowlist | quote }}
+{{- end }}
             - name: DISCORDBOT_CONTINUATION_TTL_MS
               value: {{ .Values.discordbot.continuationTtlMs | quote }}
             - name: DISCORDBOT_INGRESS_MAX_EVENT_AGE_MS

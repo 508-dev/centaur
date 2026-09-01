@@ -17,11 +17,14 @@ import {
 } from "chat";
 import { Hono } from "hono";
 import pg from "pg";
+import { resolveDiscordApiBase } from "./discord-api";
 import {
   discordIngressDenialReason,
   isAllowedDiscordMessage,
   isDiscordIngressAllowlistEmpty,
+  isAllowedDiscordGuild,
   parseDiscordThreadKey,
+  resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import {
   acceptedDiscordAdmissionForMessage,
@@ -187,6 +190,10 @@ export async function resolveDiscordConversationName(
 export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
+  const discordApiBase = resolveDiscordApiBase(
+    options.discordApiUrl,
+    options.allowInProcessGatewayEmulation === true,
+  );
 
   if (isDiscordIngressAllowlistEmpty(options)) {
     logger.warn("discordbot_ingress_allowlist_incomplete_inert", {
@@ -196,7 +203,7 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   const state = options.state ?? createDefaultState(options, logger);
   const discord = createDiscordAdapter({
-    apiUrl: options.discordApiUrl,
+    apiUrl: discordApiBase,
     applicationId: options.applicationId,
     botToken: options.botToken,
     publicKey: options.publicKey,
@@ -233,6 +240,12 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       }
       return denialReason === undefined;
     },
+    // The adapter drops bot authors before admission by default. Forward only
+    // an explicitly configured immutable bot identity in an allowed guild;
+    // durable admission still requires a reviewed role capability bundle.
+    shouldForwardBotMessage: ({ authorId, guildId }) =>
+      isAllowedDiscordGuild(guildId, options) &&
+      resolveTriggerBotAllowlist(options).includes(authorId),
     // Discord delta (patched adapter): the Gateway never redelivers, so a
     // message dropped on a thread-lock conflict is otherwise lost with zero
     // signal — surface it with a 🔁 reaction so the user knows to resend.

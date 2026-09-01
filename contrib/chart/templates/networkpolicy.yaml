@@ -341,6 +341,16 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
+{{- if .Values.discordbot.enabled }}
+    # Authenticated workflow delivery to Discordbot's internal endpoint.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3001
+{{- end }}
     - ports:
         - protocol: TCP
           port: 443

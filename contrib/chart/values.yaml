@@ -472,6 +472,13 @@ apiRs:
   workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
+  # Reviewed observer/action bindings for durable action proposals. The runtime
+  # rejects persistence and approval unless the exact observer_workflow +
+  # action_type tuple selects the proposed action_workflow.
+  actionProposalBindings: []
+  # - observer_workflow: weekly_ops_review
+  #   action_type: github:create_improvement_pr
+  #   action_workflow: execute_approved_improvement
   # Requests/limits for the workflow-host sandbox pod (k8s resources map).
   workflowHostResources: {}
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
@@ -761,6 +768,9 @@ discordbot:
   continuationTtlMs: 86400000
   ingressMaxEventAgeMs: 300000
   ingressDeliveryTtlMs: 604800000
+  # Bot user/application/webhook IDs explicitly admitted at the transport
+  # boundary. A matching bot still needs a reviewed role binding; empty denies.
+  triggerBotAllowlist: ""
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.

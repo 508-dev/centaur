@@ -1360,12 +1360,12 @@ describe("discordbot", () => {
     expect(codexApi.creates).toHaveLength(0);
     expect(codexApi.executes).toHaveLength(0);
 
-    // Bot-authored messages are always denied. A legacy trigger-bot allowlist
-    // cannot bypass the actor-aware human policy boundary.
+    // Bot-authored messages need both the explicit immutable bot allowlist and
+    // the same reviewed role capability policy as a human actor.
     bot = createTestBot({ triggerBotAllowlist: [TRIGGER_BOT_ID] });
     const threadId = discordApi.nextId();
     discordApi.seedThreadChannel(threadId, CHANNEL_ID);
-    const deniedBotMentionId = await dispatchMessage({
+    const allowedBotMentionId = await dispatchMessage({
       authorBot: true,
       authorId: TRIGGER_BOT_ID,
       channelId: threadId,
@@ -1373,9 +1373,9 @@ describe("discordbot", () => {
       mention: true,
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
-    await sleep(50);
-    expect(codexApi.executes).toHaveLength(0);
-    expect(reactionsOn(threadId, deniedBotMentionId)).toEqual([]);
+    await waitForSettle(threadId, allowedBotMentionId);
+    expect(codexApi.executes).toHaveLength(1);
+    codexApi.reset();
 
     // Follow-ups are re-authorized; removing the human role blocks new context
     // even inside a previously authorized thread.

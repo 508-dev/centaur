@@ -10,9 +10,11 @@ const applicationId = requiredEnv("DISCORD_APPLICATION_ID");
 const guildAllowlist = optionalList("DISCORDBOT_GUILD_ALLOWLIST");
 const channelAllowlist = optionalList("DISCORDBOT_CHANNEL_ALLOWLIST");
 const mentionRoleIds = optionalList("DISCORD_MENTION_ROLE_IDS");
+const triggerBotAllowlist = optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST");
 validateDiscordIds("DISCORDBOT_GUILD_ALLOWLIST", guildAllowlist);
 validateDiscordIds("DISCORDBOT_CHANNEL_ALLOWLIST", channelAllowlist);
 validateDiscordIds("DISCORD_MENTION_ROLE_IDS", mentionRoleIds);
+validateDiscordIds("DISCORDBOT_TRIGGER_BOT_ALLOWLIST", triggerBotAllowlist);
 
 const consoleLogger = {
   debug: (message: string, data?: unknown) => log("debug", message, data),
@@ -64,6 +66,7 @@ const options: DiscordbotOptions = {
     optionalEnv("DISCORDBOT_ROLE_BINDINGS_JSON"),
   ),
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
+  triggerBotAllowlist,
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),
   logger: consoleLogger,
 };

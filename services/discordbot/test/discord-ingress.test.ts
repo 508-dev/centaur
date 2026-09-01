@@ -173,6 +173,34 @@ describe("Discord Gateway admission", () => {
     }
   });
 
+  it("requires both an explicit bot identity and a reviewed role capability", async () => {
+    const configured = options({ triggerBotAllowlist: [USER] });
+    expect(
+      await reasonFor(
+        event("600000000000000045", { authorIsBot: true }),
+        configured,
+      ),
+    ).toBe("accepted");
+    expect(
+      await reasonFor(
+        event("600000000000000046", {
+          authorIsBot: true,
+          roleIds: [],
+        }),
+        configured,
+      ),
+    ).toBe("role_not_authorized");
+    expect(
+      await reasonFor(
+        event("600000000000000047", {
+          authorIsBot: true,
+          webhookId: "700000000000000001",
+        }),
+        options({ triggerBotAllowlist: ["700000000000000001"] }),
+      ),
+    ).toBe("accepted");
+  });
+
   it("requires a mention root in the parent and never roots an unrelated thread", async () => {
     expect(
       await reasonFor(
