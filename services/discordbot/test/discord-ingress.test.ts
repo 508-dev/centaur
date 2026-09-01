@@ -326,6 +326,15 @@ describe("Discord Gateway admission", () => {
         "policy_changed_requires_root_trigger",
         NOW + 100,
       ],
+      [
+        follow("600000000000000065", {
+          content: `<@${APP}> continue`,
+          isMentioned: true,
+          roleIds: [ROLE, WRITE_ROLE],
+        }),
+        "policy_changed_requires_root_trigger",
+        NOW + 100,
+      ],
       [follow("600000000000000064"), "root_expired", NOW + 1_001],
     ];
     for (const [candidate, expected, now] of denied) {

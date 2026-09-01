@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, MessageRole, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime,
@@ -761,9 +761,10 @@ async fn append_messages(
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     for message in &mut request.messages {
-        message.metadata = sanitize_session_metadata(
+        message.metadata = sanitize_session_message_metadata(
             &caller,
             &thread_key,
+            &message.role,
             Some(std::mem::take(&mut message.metadata)),
         )?
         .unwrap_or_else(|| json!({}));
@@ -820,11 +821,58 @@ fn sanitize_session_metadata(
     sanitize_session_metadata_for(caller.class(), caller.identity(), thread_key, metadata)
 }
 
+fn sanitize_session_message_metadata(
+    caller: &AuthenticatedCaller,
+    thread_key: &ThreadKey,
+    role: &MessageRole,
+    metadata: Option<Value>,
+) -> Result<Option<Value>, ApiError> {
+    sanitize_session_metadata_for_message(
+        caller.class(),
+        caller.identity(),
+        thread_key,
+        role,
+        metadata,
+    )
+}
+
 fn sanitize_session_metadata_for(
     caller_class: CallerClass,
     caller_identity: &str,
     thread_key: &ThreadKey,
+    metadata: Option<Value>,
+) -> Result<Option<Value>, ApiError> {
+    sanitize_session_metadata_with_actor_check(
+        caller_class,
+        caller_identity,
+        thread_key,
+        metadata,
+        true,
+    )
+}
+
+fn sanitize_session_metadata_for_message(
+    caller_class: CallerClass,
+    caller_identity: &str,
+    thread_key: &ThreadKey,
+    role: &MessageRole,
+    metadata: Option<Value>,
+) -> Result<Option<Value>, ApiError> {
+    sanitize_session_metadata_with_actor_check(
+        caller_class,
+        caller_identity,
+        thread_key,
+        metadata,
+        matches!(role, MessageRole::User),
+    )
+}
+
+fn sanitize_session_metadata_with_actor_check(
+    caller_class: CallerClass,
+    caller_identity: &str,
+    thread_key: &ThreadKey,
     mut metadata: Option<Value>,
+    enforce_actor_user_id: bool,
 ) -> Result<Option<Value>, ApiError> {
     if caller_class != CallerClass::Console
         && let Some(Value::Object(fields)) = metadata.as_mut()
@@ -840,7 +888,7 @@ fn sanitize_session_metadata_for(
         }
         return Ok(metadata);
     }
-    validate_discord_policy_metadata(thread_key, metadata.as_ref())?;
+    validate_discord_policy_metadata(thread_key, metadata.as_ref(), enforce_actor_user_id)?;
     Ok(metadata)
 }
 
@@ -861,6 +909,7 @@ const DISCORD_POLICY_METADATA_FIELDS: &[&str] = &[
 fn validate_discord_policy_metadata(
     thread_key: &ThreadKey,
     metadata: Option<&Value>,
+    enforce_actor_user_id: bool,
 ) -> Result<(), ApiError> {
     let Some(Value::Object(fields)) = metadata else {
         return Err(ApiError::BadRequest(
@@ -904,7 +953,8 @@ fn validate_discord_policy_metadata(
             ));
         }
     }
-    if let Some(user_id) = fields.get("user_id")
+    if enforce_actor_user_id
+        && let Some(user_id) = fields.get("user_id")
         && user_id.as_str() != Some(actor_id)
     {
         return Err(ApiError::BadRequest(
@@ -1158,9 +1208,9 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
 mod session_authorization_tests {
     use super::{
         CallerClass, principal_subject_owns_session, sanitize_session_metadata_for,
-        thread_key_matches_platform,
+        sanitize_session_metadata_for_message, thread_key_matches_platform,
     };
-    use centaur_session_core::ThreadKey;
+    use centaur_session_core::{MessageRole, ThreadKey};
     use serde_json::json;
 
     fn thread_key(value: &str) -> ThreadKey {
@@ -1318,6 +1368,34 @@ mod session_authorization_tests {
         assert!(
             sanitize_session_metadata_for(CallerClass::Ingress, "discordbot", &key, Some(metadata))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn discord_history_allows_assistant_authors_but_not_other_user_authority() {
+        let key = thread_key("discord:200000000000000001:300000000000000001:400000000000000001");
+        let mut metadata = discord_policy_metadata();
+        metadata["user_id"] = json!("100000000000000099");
+
+        assert!(
+            sanitize_session_metadata_for_message(
+                CallerClass::Ingress,
+                "discordbot",
+                &key,
+                &MessageRole::Assistant,
+                Some(metadata.clone()),
+            )
+            .is_ok()
+        );
+        assert!(
+            sanitize_session_metadata_for_message(
+                CallerClass::Ingress,
+                "discordbot",
+                &key,
+                &MessageRole::User,
+                Some(metadata),
+            )
+            .is_err()
         );
     }
 }
