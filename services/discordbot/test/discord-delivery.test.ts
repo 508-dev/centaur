@@ -6,6 +6,7 @@ import {
   deliverDiscordNotification,
   DiscordDeliveryError,
 } from "../src/discord-delivery";
+import { resolveDiscordApiBase } from "../src/discord-api";
 import type { DiscordbotOptions } from "../src/types";
 
 const CHANNEL_ID = "1542739830591459369";
@@ -38,6 +39,11 @@ function recordingLogger(records: Record<string, unknown>[]): Logger {
 }
 
 describe("Discord workflow delivery", () => {
+  it("normalizes an adversarial trailing-slash run in linear time", () => {
+    const base = "https://discord.invalid/api/v10";
+    expect(resolveDiscordApiBase(`${base}${"/".repeat(100_000)}`)).toBe(base);
+  });
+
   it("requires the configured internal bearer credential", () => {
     expect(() =>
       authorizeDiscordDelivery("Bearer internal-key", "internal-key"),

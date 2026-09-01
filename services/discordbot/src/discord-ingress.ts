@@ -322,6 +322,9 @@ async function evaluateAdmission(
   if (event.threadId) {
     if (!root) return deny("authorized_root_missing");
     if (root.expiresAt < now) return deny("root_expired");
+    if (root.policy.fingerprint !== policy.fingerprint) {
+      return deny("policy_changed_requires_root_trigger");
+    }
   }
 
   if (root && root.actorId !== event.authorId && root.expiresAt >= now) {
