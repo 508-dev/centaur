@@ -104,6 +104,7 @@ class StaticSecret < ApplicationRecord
   validate :replace_config_matches_schema
   validate :kind_config_matches_profile
   validate :kind_rules_match_profile
+  validate :discord_github_policy_valid
 
   private
 
@@ -138,6 +139,10 @@ class StaticSecret < ApplicationRecord
 
   def kind_rules_match_profile
     validate_kind_rules(rules: @kind_rules_for_validation || rules)
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_static_secret(self)
   end
 
   def validate_against_schema(attr, value, schema)

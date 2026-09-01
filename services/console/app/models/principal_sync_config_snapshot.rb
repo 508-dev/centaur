@@ -328,7 +328,15 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # non-deliverable winner never suppresses a credential that would otherwise
   # serve.
   def self.served_credentials_for(principal, extra_static: [])
-    static = principal.granted_static_secrets.select { |ss| ss.source&.deliverable? }
+    static = principal.granted_static_secrets.select do |secret|
+      next false unless secret.source&.deliverable?
+      next true if DiscordGithubRolePolicy.static_secret_allowed_for_principal?(principal, secret)
+
+      Rails.logger.warn do
+        "discord_github_policy_credential_denied principal=#{principal.oid} secret=#{secret.oid}"
+      end
+      false
+    end
     static = merge_static_credentials(static, extra_static) if extra_static.any?
     gcp_auth = principal.granted_gcp_auth_secrets.to_a
     gcp_id_token = principal.granted_gcp_id_token_secrets.to_a

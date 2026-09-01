@@ -440,14 +440,18 @@ impl SessionRegistrar {
                 continue;
             }
 
-            if kind == Some(GITHUB_TOKEN_KIND) {
-                let secret_scope = parse_secret_repository_scope(&secret)?;
-                if secret_scope != expected_scope {
-                    return Err(IronControlError::DiscordPolicy(
-                        "Discord GitHub token declaration differs from the ingress repository scope"
-                            .to_owned(),
-                    ));
-                }
+            if kind != Some(GITHUB_TOKEN_KIND) {
+                return Err(IronControlError::DiscordPolicy(
+                    "Discord GitHub App credential must use the canonical github_token static-secret profile"
+                        .to_owned(),
+                ));
+            }
+            let secret_scope = parse_secret_repository_scope(&secret)?;
+            if secret_scope != expected_scope {
+                return Err(IronControlError::DiscordPolicy(
+                    "Discord GitHub token declaration differs from the ingress repository scope"
+                        .to_owned(),
+                ));
             }
             let credential_scope = parse_broker_repository_scope(&credential)?;
             if credential_scope != expected_scope {
@@ -1013,6 +1017,7 @@ mod tests {
     async fn register_session_reconciles_discord_actor_to_the_exact_reviewed_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: false,
+            github_secret_kind: GITHUB_TOKEN_KIND,
             github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: true,
         })
@@ -1075,6 +1080,7 @@ mod tests {
     async fn register_session_rejects_discord_principal_direct_grants() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: true,
+            github_secret_kind: GITHUB_TOKEN_KIND,
             github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: true,
         })
@@ -1104,6 +1110,7 @@ mod tests {
     async fn register_session_rejects_unreviewed_discord_policy_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: false,
+            github_secret_kind: GITHUB_TOKEN_KIND,
             github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: false,
         })
@@ -1134,6 +1141,7 @@ mod tests {
         for repositories in [r#"[]"#, r#"["508-dev/centaur","508-dev/other"]"#] {
             let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
                 direct_grant: false,
+                github_secret_kind: GITHUB_TOKEN_KIND,
                 github_repositories: repositories,
                 reviewed_role: true,
             })
@@ -1158,6 +1166,36 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn register_session_rejects_custom_discord_github_app_wrapper() {
+        let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
+            direct_grant: false,
+            github_secret_kind: "custom",
+            github_repositories: r#"["508-dev/centaur"]"#,
+            reviewed_role: true,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let error = registrar
+            .register_session(
+                "discord:200000000000000001:300000000000000001:400000000000000001",
+                Some(&discord_policy_metadata()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IronControlError::DiscordPolicy(_)));
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request == "PUT /api/v1/principals/prn_discord/roles"),
+            "a custom GitHub App wrapper blocks before role assignment"
+        );
+        server.abort();
     }
 
     #[test]
@@ -1485,6 +1523,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct DiscordPolicyStub {
         direct_grant: bool,
+        github_secret_kind: &'static str,
         github_repositories: &'static str,
         reviewed_role: bool,
     }
@@ -1531,7 +1570,10 @@ mod tests {
                     r#"{"data":[]}"#
                 };
                 let role_grants = r#"{"data":[{"id":"grant_github","role_id":"role_observer","static_secret_id":"ssr_github"}]}"#;
-                let github_secret = r#"{"data":{"id":"ssr_github","kind":"github_token","labels":{"repositories":"508-dev/centaur"},"source":{"source_type":"token_broker","config":{"credential_id":"bcr_github"}}}}"#;
+                let github_secret = format!(
+                    r#"{{"data":{{"id":"ssr_github","kind":"{}","labels":{{"repositories":"508-dev/centaur"}},"source":{{"source_type":"token_broker","config":{{"credential_id":"bcr_github"}}}}}}}}"#,
+                    config.github_secret_kind
+                );
                 let github_credential = format!(
                     r#"{{"data":{{"id":"bcr_github","grant":"github_app_installation","github_repositories":{}}}}}"#,
                     config.github_repositories
@@ -1552,9 +1594,7 @@ mod tests {
                     ("GET", "/api/v1/roles/role_observer/grants?page=1&limit=100") => {
                         ("200 OK", role_grants.to_owned())
                     }
-                    ("GET", "/api/v1/static_secrets/ssr_github") => {
-                        ("200 OK", github_secret.to_owned())
-                    }
+                    ("GET", "/api/v1/static_secrets/ssr_github") => ("200 OK", github_secret),
                     ("GET", "/api/v1/broker_credentials/bcr_github") => {
                         ("200 OK", github_credential)
                     }
