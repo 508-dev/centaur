@@ -354,6 +354,41 @@ module Api
         assert_nil RequestRule.find_by(id: old_rule.id), "old rule should be deleted"
       end
 
+      test "PUT rejects replacing a Discord policy secret's safe rules with a GitHub target" do
+        ref = StaticSecret.create!(
+          foreign_id: "discord-policy-custom-#{SecureRandom.hex(4)}",
+          name: "Discord policy custom secret",
+          kind: "custom",
+          inject_config: { "header" => "X-Policy-Token", "formatter" => "{{ .Value }}" },
+          created_by: users(:acme_admin),
+          rules: [ RequestRule.new(host: "safe.example.test", position: 0) ]
+        )
+        role = Role.create!(
+          foreign_id: "discord-policy-role-#{SecureRandom.hex(4)}",
+          name: "Discord policy role",
+          labels: {
+            "centaur_discord_policy_managed" => "true",
+            "repository_scope" => "508-dev/centaur"
+          },
+          created_by: users(:acme_admin)
+        )
+        Grant.create!(role: role, static_secret: ref, created_by: users(:acme_admin))
+
+        body = {
+          data: {
+            name: ref.name,
+            inject_config: ref.inject_config,
+            rules: [ { host: "api.github.com" } ]
+          }
+        }
+
+        put api_v1_static_secret_url(id: ref.oid), params: body.to_json, headers: auth_headers
+        assert_response :unprocessable_content
+        assert_includes json_body.dig("error", "details", "base").join(" "),
+                        "GitHub App credential must use the canonical github_token static-secret profile"
+        assert_equal [ "safe.example.test" ], ref.reload.rules.map(&:host)
+      end
+
       test "PUT with an unchanged document does not bump the sync config cache version" do
         ref = static_secrets(:github_token_inject)
         source = SecretSource.create!(source_type: "control_plane", secret: "same-secret",

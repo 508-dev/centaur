@@ -31,7 +31,11 @@ class DiscordGithubRolePolicy
 
     def validate_static_secret(secret)
       policy_roles_granting(secret).each do |role|
-        messages = policy_errors(role, replacement_static_secret: secret)
+        messages = policy_errors(
+          role,
+          replacement_static_secret: secret,
+          replacement_rules: secret.kind_rules_for_validation
+        )
         add_errors(secret, prefix_errors(role, messages))
       end
     end
@@ -114,7 +118,7 @@ class DiscordGithubRolePolicy
     end
 
     def policy_errors(role, replacement_static_secret: nil, replacement_source: nil,
-                      replacement_broker: nil, extra_static_secret: nil)
+                      replacement_broker: nil, extra_static_secret: nil, replacement_rules: nil)
       return [] unless managed_role?(role)
 
       expected_scope, scope_error = repository_scope(
@@ -129,7 +133,13 @@ class DiscordGithubRolePolicy
         extra_static_secret: extra_static_secret
       )
       github_secrets = secrets.select do |secret|
-        github_related_secret?(secret, replacement_static_secret, replacement_source, replacement_broker)
+        github_related_secret?(
+          secret,
+          replacement_static_secret,
+          replacement_source,
+          replacement_broker,
+          replacement_rules: replacement_rules
+        )
       end
       return [] if github_secrets.empty?
 
@@ -139,7 +149,8 @@ class DiscordGithubRolePolicy
           expected_scope,
           replacement_static_secret,
           replacement_source,
-          replacement_broker
+          replacement_broker,
+          replacement_rules: replacement_rules
         )
       end
       if github_secrets.length != 1
@@ -161,9 +172,10 @@ class DiscordGithubRolePolicy
       secrets.uniq { |secret| secret.id || secret.object_id }
     end
 
-    def github_related_secret?(secret, replacement_static_secret, replacement_source, replacement_broker)
+    def github_related_secret?(secret, replacement_static_secret, replacement_source, replacement_broker,
+                               replacement_rules:)
       return true if secret.kind == CredentialProfiles::GithubToken::KIND
-      return true if secret.rules.to_a.any? { |rule| github_host_rule?(rule) }
+      return true if rules_for(secret, replacement_static_secret, replacement_rules).any? { |rule| github_host_rule?(rule) }
 
       broker = broker_for(
         source_for(secret, replacement_static_secret, replacement_source),
@@ -180,9 +192,9 @@ class DiscordGithubRolePolicy
     end
 
     def github_secret_errors(secret, expected_scope, replacement_static_secret,
-                             replacement_source, replacement_broker)
+                             replacement_source, replacement_broker, replacement_rules:)
       errors = []
-      unless canonical_github_token?(secret)
+      unless canonical_github_token?(secret, rules: rules_for(secret, replacement_static_secret, replacement_rules))
         errors << "GitHub App credential must use the canonical github_token static-secret profile"
       end
 
@@ -218,15 +230,20 @@ class DiscordGithubRolePolicy
       errors
     end
 
-    def canonical_github_token?(secret)
+    def canonical_github_token?(secret, rules: secret.rules.to_a)
       return false unless secret.kind == CredentialProfiles::GithubToken::KIND
       return false unless secret.inject_config.blank? &&
                           secret.replace_config == CredentialProfiles::GithubToken::REPLACE_CONFIG
 
-      rules = secret.rules.to_a
       rules.present? && rules.all? do |rule|
         CredentialProfiles::GithubToken::ALLOWED_HOSTS.include?(rule.host) && rule.cidr.blank?
       end
+    end
+
+    def rules_for(secret, replacement_static_secret, replacement_rules)
+      return replacement_rules if replacement_rules && same_record?(secret, replacement_static_secret)
+
+      secret.rules.to_a
     end
 
     def source_for(secret, replacement_static_secret, replacement_source)
