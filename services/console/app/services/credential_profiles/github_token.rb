@@ -36,12 +36,13 @@ module CredentialProfiles
     end
 
     # Host-based rather than an exact match against RULE_ATTRIBUTES so secrets
-    # seeded before a host was added stay valid on later saves.
+    # seeded before a host was added stay valid on later saves and a reviewed
+    # credential may further narrow an allowed host by HTTP method and path.
+    # RequestRule owns validation of those optional method/path constraints.
     def validate_rules(secret, rules:)
       actual = Array(rules)
       confined = actual.present? && actual.all? do |rule|
-        ALLOWED_HOSTS.include?(rule.host) &&
-          rule.cidr.blank? && rule.http_methods.blank? && rule.paths.blank?
+        ALLOWED_HOSTS.include?(rule.host) && rule.cidr.blank?
       end
       return if confined
 
