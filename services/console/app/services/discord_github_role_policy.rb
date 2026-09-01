@@ -175,7 +175,7 @@ class DiscordGithubRolePolicy
     def github_related_secret?(secret, replacement_static_secret, replacement_source, replacement_broker,
                                replacement_rules:)
       return true if secret.kind == CredentialProfiles::GithubToken::KIND
-      return true if rules_for(secret, replacement_static_secret, replacement_rules).any? { |rule| github_host_rule?(rule) }
+      return true if rules_for(secret, replacement_static_secret, replacement_rules).any? { |rule| github_targetable_rule?(rule) }
 
       broker = broker_for(
         source_for(secret, replacement_static_secret, replacement_source),
@@ -189,6 +189,13 @@ class DiscordGithubRolePolicy
       CredentialProfiles::GithubToken::ALLOWED_HOSTS.any? do |github_host|
         File.fnmatch?(host, github_host)
       end
+    end
+
+    # GitHub's address space is not a stable authorization boundary. A CIDR
+    # rule can cover an address GitHub serves now or later, so reviewed Discord
+    # roles may only receive the canonical host-scoped GitHub App credential.
+    def github_targetable_rule?(rule)
+      rule.cidr.present? || github_host_rule?(rule)
     end
 
     def github_secret_errors(secret, expected_scope, replacement_static_secret,
