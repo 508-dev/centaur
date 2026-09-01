@@ -98,6 +98,46 @@ module Api
         assert_response :not_found
       end
 
+      test "PUT atomically replaces roles and sandbox policy" do
+        principal = principals(:acme_channel)
+        role = roles(:acme_admin_role)
+        body = {
+          data: {
+            role_ids: [ role.oid ],
+            sandbox_repo_cache: "all",
+            sandbox_observability_enabled: false,
+            sandbox_sessions_read_enabled: true,
+            sandbox_workflows_read_enabled: true,
+            sandbox_workflows_write_enabled: false
+          }
+        }
+
+        put api_v1_principal_roles_url(principal_id: principal.oid),
+            params: body.to_json, headers: auth_headers
+
+        assert_response :ok
+        assert_equal [ role.oid ], json_body.fetch("data").map { |item| item.fetch("id") }
+        principal.reload
+        assert_equal [ role.id ], principal.role_ids
+        assert_equal "all", principal.sandbox_repo_cache
+        assert_not principal.sandbox_observability_enabled
+        assert principal.sandbox_sessions_read_enabled
+        assert principal.sandbox_workflows_read_enabled
+        assert_not principal.sandbox_workflows_write_enabled
+      end
+
+      test "PUT rejects partial policy without changing roles" do
+        principal = principals(:acme_channel)
+        previous_role_ids = principal.role_ids
+
+        put api_v1_principal_roles_url(principal_id: principal.oid),
+            params: { data: { role_ids: [ roles(:acme_admin_role).oid ] } }.to_json,
+            headers: auth_headers
+
+        assert_response :bad_request
+        assert_equal previous_role_ids, principal.reload.role_ids
+      end
+
       test "DELETE unassigns a role" do
         principal = principals(:acme_channel)
         role = roles(:acme_infra)

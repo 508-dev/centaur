@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
-use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
+use crate::models::{Principal, PrincipalInput, PrincipalPolicyInput, SlackChannelPermissionInput};
 use crate::principal::{
     derive_principal_with_slack_team, derive_slack_requester_principal, is_direct_message,
     slack_conversation_id,
@@ -45,6 +45,7 @@ struct DiscordPrincipalCapabilities {
 }
 
 impl DiscordPrincipalCapabilities {
+    #[cfg(test)]
     fn safe() -> Self {
         Self {
             repo_cache: "none".to_owned(),
@@ -268,10 +269,9 @@ impl SessionRegistrar {
 
     /// Replace every role on an actor-scoped Discord principal with the one
     /// reviewed policy role asserted by the authenticated Discord ingress.
-    /// Defaults and stale roles are removed before the desired role is added,
-    /// so a partial failure can only narrow access. Direct grants are never
-    /// deleted implicitly; their presence fails session creation for an
-    /// operator to reconcile explicitly.
+    /// Console replaces the role and capability tuple in one row-locked
+    /// transaction. Direct grants are never deleted implicitly; their presence
+    /// fails session creation for an operator to reconcile explicitly.
     async fn reconcile_discord_policy_roles(
         &self,
         principal: &Principal,
@@ -334,62 +334,20 @@ impl SessionRegistrar {
                 .labels,
         )?;
 
-        // Persist a conservative baseline before removing defaults or changing
-        // role assignments. If a later API call fails, the stored principal is
-        // no more capable than the global defaults.
-        let narrowed = self
-            .apply_discord_principal_capabilities(principal, &DiscordPrincipalCapabilities::safe())
-            .await?;
-        let desired_ids = desired_roles
-            .iter()
-            .map(|role| role.id.as_str())
-            .collect::<BTreeSet<_>>();
-        let current_roles = self.client.list_principal_roles(&narrowed.id).await?;
-        for role in &current_roles {
-            if !desired_ids.contains(role.id.as_str()) {
-                self.client.unassign_role(&narrowed.id, &role.id).await?;
-            }
-        }
-        let current_ids = current_roles
-            .iter()
-            .map(|role| role.id.as_str())
-            .collect::<BTreeSet<_>>();
-        for role in desired_roles {
-            if !current_ids.contains(role.id.as_str()) {
-                self.client.assign_role(&narrowed.id, &role.id).await?;
-            }
-        }
-        self.apply_discord_principal_capabilities(&narrowed, &capabilities)
-            .await
-    }
-
-    async fn apply_discord_principal_capabilities(
-        &self,
-        principal: &Principal,
-        capabilities: &DiscordPrincipalCapabilities,
-    ) -> Result<Principal> {
-        let foreign_id = principal.foreign_id.clone().ok_or_else(|| {
-            IronControlError::DiscordPolicy(
-                "policy-managed Discord principal has no foreign ID".to_owned(),
-            )
-        })?;
+        let policy = PrincipalPolicyInput {
+            role_ids: desired_roles.into_iter().map(|role| role.id).collect(),
+            sandbox_repo_cache: capabilities.repo_cache,
+            sandbox_observability_enabled: capabilities.observability,
+            sandbox_sessions_read_enabled: capabilities.sessions_read,
+            sandbox_workflows_read_enabled: capabilities.workflows_read,
+            sandbox_workflows_write_enabled: capabilities.workflows_write,
+        };
         self.client
-            .upsert_principal(&PrincipalInput {
-                foreign_id,
-                name: principal.name.clone(),
-                labels: BTreeMap::new(),
-                kind: None,
-                slack_user_id: None,
-                slack_channel_id: None,
-                slack_team_id: None,
-                slack_email: None,
-                sandbox_repo_cache: Some(capabilities.repo_cache.clone()),
-                sandbox_observability_enabled: Some(capabilities.observability),
-                sandbox_sessions_read_enabled: Some(capabilities.sessions_read),
-                sandbox_workflows_read_enabled: Some(capabilities.workflows_read),
-                sandbox_workflows_write_enabled: Some(capabilities.workflows_write),
-            })
-            .await
+            .replace_principal_policy(&principal.id, &policy)
+            .await?;
+        let mut reconciled = principal.clone();
+        reconciled.sandbox_observability_enabled = policy.sandbox_observability_enabled;
+        Ok(reconciled)
     }
 }
 
@@ -819,7 +777,6 @@ mod tests {
     #[tokio::test]
     async fn register_session_reconciles_discord_actor_to_the_exact_reviewed_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
-            current_stale_role: true,
             direct_grant: false,
             reviewed_role: true,
         })
@@ -848,20 +805,23 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             principal_updates.len(),
-            3,
-            "initial upsert, conservative baseline, then reviewed capabilities"
+            1,
+            "identity upsert remains separate from the atomic policy replacement"
         );
-        let remove = requests
+        let replace = requests
             .iter()
-            .position(|request| request == "DELETE /api/v1/principals/prn_discord/roles/role_stale")
-            .expect("stale/default role is removed");
-        let assign = requests
-            .iter()
-            .position(|request| request == "POST /api/v1/principals/prn_discord/roles")
-            .expect("reviewed role is assigned");
+            .position(|request| request == "PUT /api/v1/principals/prn_discord/roles")
+            .expect("roles and capabilities are replaced atomically");
         assert!(
-            principal_updates[1] < remove && remove < assign && assign < principal_updates[2],
-            "capabilities and roles reconcile from a conservative baseline before widening"
+            principal_updates[0] < replace,
+            "identity is verified before its reviewed policy is committed"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "PUT /api/v1/principals/prn_discord/roles")
+                .count(),
+            1,
         );
         server.abort();
     }
@@ -869,7 +829,6 @@ mod tests {
     #[tokio::test]
     async fn register_session_rejects_discord_principal_direct_grants() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
-            current_stale_role: false,
             direct_grant: true,
             reviewed_role: true,
         })
@@ -898,7 +857,6 @@ mod tests {
     #[tokio::test]
     async fn register_session_rejects_unreviewed_discord_policy_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
-            current_stale_role: true,
             direct_grant: false,
             reviewed_role: false,
         })
@@ -917,6 +875,7 @@ mod tests {
             !requests.lock().unwrap().iter().any(|request| {
                 request.starts_with("DELETE ")
                     || request == "POST /api/v1/principals/prn_discord/roles"
+                    || request == "PUT /api/v1/principals/prn_discord/roles"
             }),
             "an unreviewed role blocks before any assignment mutation"
         );
@@ -1246,7 +1205,6 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct DiscordPolicyStub {
-        current_stale_role: bool,
         direct_grant: bool,
         reviewed_role: bool,
     }
@@ -1292,11 +1250,6 @@ mod tests {
                 } else {
                     r#"{"data":[]}"#
                 };
-                let roles = if config.current_stale_role {
-                    r#"{"data":[{"id":"role_stale","foreign_id":"default-agent","name":"Default Agent","labels":{}}]}"#
-                } else {
-                    r#"{"data":[]}"#
-                };
                 let (status_line, body) = match (method, path) {
                     (
                         "GET",
@@ -1310,9 +1263,7 @@ mod tests {
                         ("200 OK", grants.to_owned())
                     }
                     ("GET", "/api/v1/roles/lookup/discord-observer") => ("200 OK", role),
-                    ("GET", "/api/v1/principals/prn_discord/roles") => ("200 OK", roles.to_owned()),
-                    ("DELETE", "/api/v1/principals/prn_discord/roles/role_stale")
-                    | ("POST", "/api/v1/principals/prn_discord/roles") => {
+                    ("PUT", "/api/v1/principals/prn_discord/roles") => {
                         ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
                     }
                     _ => (

@@ -16,8 +16,8 @@ use crate::models::{
     AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope,
     EffectiveConfig, GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee,
     HmacSecretInput, IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal,
-    PrincipalInput, Proxy, ProxyInput, Role, SecretRecord, SlackChannelPermissionInput,
-    StaticSecretInput,
+    PrincipalInput, PrincipalPolicyInput, Proxy, ProxyInput, Role, SecretRecord,
+    SlackChannelPermissionInput, StaticSecretInput,
 };
 
 const API_PREFIX: &str = "/api/v1";
@@ -155,6 +155,21 @@ impl IronControlClient {
         );
         self.write_unit(Method::POST, &path, &json!({ "role_id": role_id }))
             .await
+    }
+
+    /// Atomically replace a principal's complete role set and sandbox policy.
+    /// The Console locks the principal row for the whole replacement, so two
+    /// actor-policy reconciliations cannot leave a union of their roles.
+    pub async fn replace_principal_policy(
+        &self,
+        principal_id: &str,
+        input: &PrincipalPolicyInput,
+    ) -> Result<()> {
+        let path = format!(
+            "{API_PREFIX}/principals/{}/roles",
+            urlencoding::encode(principal_id)
+        );
+        self.write_unit(Method::PUT, &path, input).await
     }
 
     /// Create or update one Slack channel permission row on a principal without

@@ -492,6 +492,22 @@ fn http_request_scope_rejects_invalid_methods_and_paths() {
 }
 
 #[test]
+fn http_request_scope_trims_reviewed_methods_and_paths() {
+    let parsed = tools::parse_secret(
+        &entry(
+            r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = [" GET "], paths = [" /v1/* "]}"#,
+        ),
+        &[],
+    )
+    .unwrap();
+    let ParsedSecret::Http(http) = parsed else {
+        panic!("expected http")
+    };
+    assert_eq!(http.http_methods, ["GET"]);
+    assert_eq!(http.paths, ["/v1/*"]);
+}
+
+#[test]
 fn translates_gcp_auth_defaults_scopes_when_unset() {
     let secrets = vec![
         tools::parse_secret(
