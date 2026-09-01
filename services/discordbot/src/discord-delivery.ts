@@ -1,7 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Logger, StateAdapter } from "chat";
+import { resolveDiscordApiBase } from "./discord-api";
 import { resolveChannelAllowlist } from "./discord-allowlist";
-import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotOptions } from "./types";
 
 const MAX_DELIVERY_ID_LENGTH = 128;
@@ -20,6 +20,7 @@ export type DiscordDeliveryResult = {
   delivery_id: string;
   message_id: string;
   ok: true;
+  request_fingerprint: string;
 };
 
 export class DiscordDeliveryError extends Error {
@@ -51,6 +52,7 @@ export async function deliverDiscordNotification(
   logger: Logger,
 ): Promise<DiscordDeliveryResult> {
   const input = validateDeliveryInput(raw, options);
+  const requestFingerprint = deliveryRequestFingerprint(input);
   const resultKey = `discordbot:delivery:result:${input.delivery_id}`;
   const leaseKey = `discordbot:delivery:lease:${input.delivery_id}`;
 
@@ -60,7 +62,8 @@ export async function deliverDiscordNotification(
   } catch {
     throw new DiscordDeliveryError("state_unavailable", 503);
   }
-  if (isDeliveryResult(existing, input)) return existing;
+  const existingResult = existingDeliveryResult(existing, requestFingerprint);
+  if (existingResult) return existingResult;
 
   const leaseToken = randomUUID();
   let claimed: boolean;
@@ -77,9 +80,10 @@ export async function deliverDiscordNotification(
 
   try {
     existing = await state.get<unknown>(resultKey);
-    if (isDeliveryResult(existing, input)) return existing;
+    const claimedResult = existingDeliveryResult(existing, requestFingerprint);
+    if (claimedResult) return claimedResult;
 
-    const result = await postDiscordMessage(input, options);
+    const result = await postDiscordMessage(input, requestFingerprint, options);
     await state.set(resultKey, result, DELIVERY_RESULT_TTL_MS);
     logger.info("discordbot_delivery_audit", {
       channel_id: result.channel_id,
@@ -147,12 +151,18 @@ function validateDeliveryInput(
 
 async function postDiscordMessage(
   input: DiscordDeliveryInput,
+  requestFingerprint: string,
   options: DiscordbotOptions,
 ): Promise<DiscordDeliveryResult> {
-  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
-    /\/$/,
-    "",
-  );
+  let apiBase: string;
+  try {
+    apiBase = resolveDiscordApiBase(
+      options.discordApiUrl,
+      options.allowInProcessGatewayEmulation === true,
+    );
+  } catch {
+    throw new DiscordDeliveryError("discord_api_url_invalid", 502);
+  }
   const nonce = createHash("sha256")
     .update(input.delivery_id)
     .digest("hex")
@@ -184,21 +194,39 @@ async function postDiscordMessage(
     delivery_id: input.delivery_id,
     message_id: body.id,
     ok: true,
+    request_fingerprint: requestFingerprint,
   };
 }
 
-function isDeliveryResult(
+function existingDeliveryResult(
   value: unknown,
-  input: DiscordDeliveryInput,
-): value is DiscordDeliveryResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  requestFingerprint: string,
+): DiscordDeliveryResult | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DiscordDeliveryError("delivery_id_conflict", 409);
+  }
   const result = value as Partial<DiscordDeliveryResult>;
-  return (
+  const valid =
     result.ok === true &&
-    result.channel_id === input.channel_id &&
-    result.delivery_id === input.delivery_id &&
-    typeof result.message_id === "string"
-  );
+    result.request_fingerprint === requestFingerprint &&
+    typeof result.channel_id === "string" &&
+    typeof result.delivery_id === "string" &&
+    typeof result.message_id === "string";
+  if (!valid) {
+    throw new DiscordDeliveryError("delivery_id_conflict", 409);
+  }
+  return result as DiscordDeliveryResult;
+}
+
+function deliveryRequestFingerprint(input: DiscordDeliveryInput): string {
+  const canonical = JSON.stringify([
+    1,
+    input.delivery_id,
+    input.channel_id,
+    input.text,
+  ]);
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {

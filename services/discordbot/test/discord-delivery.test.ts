@@ -9,6 +9,7 @@ import {
 import type { DiscordbotOptions } from "../src/types";
 
 const CHANNEL_ID = "1542739830591459369";
+const OTHER_CHANNEL_ID = "1542739830591459000";
 const MESSAGE_ID = "1542739830591459999";
 
 function options(fetchFn: typeof fetch): DiscordbotOptions {
@@ -95,6 +96,73 @@ describe("Discord workflow delivery", () => {
     expect(String(requests[0]?.body.nonce)).toHaveLength(24);
     expect(audits).toHaveLength(1);
     expect(audits[0]).not.toHaveProperty("text");
+    expect(first.request_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it("rejects conflicting reuse of a delivery id before a second post", async () => {
+    let requests = 0;
+    const fetchFn = (async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ id: MESSAGE_ID }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const configured = options(fetchFn);
+    configured.channelAllowlist = [CHANNEL_ID, OTHER_CHANNEL_ID];
+    const state = createMemoryState();
+    await state.connect();
+    const original = {
+      channel_id: CHANNEL_ID,
+      delivery_id: "weekly-ops:stable-id",
+      text: "Original bounded digest.",
+    };
+    await deliverDiscordNotification(
+      original,
+      configured,
+      state,
+      recordingLogger([]),
+    );
+
+    for (const conflict of [
+      { ...original, text: "Different text." },
+      { ...original, channel_id: OTHER_CHANNEL_ID },
+    ]) {
+      const error = await deliverDiscordNotification(
+        conflict,
+        configured,
+        state,
+        recordingLogger([]),
+      ).catch((caught) => caught);
+      expect(error).toBeInstanceOf(DiscordDeliveryError);
+      expect(error.code).toBe("delivery_id_conflict");
+      expect(error.status).toBe(409);
+    }
+    expect(requests).toBe(1);
+  });
+
+  it("rejects a non-HTTPS Discord API before sending the bot token", async () => {
+    let requests = 0;
+    const fetchFn = (async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ id: MESSAGE_ID }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const configured = options(fetchFn);
+    configured.discordApiUrl = "http://discord.invalid/api/v10";
+    const state = createMemoryState();
+    await state.connect();
+
+    const error = await deliverDiscordNotification(
+      {
+        channel_id: CHANNEL_ID,
+        delivery_id: "weekly-ops:unsafe-origin",
+        text: "Must not send.",
+      },
+      configured,
+      state,
+      recordingLogger([]),
+    ).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(DiscordDeliveryError);
+    expect(error.code).toBe("discord_api_url_invalid");
+    expect(requests).toBe(0);
   });
 
   it("rejects an unlisted destination before any Discord request", async () => {
@@ -108,7 +176,7 @@ describe("Discord workflow delivery", () => {
 
     const error = await deliverDiscordNotification(
       {
-        channel_id: "1542739830591459000",
+        channel_id: OTHER_CHANNEL_ID,
         delivery_id: "weekly-ops:blocked",
         text: "should not post",
       },

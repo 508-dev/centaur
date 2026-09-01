@@ -314,4 +314,18 @@ describe("Discord ingress context", () => {
       isDiscordIngressAllowlistEmpty(options({ roleBindings: [] })),
     ).toBe(true);
   });
+
+  it("does not let a legacy role reactivate an explicitly empty policy", () => {
+    expect(
+      discordIngressDenialReason(
+        {
+          authorIsBot: false,
+          channelId: "C1",
+          guildId: "G1",
+          roleIds: ["R1"],
+        },
+        options({ roleBindings: [], triggerRoleAllowlist: ["R1"] }),
+      ),
+    ).toBe("role_allowlist_empty");
+  });
 });

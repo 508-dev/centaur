@@ -17,6 +17,15 @@ const MAX_PROPOSAL_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_PARAMETERS_BYTES: usize = 16 * 1024;
 const MAX_PARAMETER_DEPTH: usize = 8;
 const APPROVAL_ROLE_ALLOWLIST_ENV: &str = "DISCORDBOT_APPROVAL_ROLE_ALLOWLIST";
+const ACTION_PROPOSAL_BINDINGS_ENV: &str = "CENTAUR_ACTION_PROPOSAL_BINDINGS_JSON";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionProposalBinding {
+    action_type: String,
+    action_workflow: String,
+    observer_workflow: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -121,7 +130,7 @@ impl ActionProposal {
     pub fn normalize_and_fingerprint(mut self) -> Result<(Self, String), WorkflowRuntimeError> {
         self.action_type = bounded_identifier("action_type", &self.action_type, 96)?;
         self.action_workflow = bounded_identifier("action_workflow", &self.action_workflow, 128)?;
-        self.repository = exact_repository(&self.repository)?;
+        self.repository = normalize_exact_repository(&self.repository)?;
         self.base_ref = bounded_string("base_ref", &self.base_ref, 128)?;
         self.head_ref = self
             .head_ref
@@ -226,6 +235,11 @@ pub async fn put_action_proposal(
         )));
     }
     let (proposal, fingerprint) = request.proposal.normalize_and_fingerprint()?;
+    let action_workflow = reviewed_action_workflow(
+        observer_workflow,
+        &proposal.action_type,
+        &proposal.action_workflow,
+    )?;
     let proposal_json = serde_json::to_value(&proposal)?;
     let expires_at =
         OffsetDateTime::now_utc() + time::Duration::seconds(request.expires_in_seconds);
@@ -237,7 +251,7 @@ pub async fn put_action_proposal(
     )
     .bind(&fingerprint)
     .bind(&proposal_json)
-    .bind(&proposal.action_workflow)
+    .bind(&action_workflow)
     .bind(observer_workflow)
     .bind(observer_task_id)
     .bind(observer_run_id)
@@ -284,23 +298,24 @@ impl WorkflowRuntime {
         fingerprint: &str,
         mut request: ApproveActionProposalRequest,
     ) -> Result<ApproveActionProposalResponse, WorkflowRuntimeError> {
-        validate_approval_request(fingerprint, &request)?;
+        let fingerprint = validate_approval_request(fingerprint, &request)?;
         request.repository_scope = request
             .repository_scope
             .iter()
-            .map(|repository| exact_repository(repository))
+            .map(|repository| normalize_exact_repository(repository))
             .collect::<Result<Vec<_>, _>>()?;
         request.repository_scope.sort();
         let mut tx = self.inner.client.pool().begin().await?;
         let row = sqlx::query(
-            "SELECT proposal, action_workflow, expires_at, consumed_at, action_task_id, action_run_id \
+            "SELECT proposal, action_workflow, observer_workflow, expires_at, consumed_at, action_task_id, action_run_id \
              FROM workflow_action_proposals WHERE fingerprint = $1 FOR UPDATE",
         )
-        .bind(fingerprint)
+        .bind(&fingerprint)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| WorkflowRuntimeError::NotFound("action proposal not found".to_owned()))?;
-        let action_workflow: String = row.try_get("action_workflow")?;
+        let stored_action_workflow: String = row.try_get("action_workflow")?;
+        let observer_workflow: String = row.try_get("observer_workflow")?;
         let proposal_value: Value = row.try_get("proposal")?;
         let (proposal, computed_fingerprint) =
             serde_json::from_value::<ActionProposal>(proposal_value.clone())?
@@ -308,6 +323,16 @@ impl WorkflowRuntime {
         if computed_fingerprint != fingerprint {
             return Err(WorkflowRuntimeError::Internal(
                 "stored action proposal fingerprint is invalid".to_owned(),
+            ));
+        }
+        let action_workflow = reviewed_action_workflow(
+            &observer_workflow,
+            &proposal.action_type,
+            &proposal.action_workflow,
+        )?;
+        if action_workflow != stored_action_workflow {
+            return Err(WorkflowRuntimeError::Internal(
+                "stored action proposal workflow binding is invalid".to_owned(),
             ));
         }
         if !proposal.is_approvable() {
@@ -330,7 +355,7 @@ impl WorkflowRuntime {
         ) {
             tx.commit().await?;
             return Ok(approval_response(
-                fingerprint,
+                &fingerprint,
                 &action_workflow,
                 action_task_id,
                 action_run_id,
@@ -355,7 +380,7 @@ impl WorkflowRuntime {
                         "message_id": request.message_id,
                         "policy_fingerprint": request.policy_fingerprint,
                         "principal_role": request.principal_role,
-                        "proposal_fingerprint": fingerprint,
+                        "proposal_fingerprint": &fingerprint,
                         "repository_scope": request.repository_scope,
                         "root_message_id": request.root_message_id,
                         "thread_id": request.thread_id,
@@ -376,7 +401,7 @@ impl WorkflowRuntime {
              action_task_id = $12, action_run_id = $13, updated_at = NOW() \
              WHERE fingerprint = $1 AND consumed_at IS NULL",
         )
-        .bind(fingerprint)
+        .bind(&fingerprint)
         .bind(&request.actor_id)
         .bind(&request.message_id)
         .bind(&request.guild_id)
@@ -393,7 +418,7 @@ impl WorkflowRuntime {
         .await?;
         tx.commit().await?;
         Ok(approval_response(
-            fingerprint,
+            &fingerprint,
             &action_workflow,
             run.task_id,
             run.run_id,
@@ -443,6 +468,13 @@ async fn try_transition_notification_state(
     let state_class = request.state_class;
     let active = request.semantic_fingerprint.is_some();
     let mut tx = client.pool().begin().await?;
+    // A missing scope row cannot be protected by SELECT ... FOR UPDATE. Take a
+    // transaction-scoped advisory lock first so concurrent first transitions
+    // calculate notification ownership one at a time across API replicas.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&scope)
+        .fetch_optional(&mut *tx)
+        .await?;
     let previous = sqlx::query(
         "SELECT semantic_fingerprint, state_class, active, last_notification_workflow_run_id \
          FROM workflow_semantic_notification_states \
@@ -565,7 +597,7 @@ fn action_proposal_state(
 fn validate_approval_request(
     fingerprint: &str,
     request: &ApproveActionProposalRequest,
-) -> Result<(), WorkflowRuntimeError> {
+) -> Result<String, WorkflowRuntimeError> {
     let allowed_roles = env::var(APPROVAL_ROLE_ALLOWLIST_ENV)
         .unwrap_or_default()
         .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -579,8 +611,8 @@ fn validate_approval_request_with_roles(
     fingerprint: &str,
     request: &ApproveActionProposalRequest,
     allowed_roles: &[String],
-) -> Result<(), WorkflowRuntimeError> {
-    sha256_fingerprint("proposal fingerprint", fingerprint)?;
+) -> Result<String, WorkflowRuntimeError> {
+    let fingerprint = sha256_fingerprint("proposal fingerprint", fingerprint)?;
     for (name, value) in [
         ("actor_id", request.actor_id.as_str()),
         ("channel_id", request.channel_id.as_str()),
@@ -618,14 +650,14 @@ fn validate_approval_request_with_roles(
     }
     let mut repositories = BTreeSet::new();
     for repository in &request.repository_scope {
-        let repository = exact_repository(repository)?;
+        let repository = normalize_exact_repository(repository)?;
         if !repositories.insert(repository) {
             return Err(WorkflowRuntimeError::BadRequest(
                 "approval repository_scope must contain unique repositories".to_owned(),
             ));
         }
     }
-    Ok(())
+    Ok(fingerprint)
 }
 
 fn approval_response(
@@ -728,7 +760,7 @@ fn bounded_string(name: &str, value: &str, maximum: usize) -> Result<String, Wor
     Ok(value.to_owned())
 }
 
-fn exact_repository(value: &str) -> Result<String, WorkflowRuntimeError> {
+pub fn normalize_exact_repository(value: &str) -> Result<String, WorkflowRuntimeError> {
     let value = value.trim().to_ascii_lowercase();
     let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
@@ -737,6 +769,8 @@ fn exact_repository(value: &str) -> Result<String, WorkflowRuntimeError> {
         && !repository.is_empty()
         && parts.next().is_none()
         && !value.contains('*')
+        && !matches!(owner, "." | "..")
+        && !matches!(repository, "." | "..")
         && owner.bytes().all(is_github_name_byte)
         && repository.bytes().all(is_github_name_byte);
     if !valid {
@@ -745,6 +779,68 @@ fn exact_repository(value: &str) -> Result<String, WorkflowRuntimeError> {
         ));
     }
     Ok(value)
+}
+
+fn reviewed_action_workflow(
+    observer_workflow: &str,
+    action_type: &str,
+    proposed_action_workflow: &str,
+) -> Result<String, WorkflowRuntimeError> {
+    let raw = env::var(ACTION_PROPOSAL_BINDINGS_ENV).unwrap_or_else(|_| "[]".to_owned());
+    let bindings = serde_json::from_str::<Vec<ActionProposalBinding>>(&raw).map_err(|_| {
+        WorkflowRuntimeError::Internal(
+            "CENTAUR_ACTION_PROPOSAL_BINDINGS_JSON is invalid".to_owned(),
+        )
+    })?;
+    reviewed_action_workflow_with_bindings(
+        observer_workflow,
+        action_type,
+        proposed_action_workflow,
+        &bindings,
+    )
+}
+
+fn reviewed_action_workflow_with_bindings(
+    observer_workflow: &str,
+    action_type: &str,
+    proposed_action_workflow: &str,
+    bindings: &[ActionProposalBinding],
+) -> Result<String, WorkflowRuntimeError> {
+    if bindings.len() > 128 {
+        return Err(WorkflowRuntimeError::Internal(
+            "action proposal workflow binding policy is too large".to_owned(),
+        ));
+    }
+    let observer_workflow = bounded_identifier("observer_workflow", observer_workflow, 128)?;
+    let action_type = bounded_identifier("action_type", action_type, 96)?;
+    let proposed_action_workflow =
+        bounded_identifier("action_workflow", proposed_action_workflow, 128)?;
+    let mut reviewed = BTreeMap::new();
+    for binding in bindings {
+        let key = (
+            bounded_identifier("binding observer_workflow", &binding.observer_workflow, 128)?,
+            bounded_identifier("binding action_type", &binding.action_type, 96)?,
+        );
+        let action_workflow =
+            bounded_identifier("binding action_workflow", &binding.action_workflow, 128)?;
+        if reviewed.insert(key, action_workflow).is_some() {
+            return Err(WorkflowRuntimeError::Internal(
+                "action proposal workflow binding policy contains a duplicate tuple".to_owned(),
+            ));
+        }
+    }
+    let Some(action_workflow) = reviewed.get(&(observer_workflow, action_type)) else {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "observer workflow and action type are not bound to a reviewed action workflow"
+                .to_owned(),
+        ));
+    };
+    if action_workflow != &proposed_action_workflow {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "proposal action_workflow does not match the reviewed workflow binding".to_owned(),
+        ));
+    }
+    Ok(action_workflow.clone())
 }
 
 fn immutable_git_object_id(name: &str, value: &str) -> Result<String, WorkflowRuntimeError> {
@@ -853,6 +949,10 @@ mod tests {
                 .to_string()
                 .contains("exact owner/repository")
         );
+
+        for repository in ["./repo", "508-dev/.", "508-dev/.."] {
+            assert!(normalize_exact_repository(repository).is_err());
+        }
     }
 
     #[test]
@@ -975,8 +1075,14 @@ mod tests {
         };
         let allowed_roles = vec!["discord-operator".to_owned()];
 
-        assert!(
-            validate_approval_request_with_roles(&fingerprint, &request, &allowed_roles).is_ok()
+        assert_eq!(
+            validate_approval_request_with_roles(
+                &fingerprint.to_ascii_uppercase(),
+                &request,
+                &allowed_roles,
+            )
+            .unwrap(),
+            fingerprint
         );
 
         request.repository_scope = vec!["508-dev/*".to_owned()];
@@ -990,5 +1096,54 @@ mod tests {
         );
         request.root_message_id = request.thread_id.clone();
         assert!(validate_approval_request_with_roles(&fingerprint, &request, &[]).is_err());
+    }
+
+    #[test]
+    fn observer_and_action_type_select_exactly_one_reviewed_action_workflow() {
+        let bindings = vec![ActionProposalBinding {
+            action_type: "github:create_improvement_pr".to_owned(),
+            action_workflow: "execute_approved_improvement".to_owned(),
+            observer_workflow: "weekly_ops_review".to_owned(),
+        }];
+
+        assert_eq!(
+            reviewed_action_workflow_with_bindings(
+                "weekly_ops_review",
+                "github:create_improvement_pr",
+                "execute_approved_improvement",
+                &bindings,
+            )
+            .unwrap(),
+            "execute_approved_improvement"
+        );
+        assert!(
+            reviewed_action_workflow_with_bindings(
+                "weekly_ops_review",
+                "github:create_improvement_pr",
+                "unrelated_privileged_workflow",
+                &bindings,
+            )
+            .is_err()
+        );
+        assert!(
+            reviewed_action_workflow_with_bindings(
+                "other_observer",
+                "github:create_improvement_pr",
+                "execute_approved_improvement",
+                &bindings,
+            )
+            .is_err()
+        );
+
+        let duplicate = vec![bindings[0].clone(), bindings[0].clone()];
+        assert!(
+            reviewed_action_workflow_with_bindings(
+                "weekly_ops_review",
+                "github:create_improvement_pr",
+                "execute_approved_improvement",
+                &duplicate,
+            )
+            .is_err()
+        );
     }
 }

@@ -40,6 +40,7 @@ use centaur_telemetry::{
 use centaur_workflows::{
     ApproveActionProposalRequest, CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime,
     WorkflowWebhookAuth, WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
+    normalize_exact_repository,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
@@ -1018,21 +1019,12 @@ fn validate_discord_string_scope(
             )));
         }
         if repositories {
-            let mut parts = value.split('/');
-            let owner = parts.next().unwrap_or_default();
-            let repo = parts.next().unwrap_or_default();
-            if owner.is_empty()
-                || repo.is_empty()
-                || parts.next().is_some()
-                || value.contains('*')
-                || !owner.bytes().all(is_github_name_byte)
-                || !repo.bytes().all(is_github_name_byte)
-            {
-                return Err(ApiError::BadRequest(
+            normalize_exact_repository(value).map_err(|_| {
+                ApiError::BadRequest(
                     "discord_repository_scope entries must be exact owner/repository names"
                         .to_owned(),
-                ));
-            }
+                )
+            })?;
         }
     }
     Ok(())
@@ -1062,10 +1054,6 @@ fn required_metadata_array<'a>(
 
 fn is_discord_snowflake(value: &str) -> bool {
     (16..=22).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn is_github_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 async fn interrupt_session_execution(

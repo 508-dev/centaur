@@ -349,6 +349,29 @@
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
+        "actionProposalBindings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["observer_workflow", "action_type", "action_workflow"],
+            "properties": {
+              "observer_workflow": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+              },
+              "action_type": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$"
+              },
+              "action_workflow": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+              }
+            }
+          }
+        },
         "etl": {
           "type": "object",
           "properties": {
