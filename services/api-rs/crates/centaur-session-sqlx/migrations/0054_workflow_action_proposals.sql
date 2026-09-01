@@ -62,11 +62,15 @@ create table workflow_semantic_notification_states (
     state_class text not null,
     active boolean not null,
     last_workflow_run_id text not null,
+    last_notification_workflow_run_id text,
     last_notified_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     constraint workflow_semantic_notification_fingerprint_check
-        check (semantic_fingerprint is null or semantic_fingerprint ~ '^sha256:[0-9a-f]{64}$')
+        check (semantic_fingerprint is null or semantic_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    constraint workflow_semantic_notification_active_check
+        check ((active and semantic_fingerprint is not null)
+            or (not active and semantic_fingerprint is null))
 );
 
 revoke all on workflow_action_proposals from public;

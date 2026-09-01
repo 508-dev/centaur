@@ -109,6 +109,14 @@ pub struct NotificationTransitionResponse {
     pub state_persisted: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PreviousNotificationState {
+    active: bool,
+    last_notification_workflow_run_id: Option<String>,
+    semantic_fingerprint: Option<String>,
+    state_class: String,
+}
+
 impl ActionProposal {
     pub fn normalize_and_fingerprint(mut self) -> Result<(Self, String), WorkflowRuntimeError> {
         self.action_type = bounded_identifier("action_type", &self.action_type, 96)?;
@@ -436,37 +444,42 @@ async fn try_transition_notification_state(
     let active = request.semantic_fingerprint.is_some();
     let mut tx = client.pool().begin().await?;
     let previous = sqlx::query(
-        "SELECT semantic_fingerprint, state_class, active FROM workflow_semantic_notification_states \
+        "SELECT semantic_fingerprint, state_class, active, last_notification_workflow_run_id \
+         FROM workflow_semantic_notification_states \
          WHERE scope = $1 FOR UPDATE",
     )
     .bind(&scope)
     .fetch_optional(&mut *tx)
     .await?;
-    let (notify, resolution) = match previous.as_ref() {
-        None => (active, false),
-        Some(row) => {
-            let previous_active: bool = row.try_get("active")?;
-            let previous_fingerprint: Option<String> = row.try_get("semantic_fingerprint")?;
-            let previous_class: String = row.try_get("state_class")?;
-            if !active {
-                (previous_active, previous_active)
-            } else {
-                (
-                    !previous_active
-                        || previous_fingerprint != request.semantic_fingerprint
-                        || previous_class != state_class,
-                    false,
-                )
-            }
-        }
-    };
+    let previous = previous
+        .map(|row| {
+            Ok::<_, WorkflowRuntimeError>(PreviousNotificationState {
+                active: row.try_get("active")?,
+                last_notification_workflow_run_id: row
+                    .try_get("last_notification_workflow_run_id")?,
+                semantic_fingerprint: row.try_get("semantic_fingerprint")?,
+                state_class: row.try_get("state_class")?,
+            })
+        })
+        .transpose()?;
+    let (notify, resolution) = notification_transition_decision(
+        previous.as_ref(),
+        active,
+        request.semantic_fingerprint.as_deref(),
+        &state_class,
+        workflow_run_id,
+    );
     sqlx::query(
         "INSERT INTO workflow_semantic_notification_states (\
-         scope, semantic_fingerprint, state_class, active, last_workflow_run_id, last_notified_at) \
-         VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN NOW() END) \
+         scope, semantic_fingerprint, state_class, active, last_workflow_run_id, \
+         last_notification_workflow_run_id, last_notified_at) \
+         VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN $5 END, CASE WHEN $6 THEN NOW() END) \
          ON CONFLICT (scope) DO UPDATE SET semantic_fingerprint = EXCLUDED.semantic_fingerprint, \
          state_class = EXCLUDED.state_class, active = EXCLUDED.active, \
          last_workflow_run_id = EXCLUDED.last_workflow_run_id, \
+         last_notification_workflow_run_id = CASE WHEN $6 \
+           THEN EXCLUDED.last_notification_workflow_run_id \
+           ELSE workflow_semantic_notification_states.last_notification_workflow_run_id END, \
          last_notified_at = CASE WHEN $6 THEN NOW() ELSE workflow_semantic_notification_states.last_notified_at END, \
          updated_at = NOW()",
     )
@@ -484,6 +497,28 @@ async fn try_transition_notification_state(
         resolution,
         state_persisted: true,
     })
+}
+
+fn notification_transition_decision(
+    previous: Option<&PreviousNotificationState>,
+    active: bool,
+    semantic_fingerprint: Option<&str>,
+    state_class: &str,
+    workflow_run_id: &str,
+) -> (bool, bool) {
+    let Some(previous) = previous else {
+        return (active, false);
+    };
+    let unchanged = previous.active == active
+        && previous.semantic_fingerprint.as_deref() == semantic_fingerprint
+        && previous.state_class == state_class;
+    if unchanged && previous.last_notification_workflow_run_id.as_deref() == Some(workflow_run_id) {
+        return (true, !active);
+    }
+    if !active {
+        return (previous.active, previous.active);
+    }
+    (!unchanged, false)
 }
 
 async fn proposal_row(
@@ -791,6 +826,10 @@ mod tests {
         assert_eq!(first.repository, "508-dev/508-workflows");
         assert_eq!(first, second);
         assert_eq!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            first_fingerprint,
+            "sha256:10dee99e59991ad9b3c2caf55898a1647d627e03469da1ac052b67aaa8360659"
+        );
     }
 
     #[test]
@@ -869,6 +908,53 @@ mod tests {
                 state_class: "proposal_pending".to_owned(),
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_claim_replays_only_within_the_claiming_workflow_run() {
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        let previous = PreviousNotificationState {
+            active: true,
+            last_notification_workflow_run_id: Some("run-claim".to_owned()),
+            semantic_fingerprint: Some(fingerprint.clone()),
+            state_class: "proposal_pending".to_owned(),
+        };
+
+        assert_eq!(
+            notification_transition_decision(
+                Some(&previous),
+                true,
+                Some(&fingerprint),
+                "proposal_pending",
+                "run-claim",
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            notification_transition_decision(
+                Some(&previous),
+                true,
+                Some(&fingerprint),
+                "proposal_pending",
+                "run-later",
+            ),
+            (false, false)
+        );
+
+        let resolved = PreviousNotificationState {
+            active: false,
+            last_notification_workflow_run_id: Some("run-resolve".to_owned()),
+            semantic_fingerprint: None,
+            state_class: "clear".to_owned(),
+        };
+        assert_eq!(
+            notification_transition_decision(Some(&resolved), false, None, "clear", "run-resolve",),
+            (true, true)
+        );
+        assert_eq!(
+            notification_transition_decision(Some(&resolved), false, None, "clear", "run-later",),
+            (false, false)
         );
     }
 
