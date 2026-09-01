@@ -23,7 +23,9 @@ import {
   isAllowedDiscordMessage,
   isDiscordIngressAllowlistEmpty,
   isAllowedDiscordGuild,
+  isAllowedTriggerBotIdentifiers,
   parseDiscordThreadKey,
+  resolveChannelAllowlist,
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import {
@@ -243,9 +245,19 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // The adapter drops bot authors before admission by default. Forward only
     // an explicitly configured immutable bot identity in an allowed guild;
     // durable admission still requires a reviewed role capability bundle.
-    shouldForwardBotMessage: ({ authorId, guildId }) =>
+    shouldForwardBotMessage: ({
+      applicationId,
+      authorId,
+      channelId,
+      guildId,
+      webhookId,
+    }) =>
       isAllowedDiscordGuild(guildId, options) &&
-      resolveTriggerBotAllowlist(options).includes(authorId),
+      resolveChannelAllowlist(options).includes(channelId) &&
+      isAllowedTriggerBotIdentifiers(
+        { applicationId, authorId, webhookId },
+        resolveTriggerBotAllowlist(options),
+      ),
     // Discord delta (patched adapter): the Gateway never redelivers, so a
     // message dropped on a thread-lock conflict is otherwise lost with zero
     // signal — surface it with a 🔁 reaction so the user knows to resend.

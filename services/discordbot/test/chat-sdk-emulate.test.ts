@@ -49,6 +49,7 @@ const BOT_TOKEN = "discordbot-emulate-token";
 const APP_ID = "900000000000000001";
 const USER_ID = "100000000000000001";
 const TRIGGER_BOT_ID = "400000000000000001";
+const TRIGGER_BOT_APPLICATION_ID = "400000000000000002";
 const GUILD_ID = "200000000000000001";
 const CHANNEL_ID = "300000000000000001";
 const TRIGGER_ROLE_ID = "500000000000000001";
@@ -1377,6 +1378,26 @@ describe("discordbot", () => {
     expect(codexApi.executes).toHaveLength(1);
     codexApi.reset();
 
+    // Application and webhook IDs accepted by durable admission must survive
+    // the adapter's later bot-forwarding hook as the same policy identity.
+    bot = createTestBot({
+      triggerBotAllowlist: [TRIGGER_BOT_APPLICATION_ID],
+    });
+    const applicationThreadId = discordApi.nextId();
+    discordApi.seedThreadChannel(applicationThreadId, CHANNEL_ID);
+    const applicationBotMentionId = await dispatchMessage({
+      applicationId: TRIGGER_BOT_APPLICATION_ID,
+      authorBot: true,
+      authorId: TRIGGER_BOT_ID,
+      channelId: applicationThreadId,
+      content: `<@${APP_ID}> from an allowlisted application`,
+      mention: true,
+      thread: { id: applicationThreadId, parentId: CHANNEL_ID },
+    });
+    await waitForSettle(applicationThreadId, applicationBotMentionId);
+    expect(codexApi.executes).toHaveLength(1);
+    codexApi.reset();
+
     // Follow-ups are re-authorized; removing the human role blocks new context
     // even inside a previously authorized thread.
     bot = createTestBot();
@@ -1447,6 +1468,7 @@ function threadKey(threadId: string): string {
  * that production admits before it creates a Discord thread.
  */
 async function dispatchMessage(input: {
+  applicationId?: string;
   attachments?: Record<string, unknown>[];
   authorBot?: boolean;
   authorId?: string;
@@ -1458,6 +1480,7 @@ async function dispatchMessage(input: {
   preauthorizeRoot?: boolean;
   roleIds?: string[];
   thread?: { id: string; parentId: string };
+  webhookId?: string;
 }): Promise<string> {
   if (input.thread && input.mention && input.preauthorizeRoot !== false) {
     await preauthorizeTestThreadRoot({ ...input, thread: input.thread });
@@ -1471,12 +1494,15 @@ async function dispatchMessage(input: {
       username: "tester",
     },
     content: input.content,
+    application_id: input.applicationId,
+    webhook_id: input.webhookId,
   });
   if (!input.thread && input.mention) {
     await botState.connect();
     await admitDiscordGatewayMessage(
       {
         authorId: input.authorId ?? USER_ID,
+        applicationId: input.applicationId,
         authorIsBot: input.authorBot === true,
         authorIsSelf: false,
         channelId: input.channelId,
@@ -1488,6 +1514,7 @@ async function dispatchMessage(input: {
         messageId: String(raw.id),
         messageType: 0,
         roleIds: input.roleIds ?? [TRIGGER_ROLE_ID],
+        webhookId: input.webhookId,
       },
       botOptions,
       botState,
@@ -1524,12 +1551,14 @@ async function dispatchMessage(input: {
 }
 
 async function preauthorizeTestThreadRoot(input: {
+  applicationId?: string;
   authorBot?: boolean;
   authorId?: string;
   content: string;
   guildId?: string;
   roleIds?: string[];
   thread: { id: string; parentId: string };
+  webhookId?: string;
 }): Promise<void> {
   await botState.connect();
   const rootKey = `discordbot:ingress:root:${
@@ -1539,6 +1568,7 @@ async function preauthorizeTestThreadRoot(input: {
   await admitDiscordGatewayMessage(
     {
       authorId: input.authorId ?? USER_ID,
+      applicationId: input.applicationId,
       authorIsBot: input.authorBot === true,
       authorIsSelf: false,
       channelId: input.thread.parentId,
@@ -1550,6 +1580,7 @@ async function preauthorizeTestThreadRoot(input: {
       messageId: input.thread.id,
       messageType: 0,
       roleIds: input.roleIds ?? [TRIGGER_ROLE_ID],
+      webhookId: input.webhookId,
     },
     botOptions,
     botState,
@@ -1833,6 +1864,7 @@ type RawDiscordAuthor = {
 };
 
 type RawDiscordMessage = {
+  application_id?: string;
   attachments: Record<string, unknown>[];
   author: RawDiscordAuthor;
   channel_id: string;
@@ -1841,6 +1873,7 @@ type RawDiscordMessage = {
   id: string;
   timestamp: string;
   type: number;
+  webhook_id?: string;
 };
 
 type DiscordRestCall = {
@@ -1868,9 +1901,11 @@ type FakeDiscordApi = {
   seedRawMessage(
     channelId: string,
     input: {
+      application_id?: string;
       attachments?: Record<string, unknown>[];
       author: RawDiscordAuthor;
       content: string;
+      webhook_id?: string;
     },
   ): RawDiscordMessage;
   seedThreadChannel(threadId: string, parentId: string): void;
@@ -1908,6 +1943,7 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
   ) => {
     const message: RawDiscordMessage = {
       attachments: input.attachments ?? [],
+      application_id: input.application_id,
       author: input.author,
       channel_id: channelId,
       content: input.content,
@@ -1915,6 +1951,7 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
       id: nextId(),
       timestamp: new Date().toISOString(),
       type: 0,
+      webhook_id: input.webhook_id,
     };
     channelMessages(channelId).push(message);
     return message;

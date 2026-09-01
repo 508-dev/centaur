@@ -13,7 +13,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..444aa7b36347c4eea42e049504665dd3
       */
      private convertMentionsToDiscord;
      /**
-@@ -61,6 +61,69 @@ interface DiscordAdapterConfig {
+@@ -61,6 +61,71 @@ interface DiscordAdapterConfig {
      publicKey?: string;
      /** Override bot username (optional) */
      userName?: string;
@@ -70,9 +70,11 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..444aa7b36347c4eea42e049504665dd3
 +     * by this bot itself are always dropped.
 +     */
 +    shouldForwardBotMessage?: (info: {
++        applicationId?: string;
 +        authorId: string;
 +        guildId: string;
 +        channelId: string;
++        webhookId?: string;
 +    }) => boolean;
 +    /**
 +     * Invoked when the Gateway connection state changes. Called with true on
@@ -83,7 +85,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..444aa7b36347c4eea42e049504665dd3
  }
  /**
   * Discord thread ID components.
-@@ -363,6 +426,14 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -363,6 +428,14 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
      protected readonly publicKey: string;
      protected readonly applicationId: string;
      protected readonly mentionRoleIds: string[];
@@ -98,7 +100,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..444aa7b36347c4eea42e049504665dd3
      protected chat: ChatInstance | null;
      protected readonly logger: Logger;
      protected readonly formatConverter: DiscordFormatConverter;
-@@ -563,6 +634,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -563,6 +636,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
       * Handle a message received via the Gateway WebSocket.
       */
      protected handleGatewayMessage(message: Message$1, isMentioned: boolean): Promise<void>;
@@ -376,7 +378,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
        this.logger.info("Discord Gateway listener stopped");
      }
    }
-@@ -1786,27 +1919,103 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1786,27 +1919,105 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring message - Gateway is shutting down");
          return;
        }
@@ -439,9 +441,11 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
 +      }
 +      if (message.author.bot) {
 +        const forwardBotMessage = !authorIsSelf && this.shouldForwardBotMessage?.({
++          applicationId: message.applicationId ?? void 0,
 +          authorId: message.author.id,
 +          guildId: message.guildId ?? "@me",
-+          channelId: message.channelId
++          channelId: parentChannelId,
++          webhookId: message.webhookId ?? void 0
 +        }) === true;
 +        if (!forwardBotMessage) {
 +          this.logger.debug("Ignoring message from bot", {
@@ -491,7 +495,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
        });
        await this.handleGatewayMessage(message, isMentioned);
      });
-@@ -1815,6 +2024,13 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1815,6 +2026,13 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring interaction - Gateway is shutting down");
          return;
        }
@@ -505,7 +509,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
        this.logger.info("Discord Gateway interaction received", {
          id: interaction.id,
          type: interaction.type
-@@ -1983,9 +2199,18 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1983,9 +2201,18 @@ var DiscordAdapter = class _DiscordAdapter {
        })),
        raw: {
          id: message.id,
@@ -524,7 +528,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
          author: {
            id: message.author.id,
            username: message.author.username
-@@ -1998,6 +2223,19 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1998,6 +2225,19 @@ var DiscordAdapter = class _DiscordAdapter {
      try {
        await this.chat.handleIncomingMessage(this, threadId, chatMessage);
      } catch (error) {
@@ -544,7 +548,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
        this.logger.error("Error handling Gateway message", {
          error: String(error),
          messageId: message.id
-@@ -2262,7 +2500,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2262,7 +2502,9 @@ var DiscordAdapter = class _DiscordAdapter {
          `Invalid Discord channel ID: ${channelId}`
        );
      }
@@ -555,7 +559,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..bc4fc7b0bab4114133404f7de2132488
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -2313,6 +2553,43 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2313,6 +2555,43 @@ var DiscordAdapter = class _DiscordAdapter {
        raw: result
      };
    }

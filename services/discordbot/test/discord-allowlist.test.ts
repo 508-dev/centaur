@@ -4,6 +4,7 @@ import {
   discordIngressDenialReason,
   discordRoleIdsFromRaw,
   isAllowedDiscordMessage,
+  isAllowedTriggerBotIdentifiers,
   isAllowedTriggerBotMessage,
   isDiscordIngressAllowlistEmpty,
   isGuildAllowlistEmpty,
@@ -251,6 +252,20 @@ describe("isAllowedTriggerBotMessage", () => {
 
   it("tolerates entries and ids with surrounding whitespace", () => {
     expect(isAllowedTriggerBotMessage(botMessage(), [" bot-1 "])).toBe(true);
+  });
+});
+
+describe("isAllowedTriggerBotIdentifiers", () => {
+  it("uses the same author, application, and webhook identities at adapter forwarding", () => {
+    const identifiers = {
+      applicationId: "app-9",
+      authorId: "bot-1",
+      webhookId: "hook-7",
+    };
+    for (const allowed of ["bot-1", "app-9", "hook-7"]) {
+      expect(isAllowedTriggerBotIdentifiers(identifiers, [allowed])).toBe(true);
+    }
+    expect(isAllowedTriggerBotIdentifiers(identifiers, ["other"])).toBe(false);
   });
 });
 
