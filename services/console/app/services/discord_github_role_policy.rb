@@ -23,10 +23,32 @@ class DiscordGithubRolePolicy
       end
 
       role = grant.role
-      return unless managed_role?(role) && grant.static_secret
+      credential = grant.grantable
+      return unless managed_role?(role) && credential
 
-      extra_secret = grant.new_record? ? grant.static_secret : nil
-      add_errors(grant, policy_errors(role, extra_static_secret: extra_secret))
+      if credential.is_a?(StaticSecret)
+        extra_secret = grant.new_record? ? credential : nil
+        add_errors(grant, policy_errors(role, extra_static_secret: extra_secret))
+      else
+        add_errors(grant, nonstatic_credential_errors(role, credential))
+      end
+    end
+
+    # Request rules are mutable after a credential has been granted. Enforce
+    # the same boundary at that mutation point so a previously harmless
+    # non-static credential cannot later be pointed at GitHub. Static secrets
+    # have their own complete-profile validation in validate_static_secret.
+    def validate_request_rule(rule)
+      credential = credential_for_rule(rule)
+      return unless credential && !credential.is_a?(StaticSecret)
+      return unless github_targetable_rule?(rule)
+
+      policy_roles_granting(credential).each do |role|
+        rule.errors.add(
+          :base,
+          "Discord policy role #{role.foreign_id || role.oid}: may not grant #{credential.class.model_name.human.downcase} credentials that can target GitHub"
+        )
+      end
     end
 
     def validate_static_secret(secret)
@@ -79,24 +101,29 @@ class DiscordGithubRolePolicy
       add_errors(assignment, prefix_errors(role, policy_errors(role)))
     end
 
-    # Used immediately before a proxy receives its static credentials. Model
-    # validations block normal mutations; this is a final fail-closed guard for
-    # legacy state or an out-of-band write that left a Discord role inconsistent.
-    def static_secret_allowed_for_principal?(principal, secret)
+    # Used immediately before a proxy receives any credential. Model validations
+    # block normal mutations; this is a final fail-closed guard for legacy state
+    # or an out-of-band write that left a Discord role inconsistent.
+    def credential_allowed_for_principal?(principal, credential)
       if managed_principal?(principal)
         roles = principal.roles.to_a
         return false unless roles.length == 1 && managed_role?(roles.first)
-        return false unless roles.first.grants.where(static_secret_id: secret.id).exists?
+        return false unless role_grants_credential?(roles.first, credential)
 
-        return policy_errors(roles.first).empty?
+        return role_allows_credential?(roles.first, credential)
       end
 
       roles = principal.roles.to_a.select do |role|
-        managed_role?(role) && role.grants.where(static_secret_id: secret.id).exists?
+        managed_role?(role) && role_grants_credential?(role, credential)
       end
       return true if roles.empty?
 
-      roles.all? { |role| policy_errors(role).empty? }
+      roles.all? { |role| role_allows_credential?(role, credential) }
+    end
+
+    # Backwards-compatible name for callers that render static secrets.
+    def static_secret_allowed_for_principal?(principal, secret)
+      credential_allowed_for_principal?(principal, secret)
     end
 
     private
@@ -157,6 +184,17 @@ class DiscordGithubRolePolicy
         errors << "must grant exactly one scoped GitHub App credential, found #{github_secrets.length}"
       end
       errors.uniq
+    end
+
+    def nonstatic_credential_errors(role, credential)
+      _scope, scope_error = repository_scope(
+        role.labels.to_h[REPOSITORY_SCOPE_LABEL],
+        "reviewed Discord role repository_scope"
+      )
+      return [ scope_error ] if scope_error
+      return [] unless github_targetable_credential?(credential)
+
+      [ "may not grant #{credential.class.model_name.human.downcase} credentials that can target GitHub" ]
     end
 
     def static_secrets_for_role(role, replacement_static_secret:, extra_static_secret:)
@@ -278,10 +316,38 @@ class DiscordGithubRolePolicy
       reference.present? && [ broker.oid, broker.foreign_id ].compact.include?(reference)
     end
 
-    def policy_roles_granting(secret)
-      return [] unless secret.persisted?
+    def role_allows_credential?(role, credential)
+      if credential.is_a?(StaticSecret)
+        policy_errors(role).empty?
+      else
+        nonstatic_credential_errors(role, credential).empty?
+      end
+    end
 
-      Grant.where(static_secret_id: secret.id).where.not(role_id: nil).includes(:role)
+    def role_grants_credential?(role, credential)
+      association = grantable_association_for(credential)
+      association && role.grants.where(association => credential).exists?
+    end
+
+    def github_targetable_credential?(credential)
+      credential.respond_to?(:rules) && credential.rules.to_a.any? { |rule| github_targetable_rule?(rule) }
+    end
+
+    def credential_for_rule(rule)
+      RequestRule::OWNER_ASSOCIATIONS.filter_map { |association| rule.public_send(association) }.first
+    end
+
+    def grantable_association_for(credential)
+      Grant::GRANTABLE_ASSOCIATIONS.find do |association|
+        Grant.reflect_on_association(association).klass == credential.class
+      end
+    end
+
+    def policy_roles_granting(credential)
+      association = grantable_association_for(credential)
+      return [] unless credential.persisted? && association
+
+      Grant.where(association => credential).where.not(role_id: nil).includes(:role)
         .filter_map(&:role).select { |role| managed_role?(role) }.uniq(&:id)
     end
 
