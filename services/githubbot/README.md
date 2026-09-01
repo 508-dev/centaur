@@ -84,8 +84,15 @@ back. It only ever acts on owned PRs, and on a dedicated management thread
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
   turn that reads all the feedback, validates each finding against reachable code
   and enforced contracts, makes one minimal coherent commit, replies on each thread, resolves what
-  it addressed, and re-requests review only when code changed. Finding validation is prompt-level;
-  the loop limit and epoch transitions below are deterministic controller decisions. Review authors
+  it addressed, and re-requests review only when code changed. The controller fingerprints each
+  normalized finding independently of reviewer identity and retains machine-readable accepted or
+  evidence-rejected dispositions. A decided fingerprint is not re-opened by another bot or a moved
+  line; a still-pending finding remains actionable. Inline dispositions are accepted only from the
+  bot's reply to the original comment and must bind the original review ID. A rejection also needs
+  a concrete `Centaur-Finding-Evidence` line. An acceptance is persisted only after GitHub proves
+  the head advanced, the finding's exact path changed, and a complete descendant commit range
+  contains that finding's `Centaur-Review-Finding` trailer. Incomplete or capped comparisons fail
+  closed. Review authors
   must currently be an owner, organization member, or repository collaborator. Reviewer bots whose
   GitHub association is `NONE` require an exact login in `GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST`;
   wildcards are rejected.
@@ -94,12 +101,15 @@ back. It only ever acts on owned PRs, and on a dedicated management thread
   when available (with a normalized-login fallback), so one review bot cannot consume another's
   allowance. The epoch also has a six-round aggregate cap, so adding reviewers cannot create an
   unbounded side channel. Repeated reviews of the same head consume both counters.
-  For a new head, githubbot compares the cumulative change against the epoch anchor. Authorization,
-  policy, schema/migration, dependency/build, API-contract, CI/deployment changes are material, as
-  are changes that cross configured runtime-line or runtime-file thresholds. Non-linear or
-  unreadable comparisons pause instead of guessing. A material human-authored change starts a fresh
-  epoch until the PR-wide epoch cap; automated changes consume the current epoch and cannot award
-  themselves a reset. Admitting the final allowed round records the handoff pause before its repair
+  For a new head, githubbot compares the change since the last reviewed head. New runtime behavior,
+  meaningful runtime diff growth, dependency/build changes, migrations, authorization/data/API
+  boundaries, and CI/deployment changes are a new risk surface. Formatting-only changes,
+  tree-identical rebases, generated/docs/test-only diffs, and bounded repairs explicitly linked to
+  an accepted finding stay in the current epoch. Non-linear or unreadable comparisons pause instead
+  of guessing. A new-risk human-authored change starts a fresh epoch until the PR-wide epoch cap;
+  automated changes consume the current epoch and cannot award themselves a reset by widening the
+  diff. The accepted/rejected ledger survives epoch transitions. Admitting the final allowed round
+  records the handoff pause before its repair
   turn starts. Once exhausted, auto-merge remains paused across descendant heads until a reviewed,
   authorized transition clears the handoff; an already-running repair cannot push around the pause.
   Only while that handoff pause is active, a non-bot collaborator with write/admin
@@ -116,6 +126,10 @@ back. It only ever acts on owned PRs, and on a dedicated management thread
   Approved repair heads are recorded under the same per-PR lock even when draft, CI, or a hold
   prevents immediate merge, preserving the correct authorship boundary for the next review. Active
   handoff pauses are stored without expiry; ordinary in-progress budget state retains its 90-day TTL.
+  One new inline P0/security finding may interrupt an exhausted budget by default, without resetting
+  an epoch. The interrupt requires exact `Centaur-Severity`, `Impact`, and `Evidence` fields plus a
+  concrete path and line/diff hunk, is keyed by the finding fingerprint, and leaves the PR paused
+  after that one repair turn. Ordinary severity prose cannot trigger it.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
@@ -216,8 +230,9 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_REVIEW_MAX_ROUNDS_PER_EPOCH` | — | Review heads handled per reviewer within one epoch. Default 3 (initial review plus two validations). |
 | `GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH` | — | Aggregate review heads handled across all reviewers in one epoch. Default 6. |
 | `GITHUBBOT_REVIEW_MAX_EPOCHS` | — | Material human-change epochs before explicit continuation is required. Default 3. |
-| `GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES` | — | Cumulative changed runtime lines that start a new epoch for a human change. Default 200. |
-| `GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES` | — | Cumulative changed runtime files that start a new epoch for a human change. Default 8. |
+| `GITHUBBOT_REVIEW_MAX_SECURITY_INTERRUPTS_PER_PR` | — | Evidence-backed inline P0/security findings allowed to interrupt an exhausted or inconclusive PR-wide budget without resetting an epoch. Default 1; hard maximum 16. |
+| `GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES` | — | Changed runtime lines since the last reviewed head that start a new epoch for a human change. Default 200. |
+| `GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES` | — | Changed runtime files since the last reviewed head that start a new epoch for a human change. Default 8. |
 | `GITHUBBOT_REVIEW_AUTHOR_ALLOWLIST` | — | Comma-separated exact GitHub logins for trusted reviewer bots whose `author_association` is `NONE`. Empty by default; wildcards are rejected. Collaborator/organization/owner reviews are allowed without listing. |
 | `GITHUBBOT_REVIEW_RESET_LABEL` | — | One-shot, write-authorized human continuation label. Default `centaur-review-reset`. |
 | `GITHUBBOT_WORKFLOW_EVENTS` | — | Emit settled CI and submitted-review events to durable workflows. Default `false`. |

@@ -10,14 +10,27 @@ import {
   DEFAULT_REVIEW_MATERIAL_CHANGE_LINES,
   DEFAULT_REVIEW_MAX_EPOCHS,
   DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+  DEFAULT_REVIEW_MAX_SECURITY_INTERRUPTS_PER_PR,
   DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
   DEFAULT_REVIEW_RESET_LABEL,
+  MAX_REVIEW_SECURITY_INTERRUPTS_PER_PR,
   type ReviewAdmission,
   type ReviewChangeActor,
   type ReviewChangeAssessment,
   type ReviewChangeFile,
   type ReviewEpochState,
 } from "./review-budget";
+import {
+  acceptedFindingPaths,
+  applyReviewFindingDispositionMarkers,
+  isReviewFindingLedger,
+  makeReviewFinding,
+  mergeReviewFindings,
+  parseReviewFindingDispositionMarkers,
+  type ReviewFinding,
+  type ReviewFindingDispositionMarker,
+  type ReviewFindingLedger,
+} from "./review-findings";
 import { runTurnStream } from "./turn";
 import {
   fetchCiEvaluation,
@@ -235,6 +248,7 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<ReviewEpochState>;
   const reviewerRounds = candidate.reviewerRoundsUsed;
+  const securityInterrupts = candidate.securityInterruptFingerprints;
   const validReviewerRounds =
     reviewerRounds === undefined ||
     (reviewerRounds !== null &&
@@ -275,7 +289,18 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
         "epoch_budget_exhausted",
         "reviewer_round_budget_exhausted",
         "round_budget_exhausted",
-      ].includes(candidate.pauseReason))
+      ].includes(candidate.pauseReason)) &&
+    (candidate.findingLedger === undefined ||
+      isReviewFindingLedger(candidate.findingLedger)) &&
+    (securityInterrupts === undefined ||
+      (Array.isArray(securityInterrupts) &&
+        securityInterrupts.length <= MAX_REVIEW_SECURITY_INTERRUPTS_PER_PR &&
+        new Set(securityInterrupts).size === securityInterrupts.length &&
+        securityInterrupts.every(
+          (fingerprint) =>
+            typeof fingerprint === "string" &&
+            /^sha256:[0-9a-f]{64}$/.test(fingerprint),
+        )))
   );
 }
 
@@ -816,6 +841,38 @@ export async function handleReviewEvent(
       );
       return;
     }
+    let findings: ReviewFinding[];
+    try {
+      findings = await collectReviewFindings(
+        ctx,
+        repo.owner,
+        repo.repo,
+        number,
+        reviewId,
+        reviewNode,
+        reviewerKey,
+        effectiveHeadSha,
+      );
+    } catch (error) {
+      logger(ctx).warn("githubbot_review_findings_load_failed", {
+        error: errorMessage(error),
+        pr: `${repo.owner}/${repo.repo}#${number}`,
+        review_id: reviewId,
+      });
+      await release(ctx, reviewClaimKey);
+      return;
+    }
+    if (findings.length === 0) {
+      traceLog(
+        ctx.options,
+        "githubbot_review_without_findings_skipped",
+        makeTrace(
+          managementThreadKey(repo.owner, repo.repo, number),
+          `review-empty-${reviewId}`,
+        ),
+      );
+      return;
+    }
     const admission = await runExclusive(
       reviewBudgetLockKey(repo.owner, repo.repo, number),
       () =>
@@ -826,12 +883,14 @@ export async function handleReviewEvent(
           pr,
           effectiveHeadSha,
           reviewerKey,
+          findings,
         ),
     );
     if (!admission) {
       await release(ctx, reviewClaimKey);
       return;
     }
+    if (admission.decision === "skip") return;
     if (admission.decision === "pause") {
       await escalateReviewBudget(
         ctx,
@@ -849,6 +908,7 @@ export async function handleReviewEvent(
       reviewerKey,
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
+      findings: admission.newFindings,
     });
     if (admission.state.pausedHeadSha && admission.state.pauseReason) {
       await escalateReviewBudget(
@@ -865,6 +925,193 @@ export async function handleReviewEvent(
         reviewerKey,
       );
     }
+  }
+}
+
+/**
+ * Persist machine-readable dispositions posted by Centaur's own repair turn.
+ * The marker can update only an already-known fingerprint and never changes a
+ * budget, epoch, repository scope, or authorization decision.
+ */
+export async function handleReviewFindingDispositionComment(
+  ctx: PrManagerContext,
+  rawBody: string,
+): Promise<boolean> {
+  const payload = parseJson(rawBody);
+  if (!payload) return false;
+  const repo = repoFromPayload(payload);
+  const comment = isRecord(payload.comment) ? payload.comment : undefined;
+  if (!repo || !comment) return false;
+  const author = isRecord(comment.user)
+    ? stringValue(comment.user.login)
+    : undefined;
+  if (
+    !author ||
+    author.toLowerCase() !==
+      (ctx.botActorLogin ?? ctx.userName).toLowerCase()
+  ) {
+    return false;
+  }
+  const markers = parseReviewFindingDispositionMarkers(
+    stringValue(comment.body) ?? "",
+  );
+  if (markers.length === 0) return false;
+
+  const pullRequest = isRecord(payload.pull_request)
+    ? payload.pull_request
+    : undefined;
+  const issue = isRecord(payload.issue) ? payload.issue : undefined;
+  const number =
+    numberValue(pullRequest?.number) ??
+    (issue && isRecord(issue.pull_request)
+      ? numberValue(issue.number)
+      : undefined);
+  if (number === undefined) return false;
+
+  let changed = false;
+  await runExclusive(reviewBudgetLockKey(repo.owner, repo.repo, number), async () => {
+    const loaded = await retryingReviewBudgetLoad(
+      ctx,
+      repo.owner,
+      repo.repo,
+      number,
+    );
+    if (!loaded.ok || !loaded.state) return;
+    const verifiedMarkers = await verifyReviewFindingDispositionMarkers(
+      ctx,
+      repo.owner,
+      repo.repo,
+      number,
+      stringValue(comment.body) ?? "",
+      loaded.state.findingLedger,
+      markers,
+    );
+    const applied = applyReviewFindingDispositionMarkers(
+      loaded.state.findingLedger,
+      verifiedMarkers,
+      {
+        commentId: numberValue(comment.id),
+        replyToCommentId: numberValue(comment.in_reply_to_id),
+      },
+    );
+    if (!applied.changed) return;
+    changed = true;
+    await retryingReviewBudgetSave(ctx, repo.owner, repo.repo, number, {
+      ...loaded.state,
+      findingLedger: applied.ledger,
+    });
+  });
+  traceLog(
+    ctx.options,
+    "githubbot_review_finding_dispositions_recorded",
+    makeTrace(
+      managementThreadKey(repo.owner, repo.repo, number),
+      `review-disposition-${stringValue(comment.id) ?? "comment"}`,
+    ),
+    { changed, marker_count: markers.length },
+  );
+  return true;
+}
+
+const REJECTED_FINDING_EVIDENCE =
+  /^Centaur-Finding-Evidence:\s*(\S.{19,})$/im;
+
+/**
+ * A model-authored marker is only a proposal until deterministic evidence
+ * verifies it. Rejections need an explicit bounded evidence statement.
+ * Acceptances additionally need a descendant head, a complete GitHub compare,
+ * an exact changed path, and the fingerprint trailer in that repair commit.
+ */
+async function verifyReviewFindingDispositionMarkers(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  commentBody: string,
+  ledger: ReviewFindingLedger | undefined,
+  markers: readonly ReviewFindingDispositionMarker[],
+): Promise<ReviewFindingDispositionMarker[]> {
+  const verified: ReviewFindingDispositionMarker[] = [];
+  const rejectedHasEvidence = REJECTED_FINDING_EVIDENCE.test(commentBody);
+  let currentHeadSha: string | undefined;
+  const acceptedEvidence = new Map<string, boolean>();
+
+  for (const marker of markers) {
+    const finding = ledger?.[marker.fingerprint];
+    if (!finding || finding.reviewId !== marker.reviewId) continue;
+    if (marker.disposition === "rejected") {
+      if (rejectedHasEvidence) verified.push(marker);
+      continue;
+    }
+
+    if (currentHeadSha === undefined) {
+      currentHeadSha =
+        (await fetchPr(ctx, owner, repo, pullNumber))?.headSha ?? "";
+    }
+    const evidenceKey = `${marker.fingerprint}:${currentHeadSha}`;
+    let hasEvidence = acceptedEvidence.get(evidenceKey);
+    if (hasEvidence === undefined) {
+      hasEvidence = await hasAcceptedFindingRepairEvidence(
+        ctx,
+        owner,
+        repo,
+        finding.reviewedHeadSha,
+        currentHeadSha,
+        marker.fingerprint,
+        finding.path,
+      );
+      acceptedEvidence.set(evidenceKey, hasEvidence);
+    }
+    if (hasEvidence) verified.push(marker);
+  }
+  return verified;
+}
+
+async function hasAcceptedFindingRepairEvidence(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  reviewedHeadSha: string,
+  currentHeadSha: string,
+  fingerprint: string,
+  findingPath?: string,
+): Promise<boolean> {
+  if (!currentHeadSha || currentHeadSha === reviewedHeadSha) return false;
+  try {
+    const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
+      basehead: `${reviewedHeadSha}...${currentHeadSha}`,
+      owner,
+      per_page: 100,
+      repo,
+    });
+    if (stringValue(data.status)?.toLowerCase() !== "ahead") return false;
+    const commits = Array.isArray(data.commits) ? data.commits : [];
+    const totalCommits =
+      typeof data.total_commits === "number" ? data.total_commits : undefined;
+    if (totalCommits === undefined || totalCommits !== commits.length) return false;
+    const files = Array.isArray(data.files) ? data.files : undefined;
+    // The compare API caps this array at 300 files. Exactly 300 is therefore
+    // ambiguous and cannot prove an exact path was included.
+    if (!files || files.length === 0 || files.length >= 300) return false;
+    const changedFindingPath = findingPath
+      ? files.some(
+          (file) =>
+            file.filename === findingPath ||
+            ("previous_filename" in file &&
+              file.previous_filename === findingPath),
+        )
+      : true;
+    return (
+      changedFindingPath &&
+      findingFingerprintsFromCommits(commits).has(fingerprint)
+    );
+  } catch (error) {
+    logger(ctx).warn("githubbot_review_disposition_evidence_failed", {
+      error: errorMessage(error),
+      fingerprint,
+      pr: `${owner}/${repo}#${reviewedHeadSha}...${currentHeadSha}`,
+    });
+    return false;
   }
 }
 
@@ -1030,6 +1277,7 @@ async function compareReviewChange(
   repo: string,
   baseHeadSha: string,
   currentHeadSha: string,
+  findingLedger?: ReviewFindingLedger,
 ): Promise<ReviewComparisonEvidence> {
   try {
     const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
@@ -1044,10 +1292,41 @@ async function compareReviewChange(
       changes: file.changes,
       deletions: file.deletions,
       filename: file.filename,
+      patch: file.patch,
       status: file.status,
     }));
+    const comparisonStatus = data.status;
+    let treeUnchanged = comparisonStatus === "identical";
+    if (
+      !treeUnchanged &&
+      comparisonStatus &&
+      !["ahead", "identical"].includes(comparisonStatus.toLowerCase())
+    ) {
+      try {
+        const [before, after] = await Promise.all([
+          ctx.octokit.rest.repos.getCommit({ owner, repo, ref: baseHeadSha }),
+          ctx.octokit.rest.repos.getCommit({ owner, repo, ref: currentHeadSha }),
+        ]);
+        treeUnchanged =
+          before.data.commit.tree.sha === after.data.commit.tree.sha;
+      } catch (error) {
+        logger(ctx).warn("githubbot_review_tree_compare_failed", {
+          error: errorMessage(error),
+          pr: `${owner}/${repo}`,
+        });
+      }
+    }
+    const commits = Array.isArray(data.commits) ? data.commits : [];
+    const acceptedFingerprints = acceptedFindingFingerprintsFromCommits(
+      commits,
+      findingLedger,
+    );
     const assessment = assessReviewChange({
-      comparisonStatus: data.status,
+      acceptedFindingPaths: acceptedFindingPaths(
+        findingLedger,
+        acceptedFingerprints,
+      ),
+      comparisonStatus,
       files,
       fileThreshold:
         ctx.options.reviewMaterialChangeFiles ??
@@ -1055,8 +1334,8 @@ async function compareReviewChange(
       lineThreshold:
         ctx.options.reviewMaterialChangeLines ??
         DEFAULT_REVIEW_MATERIAL_CHANGE_LINES,
+      treeUnchanged,
     });
-    const commits = Array.isArray(data.commits) ? data.commits : [];
     const totalCommits =
       typeof data.total_commits === "number" ? data.total_commits : commits.length;
     const kinds = new Set(
@@ -1081,6 +1360,95 @@ async function compareReviewChange(
       assessment: assessReviewChange({ files: undefined }),
     };
   }
+}
+
+function acceptedFindingFingerprintsFromCommits(
+  commits: unknown[],
+  ledger: ReviewFindingLedger | undefined,
+): Set<string> {
+  const accepted = findingFingerprintsFromCommits(commits);
+  return new Set(
+    [...accepted].filter(
+      (fingerprint) => ledger?.[fingerprint]?.disposition === "accepted",
+    ),
+  );
+}
+
+function findingFingerprintsFromCommits(commits: unknown[]): Set<string> {
+  const fingerprints = new Set<string>();
+  for (const commit of commits) {
+    if (!isRecord(commit)) continue;
+    const commitNode = isRecord(commit.commit) ? commit.commit : undefined;
+    const message = stringValue(commitNode?.message) ?? "";
+    for (const match of message.matchAll(
+      /^Centaur-Review-Finding:\s*(sha256:[0-9a-f]{64})\s*$/gim,
+    )) {
+      const fingerprint = match[1]?.toLowerCase();
+      if (fingerprint) fingerprints.add(fingerprint);
+    }
+  }
+  return fingerprints;
+}
+
+const MAX_REVIEW_COMMENT_PAGES = 10;
+
+async function collectReviewFindings(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  reviewId: number,
+  reviewNode: JsonRecord,
+  reviewerKey: string,
+  reviewedHeadSha: string,
+): Promise<ReviewFinding[]> {
+  const findings: ReviewFinding[] = [];
+  for (let page = 1; page <= MAX_REVIEW_COMMENT_PAGES; page += 1) {
+    const response = await ctx.octokit.rest.pulls.listCommentsForReview({
+      owner,
+      page,
+      per_page: 100,
+      pull_number: pullNumber,
+      repo,
+      review_id: reviewId,
+    });
+    const comments = Array.isArray(response.data) ? response.data : [];
+    for (const comment of comments) {
+      const body = stringValue(comment.body)?.trim();
+      if (!body) continue;
+      findings.push(
+        makeReviewFinding({
+          body,
+          commentId: numberValue(comment.id),
+          diffHunk: stringValue(comment.diff_hunk),
+          line:
+            numberValue(comment.line) ?? numberValue(comment.original_line),
+          path: stringValue(comment.path),
+          reviewId,
+          reviewerKey,
+          reviewedHeadSha,
+          url: stringValue(comment.html_url),
+        }),
+      );
+    }
+    if (comments.length < 100) break;
+    if (page === MAX_REVIEW_COMMENT_PAGES) {
+      throw new Error("review contains more than 1000 inline findings");
+    }
+  }
+
+  // GitHub reviews may carry one body-only finding and no inline comments.
+  // Do not fingerprint a summary body in addition to its inline findings: that
+  // would create a fresh pseudo-finding whenever a reviewer rewrites a summary.
+  if (findings.length === 0) {
+    const body = stringValue(reviewNode.body)?.trim();
+    if (body) {
+      findings.push(
+        makeReviewFinding({ body, reviewId, reviewerKey, reviewedHeadSha }),
+      );
+    }
+  }
+  return findings;
 }
 
 async function pendingReviewResetApproval(
@@ -1256,9 +1624,34 @@ async function admitReviewResponse(
   pr: PullRequestSummary,
   headSha: string,
   reviewerKey: string,
-): Promise<ReviewAdmission | null> {
+  findings: readonly ReviewFinding[],
+): Promise<
+  | (ReviewAdmission & { newFindings: ReviewFinding[] })
+  | { decision: "skip"; state: ReviewEpochState }
+  | null
+> {
   const loaded = await retryingReviewBudgetLoad(ctx, owner, repo, pr.number);
   if (!loaded.ok) return null;
+  const mergedFindings = mergeReviewFindings(
+    loaded.state?.findingLedger,
+    findings,
+    loaded.state?.epoch ?? 1,
+  );
+  if (findings.length > 0 && mergedFindings.newFindings.length === 0) {
+    traceLog(
+      ctx.options,
+      "githubbot_review_findings_already_known",
+      makeTrace(
+        managementThreadKey(owner, repo, pr.number),
+        `review-findings-${headSha}`,
+      ),
+      { finding_count: findings.length, head_sha: headSha },
+    );
+    return {
+      decision: "skip",
+      state: loaded.state as ReviewEpochState,
+    };
+  }
   const approval = await pendingReviewResetApproval(
     ctx,
     owner,
@@ -1274,22 +1667,10 @@ async function admitReviewResponse(
       ctx,
       owner,
       repo,
-      loaded.state.anchorHeadSha,
+      loaded.state.lastReviewedHeadSha,
       headSha,
+      mergedFindings.ledger,
     );
-    if (
-      evidence.assessment.kind === "material" &&
-      loaded.state.anchorHeadSha !== loaded.state.lastReviewedHeadSha
-    ) {
-      const latestRange = await compareReviewChange(
-        ctx,
-        owner,
-        repo,
-        loaded.state.lastReviewedHeadSha,
-        headSha,
-      );
-      evidence = { ...evidence, actor: latestRange.actor };
-    }
     if (
       evidence.actor === "unknown" &&
       loaded.state.automationPendingFromHeadSha ===
@@ -1308,16 +1689,24 @@ async function admitReviewResponse(
     maxRoundsPerEpoch:
       ctx.options.reviewMaxRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+    maxSecurityInterruptsPerPr:
+      ctx.options.reviewMaxSecurityInterruptsPerPr ??
+      DEFAULT_REVIEW_MAX_SECURITY_INTERRUPTS_PER_PR,
     maxTotalRoundsPerEpoch:
       ctx.options.reviewMaxTotalRoundsPerEpoch ??
       DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
     reviewerKey,
+    securityInterruptFingerprint: mergedFindings.newFindings.find(
+      (finding) => finding.severity === "p0" || finding.severity === "security",
+    )?.fingerprint,
     startsRepairTurn: true,
     state: loaded.state,
   });
-  const state = approval
-    ? { ...admission.state, consumedResetApprovalId: approval.approvalId }
-    : admission.state;
+  const state = {
+    ...admission.state,
+    findingLedger: mergedFindings.ledger,
+    ...(approval ? { consumedResetApprovalId: approval.approvalId } : {}),
+  };
   await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
   if (admission.decision === "allow" && manualReset) {
     await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
@@ -1331,10 +1720,12 @@ async function admitReviewResponse(
     ),
     {
       assessment: admission.assessment?.kind,
+      change_class: admission.assessment?.changeClass,
       assessment_reasons: admission.assessment?.reasons,
       decision: admission.decision,
       epoch: state.epoch,
       head_sha: headSha,
+      new_finding_count: mergedFindings.newFindings.length,
       reset_epoch:
         admission.decision === "allow" ? admission.resetEpoch : undefined,
       reviewer_key: reviewerKey,
@@ -1343,7 +1734,7 @@ async function admitReviewResponse(
       rounds_used: state.roundsUsed,
     },
   );
-  return { ...admission, state };
+  return { ...admission, newFindings: mergedFindings.newFindings, state };
 }
 
 async function escalateReviewBudget(
@@ -1696,13 +2087,14 @@ function fireAddressReviewTurn(
   pr: PullRequestSummary,
   review: {
     budget: ReviewEpochState;
+    findings: ReviewFinding[];
     reviewer: string;
     reviewerKey: string;
     reviewId: number;
     reviewNodeId?: string;
   },
 ): void {
-  const { budget, reviewer, reviewerKey, reviewId, reviewNodeId } = review;
+  const { budget, findings, reviewer, reviewerKey, reviewId, reviewNodeId } = review;
   const maxReviewerRounds =
     ctx.options.reviewMaxRoundsPerEpoch ??
     DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH;
@@ -1711,6 +2103,14 @@ function fireAddressReviewTurn(
     DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH;
   const reviewerRounds =
     budget.reviewerRoundsUsed?.[reviewerKey] ?? budget.roundsUsed;
+  const findingManifest = findings
+    .map(
+      (finding) =>
+        `  - ${finding.fingerprint} (${finding.path ?? "review body"}${
+          finding.line ? `:${finding.line}` : ""
+        })`,
+    )
+    .join("\n");
   const preamble =
     `A review was submitted on pull request ${owner}/${repo}#${pr.number} ` +
     `(head ${pr.headSha}). This is review epoch ${budget.epoch}, reviewer round ` +
@@ -1731,8 +2131,21 @@ function fireAddressReviewTurn(
     `- Put all agreed changes in one coherent commit on ${pr.headRef} and include ` +
     `the commit trailer \`Centaur-Automation: true\`, then push.\n` +
     `- Reply to every thread with the evidence and what changed. Where a finding ` +
-    `is invalid, explain the enforcing contract briefly. Resolve addressed or ` +
-    `evidence-rejected threads when authorized.\n` +
+    `is invalid, explain the enforcing contract briefly and include an exact ` +
+    `\`Centaur-Finding-Evidence: <at least 20 characters of concrete evidence>\` ` +
+    `line. Resolve addressed or ` +
+    `evidence-rejected threads when authorized. For each finding below, include ` +
+    `exactly one machine-readable disposition marker in your reply to that ` +
+    `finding's thread: ` +
+    `\`<!-- centaur-review-finding <fingerprint> review:${reviewId} accepted -->\` ` +
+    `when you validate and address it, or ` +
+    `\`<!-- centaur-review-finding <fingerprint> review:${reviewId} rejected -->\` ` +
+    `when concrete evidence disproves it. Never invent, alter, or reuse a ` +
+    `fingerprint. Push before replying. Add a ` +
+    `\`Centaur-Review-Finding: <fingerprint>\` commit trailer for each accepted ` +
+    `finding that changed code; an accepted marker is ignored unless GitHub ` +
+    `proves a descendant head, that exact changed path, and its trailer.\n` +
+    `${findingManifest}\n` +
     `- Re-request review from @${reviewer} only if you pushed code.\n` +
     `- If a request is unclear or you can't address it, say so in the thread and ask.`;
   fireManagementTurn(

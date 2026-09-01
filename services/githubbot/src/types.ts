@@ -151,9 +151,11 @@ export type GithubbotOptions = {
   reviewMaxTotalRoundsPerEpoch?: number;
   /** Material-change epochs allowed before human continuation is required. Default 3. */
   reviewMaxEpochs?: number;
-  /** Cumulative changed runtime lines that make a review change material. Default 200. */
+  /** Evidence-backed P0/security budget interrupts allowed for the whole PR. Default 1. */
+  reviewMaxSecurityInterruptsPerPr?: number;
+  /** Changed runtime lines since the last reviewed head that add risk. Default 200. */
   reviewMaterialChangeLines?: number;
-  /** Cumulative changed runtime files that make a review change material. Default 8. */
+  /** Changed runtime files since the last reviewed head that add risk. Default 8. */
   reviewMaterialChangeFiles?: number;
   /** Exact GitHub logins for trusted reviewer bots whose association is NONE. */
   reviewAuthorAllowlist?: readonly string[];
