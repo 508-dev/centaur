@@ -101,6 +101,7 @@ class BrokerCredential < ApplicationRecord
   validate :github_repositories_valid
   validate :grant_credentials_present
   validate :token_endpoint_headers_valid
+  validate :discord_github_policy_valid
 
   # OAuth client identity used for refresh. Flow-minted credentials delegate to
   # their OauthApp so a client-secret rotation on the app applies to every
@@ -301,6 +302,10 @@ class BrokerCredential < ApplicationRecord
     valid = token_endpoint_headers.is_a?(Hash) &&
             token_endpoint_headers.all? { |k, v| k.is_a?(String) && v.is_a?(String) }
     errors.add(:token_endpoint_headers, "must be an object mapping header names to string values") unless valid
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_broker_credential(self)
   end
 
   def default_fixed_token_endpoint

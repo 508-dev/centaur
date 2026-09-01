@@ -18,6 +18,7 @@ class Role < ApplicationRecord
   validates :foreign_id, uniqueness: { allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
   validate :labels_is_a_hash
+  validate :discord_github_policy_valid
 
   def self.ensure_default_infra!(created_by:)
     role = find_or_initialize_by(foreign_id: "infra")
@@ -49,5 +50,9 @@ class Role < ApplicationRecord
 
   def labels_is_a_hash
     errors.add(:labels, "must be a hash") unless labels.is_a?(Hash)
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_role(self)
   end
 end

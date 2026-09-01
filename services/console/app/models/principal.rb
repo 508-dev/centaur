@@ -281,7 +281,11 @@ class Principal < ApplicationRecord
   end
 
   def roles_blank_for_defaulting?
-    association(:roles).target.empty? && !roles.exists?
+    # Actor-scoped Discord principals are always populated by the reviewed
+    # policy replacement path. They must not transiently inherit a default role
+    # before that replacement validates their exact GitHub App scope.
+    labels.to_h["centaur_discord_policy_managed"] != "true" &&
+      association(:roles).target.empty? && !roles.exists?
   end
 
   def assign_default_roles
