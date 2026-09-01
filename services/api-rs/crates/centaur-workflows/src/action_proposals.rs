@@ -271,11 +271,18 @@ pub async fn put_action_proposal(
     let mut created = inserted;
     let consumed_at: Option<OffsetDateTime> = row.try_get("consumed_at")?;
     let stored_expires_at: OffsetDateTime = row.try_get("expires_at")?;
-    if !inserted && consumed_at.is_none() && stored_expires_at <= OffsetDateTime::now_utc() {
+    let approval_claimed: bool = row.try_get("approval_claimed")?;
+    if !inserted
+        && consumed_at.is_none()
+        && !approval_claimed
+        && stored_expires_at <= OffsetDateTime::now_utc()
+    {
         let reactivated = sqlx::query(
             "UPDATE workflow_action_proposals SET observer_workflow = $2, observer_task_id = $3, \
              observer_run_id = $4, expires_at = $5, updated_at = NOW() \
-             WHERE fingerprint = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
+             WHERE fingerprint = $1 AND consumed_at IS NULL AND expires_at <= NOW() \
+             AND NOT EXISTS (SELECT 1 FROM workflow_action_proposal_approval_claims claim \
+                             WHERE claim.fingerprint = workflow_action_proposals.fingerprint)",
         )
         .bind(&fingerprint)
         .bind(observer_workflow)
@@ -362,28 +369,64 @@ impl WorkflowRuntime {
                 false,
             ));
         }
-        let expires_at: OffsetDateTime = row.try_get("expires_at")?;
-        if expires_at <= OffsetDateTime::now_utc() {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "action proposal expired; run a fresh observation".to_owned(),
-            ));
-        }
+        let approval_claim = sqlx::query(
+            "SELECT actor_id, capability_class, channel_id, guild_id, message_id, \
+             policy_fingerprint, principal_role, repository_scope, root_message_id, thread_id \
+             FROM workflow_action_proposal_approval_claims WHERE fingerprint = $1",
+        )
+        .bind(&fingerprint)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let approval = if let Some(claim) = approval_claim {
+            approval_request_from_row(&claim)?
+        } else {
+            let expires_at: OffsetDateTime = row.try_get("expires_at")?;
+            if expires_at <= OffsetDateTime::now_utc() {
+                return Err(WorkflowRuntimeError::BadRequest(
+                    "action proposal expired; run a fresh observation".to_owned(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO workflow_action_proposal_approval_claims (\
+                 fingerprint, actor_id, capability_class, channel_id, guild_id, message_id, \
+                 policy_fingerprint, principal_role, repository_scope, root_message_id, thread_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)",
+            )
+            .bind(&fingerprint)
+            .bind(&request.actor_id)
+            .bind(&request.capability_class)
+            .bind(&request.channel_id)
+            .bind(&request.guild_id)
+            .bind(&request.message_id)
+            .bind(&request.policy_fingerprint)
+            .bind(&request.principal_role)
+            .bind(serde_json::to_value(&request.repository_scope)?)
+            .bind(&request.root_message_id)
+            .bind(&request.thread_id)
+            .execute(&mut *tx)
+            .await?;
+            request.clone()
+        };
+        // Commit the immutable approval context before spawning. If the
+        // process fails after this point, a repeated authorized approval
+        // resumes from this claim and the stable spawn idempotency key.
+        tx.commit().await?;
         let run = self
             .create_run(CreateWorkflowRunRequest {
                 workflow_name: action_workflow.clone(),
                 input: json!({
                     "approval": {
-                        "actor_id": request.actor_id,
-                        "capability_class": request.capability_class,
-                        "channel_id": request.channel_id,
-                        "guild_id": request.guild_id,
-                        "message_id": request.message_id,
-                        "policy_fingerprint": request.policy_fingerprint,
-                        "principal_role": request.principal_role,
+                        "actor_id": &approval.actor_id,
+                        "capability_class": &approval.capability_class,
+                        "channel_id": &approval.channel_id,
+                        "guild_id": &approval.guild_id,
+                        "message_id": &approval.message_id,
+                        "policy_fingerprint": &approval.policy_fingerprint,
+                        "principal_role": &approval.principal_role,
                         "proposal_fingerprint": &fingerprint,
-                        "repository_scope": request.repository_scope,
-                        "root_message_id": request.root_message_id,
-                        "thread_id": request.thread_id,
+                        "repository_scope": &approval.repository_scope,
+                        "root_message_id": &approval.root_message_id,
+                        "thread_id": &approval.thread_id,
                     },
                     "proposal": proposal_value,
                 }),
@@ -392,7 +435,8 @@ impl WorkflowRuntime {
                 max_attempts: Some(3),
             })
             .await?;
-        sqlx::query(
+        let mut tx = self.inner.client.pool().begin().await?;
+        let updated = sqlx::query(
             "UPDATE workflow_action_proposals SET consumed_at = NOW(), approved_by_actor_id = $2, \
              approved_message_id = $3, approved_guild_id = $4, approved_channel_id = $5, \
              approved_thread_id = $6, approved_root_message_id = $7, \
@@ -402,20 +446,43 @@ impl WorkflowRuntime {
              WHERE fingerprint = $1 AND consumed_at IS NULL",
         )
         .bind(&fingerprint)
-        .bind(&request.actor_id)
-        .bind(&request.message_id)
-        .bind(&request.guild_id)
-        .bind(&request.channel_id)
-        .bind(&request.thread_id)
-        .bind(&request.root_message_id)
-        .bind(&request.policy_fingerprint)
-        .bind(&request.capability_class)
-        .bind(&request.principal_role)
-        .bind(serde_json::to_value(&request.repository_scope)?)
+        .bind(&approval.actor_id)
+        .bind(&approval.message_id)
+        .bind(&approval.guild_id)
+        .bind(&approval.channel_id)
+        .bind(&approval.thread_id)
+        .bind(&approval.root_message_id)
+        .bind(&approval.policy_fingerprint)
+        .bind(&approval.capability_class)
+        .bind(&approval.principal_role)
+        .bind(serde_json::to_value(&approval.repository_scope)?)
         .bind(&run.task_id)
         .bind(&run.run_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            let existing = sqlx::query(
+                "SELECT action_task_id, action_run_id FROM workflow_action_proposals \
+                 WHERE fingerprint = $1 FOR UPDATE",
+            )
+            .bind(&fingerprint)
+            .fetch_one(&mut *tx)
+            .await?;
+            if existing
+                .try_get::<Option<String>, _>("action_task_id")?
+                .as_deref()
+                != Some(run.task_id.as_str())
+                || existing
+                    .try_get::<Option<String>, _>("action_run_id")?
+                    .as_deref()
+                    != Some(run.run_id.as_str())
+            {
+                return Err(WorkflowRuntimeError::Internal(
+                    "action proposal was consumed by a different workflow run".to_owned(),
+                ));
+            }
+        }
         tx.commit().await?;
         Ok(approval_response(
             &fingerprint,
@@ -558,7 +625,9 @@ async fn proposal_row(
     fingerprint: &str,
 ) -> Result<sqlx::postgres::PgRow, WorkflowRuntimeError> {
     sqlx::query(
-        "SELECT proposal, action_workflow, expires_at, consumed_at, action_task_id, action_run_id \
+        "SELECT proposal, action_workflow, expires_at, consumed_at, action_task_id, action_run_id, \
+         EXISTS(SELECT 1 FROM workflow_action_proposal_approval_claims claim \
+                WHERE claim.fingerprint = workflow_action_proposals.fingerprint) AS approval_claimed \
          FROM workflow_action_proposals WHERE fingerprint = $1",
     )
     .bind(fingerprint)
@@ -573,8 +642,11 @@ fn action_proposal_state(
 ) -> Result<ActionProposalState, WorkflowRuntimeError> {
     let consumed_at: Option<OffsetDateTime> = row.try_get("consumed_at")?;
     let expires_at: OffsetDateTime = row.try_get("expires_at")?;
+    let approval_claimed: bool = row.try_get("approval_claimed")?;
     let status = if consumed_at.is_some() {
         "consumed"
+    } else if approval_claimed {
+        "approving"
     } else if expires_at <= OffsetDateTime::now_utc() {
         "expired"
     } else {
@@ -591,6 +663,23 @@ fn action_proposal_state(
         expires_at,
         fingerprint,
         status: status.to_owned(),
+    })
+}
+
+fn approval_request_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ApproveActionProposalRequest, WorkflowRuntimeError> {
+    Ok(ApproveActionProposalRequest {
+        actor_id: row.try_get("actor_id")?,
+        capability_class: row.try_get("capability_class")?,
+        channel_id: row.try_get("channel_id")?,
+        guild_id: row.try_get("guild_id")?,
+        message_id: row.try_get("message_id")?,
+        policy_fingerprint: row.try_get("policy_fingerprint")?,
+        principal_role: row.try_get("principal_role")?,
+        repository_scope: serde_json::from_value(row.try_get("repository_scope")?)?,
+        root_message_id: row.try_get("root_message_id")?,
+        thread_id: row.try_get("thread_id")?,
     })
 }
 

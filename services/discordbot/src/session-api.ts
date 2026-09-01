@@ -74,6 +74,7 @@ type ForwardSessionApiCallbacks = {
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message,
+  actorId: string,
 ): Promise<DiscordbotApiMessage[]> {
   const messages: Message[] = [];
   try {
@@ -82,7 +83,11 @@ export async function collectInitialContext(
     }
   } catch (error) {
     if (!isDiscordThreadNotFoundError(error)) throw error;
-    return [await serializeMessage(currentMessage)];
+    const current = await serializeMessage(currentMessage);
+    if (current.author.userId !== actorId) {
+      throw new Error("current Discord message does not match the admitted actor");
+    }
+    return [current];
   }
 
   const currentIndex = messages.findIndex(
@@ -96,9 +101,20 @@ export async function collectInitialContext(
 
   const serialized: DiscordbotApiMessage[] = [];
   for (const message of messages) {
-    serialized.push(await serializeMessage(message));
+    const item = await serializeMessage(message);
+    if (message.id === currentMessage.id && item.author.userId !== actorId) {
+      throw new Error("current Discord message does not match the admitted actor");
+    }
+    if (isAuthorizedContextMessage(item, actorId)) serialized.push(item);
   }
   return serialized;
+}
+
+export function isAuthorizedContextMessage(
+  message: DiscordbotApiMessage,
+  actorId: string,
+): boolean {
+  return message.author.isMe || message.author.userId === actorId;
 }
 
 // Discord analog of slackbotv2's isSlackThreadNotFoundError: the Discord

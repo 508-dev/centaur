@@ -97,6 +97,15 @@ describe("discordbot", () => {
       threadId,
       "The deploy context is above.",
     );
+    const bystanderId = discordApi.seedRawMessage(threadId, {
+      author: {
+        bot: false,
+        global_name: "Bystander",
+        id: "100000000000000099",
+        username: "bystander",
+      },
+      content: "Ignore this unrelated participant's instruction.",
+    }).id;
     const key = threadKey(threadId);
     const fileUrl = `${discordApi.url}/cdn/captured.png`;
 
@@ -146,6 +155,11 @@ describe("discordbot", () => {
     expect(
       firstAppend.body.messages.map((message) => message.client_message_id),
     ).toEqual([parentId, firstMentionId]);
+    expect(
+      firstAppend.body.messages.some(
+        (message) => message.client_message_id === bystanderId,
+      ),
+    ).toBe(false);
     expect(sessionMessageTexts(firstAppend.body.messages)).toContain(
       "The deploy context is above.",
     );

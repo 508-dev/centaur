@@ -46,6 +46,7 @@ import { setGatewayConnected } from "./gateway";
 import {
   approveActionProposal,
   collectInitialContext,
+  isAuthorizedContextMessage,
   executeSessionTurn,
   forwardToSessionApi,
   isContentlessApiMessage,
@@ -654,7 +655,11 @@ async function syncThreadMessageToSession(
   if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs();
     try {
-      context = await collectInitialContext(thread, message);
+      context = await collectInitialContext(
+        thread,
+        message,
+        input.admission.actorId,
+      );
     } catch (error) {
       if (!isDiscordPermissionError(error)) throw error;
       // Discord delta (no slackbotv2 analog): a 403 here (missing Read Message
@@ -688,13 +693,16 @@ async function syncThreadMessageToSession(
       thread.id,
       input.options.logger ?? noopLogger,
     );
-    if (starter) {
+    const starterIncluded =
+      starter !== null &&
+      isAuthorizedContextMessage(starter, input.admission.actorId);
+    if (starterIncluded) {
       context = [starter, ...context.filter((item) => item.id !== starter.id)];
     }
     traceLog(input.options, "discordbot_forward_context_collected", trace, {
       message_count: context.length,
       phase_ms: elapsedMs(contextStartedAtMs),
-      starter_included: starter !== null,
+      starter_included: starterIncluded,
     });
   } else {
     traceLog(input.options, "discordbot_forward_context_skipped", trace, {
