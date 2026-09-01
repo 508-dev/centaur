@@ -30,6 +30,7 @@ struct SessionPrincipalMetadata<'a> {
 }
 
 const DISCORD_REPO_CACHE_LABEL: &str = "centaur.discord.sandbox_repo_cache";
+const PRINCIPAL_REPO_CACHE_LABEL: &str = "centaur.sandbox_repo_cache";
 const DISCORD_OBSERVABILITY_LABEL: &str = "centaur.discord.sandbox_observability_enabled";
 const DISCORD_SESSIONS_READ_LABEL: &str = "centaur.discord.sandbox_sessions_read_enabled";
 const DISCORD_WORKFLOWS_READ_LABEL: &str = "centaur.discord.sandbox_workflows_read_enabled";
@@ -346,6 +347,10 @@ impl SessionRegistrar {
             .replace_principal_policy(&principal.id, &policy)
             .await?;
         let mut reconciled = principal.clone();
+        reconciled.labels.insert(
+            PRINCIPAL_REPO_CACHE_LABEL.to_owned(),
+            policy.sandbox_repo_cache.clone(),
+        );
         reconciled.sandbox_observability_enabled = policy.sandbox_observability_enabled;
         Ok(reconciled)
     }
@@ -792,6 +797,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(principal.id, "prn_discord");
+        assert_eq!(
+            principal
+                .labels
+                .get(PRINCIPAL_REPO_CACHE_LABEL)
+                .map(String::as_str),
+            Some("all"),
+            "the first execution must use the just-reconciled repo-cache policy"
+        );
+        assert!(principal.sandbox_observability_enabled);
 
         let requests = requests.lock().unwrap();
         let principal_updates = requests
