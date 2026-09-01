@@ -74,6 +74,11 @@ impl PrincipalRef {
             slack_team_id: self.slack_team_id.clone(),
             slack_email: None,
             labels,
+            sandbox_repo_cache: None,
+            sandbox_observability_enabled: None,
+            sandbox_sessions_read_enabled: None,
+            sandbox_workflows_read_enabled: None,
+            sandbox_workflows_write_enabled: None,
         }
     }
 }

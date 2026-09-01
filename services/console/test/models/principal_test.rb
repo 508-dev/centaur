@@ -1,6 +1,17 @@
 require "test_helper"
 
 class PrincipalTest < ActiveSupport::TestCase
+  test "discord user is a supported actor-scoped principal kind" do
+    principal = Principal.new(default_attrs(
+      foreign_id: "discord-user-1336096360772141148-100000000000000001",
+      name: "Discord user",
+      kind: "discord_user",
+      labels: {}
+    ))
+
+    assert principal.valid?, principal.errors.full_messages.join(", ")
+  end
+
   def default_attrs(overrides = {})
     { created_by: users(:acme_admin) }.merge(overrides)
   end
