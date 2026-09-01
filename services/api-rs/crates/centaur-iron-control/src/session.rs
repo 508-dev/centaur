@@ -24,6 +24,7 @@ struct SessionPrincipalMetadata<'a> {
     actor_user_id: Option<&'a str>,
     discord_actor_user_id: Option<&'a str>,
     discord_policy_roles: Option<&'a Value>,
+    discord_repository_scope: Option<&'a Value>,
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
@@ -35,6 +36,12 @@ const DISCORD_OBSERVABILITY_LABEL: &str = "centaur.discord.sandbox_observability
 const DISCORD_SESSIONS_READ_LABEL: &str = "centaur.discord.sandbox_sessions_read_enabled";
 const DISCORD_WORKFLOWS_READ_LABEL: &str = "centaur.discord.sandbox_workflows_read_enabled";
 const DISCORD_WORKFLOWS_WRITE_LABEL: &str = "centaur.discord.sandbox_workflows_write_enabled";
+const DISCORD_REPOSITORY_SCOPE_LABEL: &str = "repository_scope";
+const GITHUB_APP_INSTALLATION_GRANT: &str = "github_app_installation";
+const GITHUB_REPOSITORIES_LABEL: &str = "repositories";
+const GITHUB_TOKEN_KIND: &str = "github_token";
+const TOKEN_BROKER_SOURCE: &str = "token_broker";
+const MAX_DISCORD_REPOSITORY_SCOPE: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiscordPrincipalCapabilities {
@@ -92,6 +99,7 @@ impl<'a> SessionPrincipalMetadata<'a> {
                 .get("discord_actor_user_id")
                 .and_then(Value::as_str),
             discord_policy_roles: metadata.get("discord_policy_role_foreign_ids"),
+            discord_repository_scope: metadata.get("discord_repository_scope"),
             slack_team_id: metadata.get("slack_team_id").and_then(Value::as_str),
             slack_user_email: metadata.get("slack_user_email").and_then(Value::as_str),
             conversation_name: metadata
@@ -162,13 +170,16 @@ impl SessionRegistrar {
                 .await?;
         }
         if is_discord
-            && (metadata.discord_actor_user_id.is_some() || metadata.discord_policy_roles.is_some())
+            && (metadata.discord_actor_user_id.is_some()
+                || metadata.discord_policy_roles.is_some()
+                || metadata.discord_repository_scope.is_some())
         {
             record = self
                 .reconcile_discord_policy_roles(
                     &record,
                     metadata.discord_actor_user_id,
                     metadata.discord_policy_roles,
+                    metadata.discord_repository_scope,
                 )
                 .await?;
         }
@@ -278,6 +289,7 @@ impl SessionRegistrar {
         principal: &Principal,
         actor_user_id: Option<&str>,
         role_value: Option<&Value>,
+        repository_scope_value: Option<&Value>,
     ) -> Result<Principal> {
         let actor_user_id = actor_user_id
             .map(str::trim)
@@ -288,6 +300,7 @@ impl SessionRegistrar {
                 )
             })?;
         let role_foreign_ids = parse_discord_policy_roles(role_value)?;
+        let repository_scope = parse_discord_repository_scope(repository_scope_value)?;
         if principal.labels.get("discord_user_id").map(String::as_str) != Some(actor_user_id)
             || principal
                 .labels
@@ -322,6 +335,8 @@ impl SessionRegistrar {
                     "role {foreign_id} is not marked as a reviewed Discord policy role"
                 )));
             }
+            self.validate_discord_role_github_scope(&role, &repository_scope)
+                .await?;
             desired_roles.push(role);
         }
         let capabilities = DiscordPrincipalCapabilities::from_role_labels(
@@ -353,6 +368,102 @@ impl SessionRegistrar {
         );
         reconciled.sandbox_observability_enabled = policy.sandbox_observability_enabled;
         Ok(reconciled)
+    }
+
+    /// Prove that a Discord role's GitHub App token can reach exactly the
+    /// repositories asserted by the authenticated ingress policy. Role labels
+    /// are only declarations; the actual broker credential is authoritative.
+    async fn validate_discord_role_github_scope(
+        &self,
+        role: &crate::models::Role,
+        expected_scope: &[String],
+    ) -> Result<()> {
+        let role_scope = parse_discord_role_repository_scope(&role.labels)?;
+        if role_scope != expected_scope {
+            return Err(IronControlError::DiscordPolicy(
+                "reviewed Discord role repository_scope differs from the ingress policy".to_owned(),
+            ));
+        }
+
+        let grants = self.client.list_role_grants(&role.id).await?;
+        let mut github_credential_count = 0usize;
+        for grant in grants {
+            let Some(("static", collection, secret_id)) = grant.secret_target() else {
+                continue;
+            };
+            let secret = self
+                .client
+                .get_secret_detail(collection, "ssr_", secret_id)
+                .await?;
+            let kind = secret.get("kind").and_then(Value::as_str);
+            let source = secret.get("source").and_then(Value::as_object);
+            let source_type = source
+                .and_then(|source| source.get("source_type"))
+                .and_then(Value::as_str);
+
+            // A value advertised as GITHUB_TOKEN must always be a scoped
+            // GitHub App credential. Other static secrets can be non-GitHub
+            // capability grants, but a token_broker backed by a GitHub App is
+            // still checked even if a bad operator relabels the secret.
+            if kind == Some(GITHUB_TOKEN_KIND) && source_type != Some(TOKEN_BROKER_SOURCE) {
+                return Err(IronControlError::DiscordPolicy(
+                    "Discord GitHub token is not sourced from a token broker".to_owned(),
+                ));
+            }
+            if source_type != Some(TOKEN_BROKER_SOURCE) {
+                continue;
+            }
+            let credential_id = source
+                .and_then(|source| source.get("config"))
+                .and_then(Value::as_object)
+                .and_then(|config| config.get("credential_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    IronControlError::DiscordPolicy(
+                        "brokered Discord role secret has no credential_id".to_owned(),
+                    )
+                })?;
+            let credential = self
+                .client
+                .get_broker_credential_detail(credential_id)
+                .await?;
+            let is_github_app = credential.get("grant").and_then(Value::as_str)
+                == Some(GITHUB_APP_INSTALLATION_GRANT);
+            if !is_github_app {
+                if kind == Some(GITHUB_TOKEN_KIND) {
+                    return Err(IronControlError::DiscordPolicy(
+                        "Discord GitHub token is not backed by a GitHub App credential".to_owned(),
+                    ));
+                }
+                continue;
+            }
+
+            if kind == Some(GITHUB_TOKEN_KIND) {
+                let secret_scope = parse_secret_repository_scope(&secret)?;
+                if secret_scope != expected_scope {
+                    return Err(IronControlError::DiscordPolicy(
+                        "Discord GitHub token declaration differs from the ingress repository scope"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let credential_scope = parse_broker_repository_scope(&credential)?;
+            if credential_scope != expected_scope {
+                return Err(IronControlError::DiscordPolicy(
+                    "Discord GitHub App credential scope differs from the ingress repository scope"
+                        .to_owned(),
+                ));
+            }
+            github_credential_count += 1;
+        }
+        if github_credential_count != 1 {
+            return Err(IronControlError::DiscordPolicy(format!(
+                "reviewed Discord role must grant exactly one scoped GitHub App credential, found {github_credential_count}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +506,125 @@ fn parse_discord_policy_roles(value: Option<&Value>) -> Result<Vec<&str>> {
         }
     }
     Ok(unique.into_iter().collect())
+}
+
+fn parse_discord_repository_scope(value: Option<&Value>) -> Result<Vec<String>> {
+    let values = value.and_then(Value::as_array).ok_or_else(|| {
+        IronControlError::DiscordPolicy(
+            "discord_repository_scope must be a non-empty array".to_owned(),
+        )
+    })?;
+    let entries = values
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                IronControlError::DiscordPolicy(
+                    "discord_repository_scope must contain strings".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_repository_scope(entries, "discord_repository_scope")
+}
+
+fn parse_discord_role_repository_scope(labels: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    let value = labels
+        .get(DISCORD_REPOSITORY_SCOPE_LABEL)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            IronControlError::DiscordPolicy(
+                "reviewed Discord role is missing repository_scope".to_owned(),
+            )
+        })?;
+    normalize_repository_scope(
+        value.split(',').map(str::trim).collect::<Vec<_>>(),
+        "reviewed Discord role repository_scope",
+    )
+}
+
+fn parse_secret_repository_scope(secret: &Value) -> Result<Vec<String>> {
+    let value = secret
+        .get("labels")
+        .and_then(Value::as_object)
+        .and_then(|labels| labels.get(GITHUB_REPOSITORIES_LABEL))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            IronControlError::DiscordPolicy(
+                "Discord GitHub token is missing its repository declaration".to_owned(),
+            )
+        })?;
+    normalize_repository_scope(
+        value.split(',').map(str::trim).collect::<Vec<_>>(),
+        "Discord GitHub token repository declaration",
+    )
+}
+
+fn parse_broker_repository_scope(credential: &Value) -> Result<Vec<String>> {
+    let values = credential
+        .get("github_repositories")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            IronControlError::DiscordPolicy(
+                "GitHub App credential has no repository scope".to_owned(),
+            )
+        })?;
+    let entries = values
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                IronControlError::DiscordPolicy(
+                    "GitHub App credential repository scope must contain strings".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_repository_scope(entries, "GitHub App credential repository scope")
+}
+
+fn normalize_repository_scope(entries: Vec<&str>, label: &str) -> Result<Vec<String>> {
+    if entries.is_empty() || entries.len() > MAX_DISCORD_REPOSITORY_SCOPE {
+        return Err(IronControlError::DiscordPolicy(format!(
+            "{label} must contain between one and {MAX_DISCORD_REPOSITORY_SCOPE} repositories"
+        )));
+    }
+    let mut repositories = BTreeSet::new();
+    for entry in entries {
+        let repository = normalize_repository(entry).ok_or_else(|| {
+            IronControlError::DiscordPolicy(format!(
+                "{label} must contain exact owner/repository names"
+            ))
+        })?;
+        if !repositories.insert(repository) {
+            return Err(IronControlError::DiscordPolicy(format!(
+                "{label} contains duplicate repositories"
+            )));
+        }
+    }
+    Ok(repositories.into_iter().collect())
+}
+
+fn normalize_repository(value: &str) -> Option<String> {
+    if value.is_empty() || value != value.trim() || value.len() > 128 {
+        return None;
+    }
+    let (owner, repository) = value.split_once('/')?;
+    if owner.is_empty()
+        || repository.is_empty()
+        || repository.contains('/')
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase()
+    ))
 }
 
 fn eligible_slack_requester_team(metadata: &Value) -> Option<&str> {
@@ -783,6 +1013,7 @@ mod tests {
     async fn register_session_reconciles_discord_actor_to_the_exact_reviewed_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: false,
+            github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: true,
         })
         .await;
@@ -844,6 +1075,7 @@ mod tests {
     async fn register_session_rejects_discord_principal_direct_grants() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: true,
+            github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: true,
         })
         .await;
@@ -872,6 +1104,7 @@ mod tests {
     async fn register_session_rejects_unreviewed_discord_policy_role() {
         let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
             direct_grant: false,
+            github_repositories: r#"["508-dev/centaur"]"#,
             reviewed_role: false,
         })
         .await;
@@ -894,6 +1127,37 @@ mod tests {
             "an unreviewed role blocks before any assignment mutation"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_rejects_unscoped_or_broader_discord_github_credentials() {
+        for repositories in [r#"[]"#, r#"["508-dev/centaur","508-dev/other"]"#] {
+            let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
+                direct_grant: false,
+                github_repositories: repositories,
+                reviewed_role: true,
+            })
+            .await;
+            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+            let error = registrar
+                .register_session(
+                    "discord:200000000000000001:300000000000000001:400000000000000001",
+                    Some(&discord_policy_metadata()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, IronControlError::DiscordPolicy(_)));
+            assert!(
+                !requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request == "PUT /api/v1/principals/prn_discord/roles"),
+                "an unscoped or broader credential blocks before role assignment"
+            );
+            server.abort();
+        }
     }
 
     #[test]
@@ -1213,13 +1477,15 @@ mod tests {
     fn discord_policy_metadata() -> Value {
         json!({
             "discord_actor_user_id": "100000000000000001",
-            "discord_policy_role_foreign_ids": ["discord-observer"]
+            "discord_policy_role_foreign_ids": ["discord-observer"],
+            "discord_repository_scope": ["508-dev/centaur"]
         })
     }
 
     #[derive(Clone, Copy)]
     struct DiscordPolicyStub {
         direct_grant: bool,
+        github_repositories: &'static str,
         reviewed_role: bool,
     }
 
@@ -1252,7 +1518,7 @@ mod tests {
 
                 let principal = r#"{"data":{"id":"prn_discord","foreign_id":"discord-user-200000000000000001-100000000000000001","name":"Discord User","labels":{"managed-by":"centaur","discord_guild_id":"200000000000000001","discord_channel_id":"300000000000000001","discord_user_id":"100000000000000001","centaur_discord_policy_managed":"true"}}}"#;
                 let role_labels = if config.reviewed_role {
-                    r#"{"centaur_discord_policy_managed":"true","centaur.discord.sandbox_repo_cache":"all","centaur.discord.sandbox_observability_enabled":"true","centaur.discord.sandbox_sessions_read_enabled":"false","centaur.discord.sandbox_workflows_read_enabled":"true","centaur.discord.sandbox_workflows_write_enabled":"true"}"#
+                    r#"{"centaur_discord_policy_managed":"true","repository_scope":"508-dev/centaur","centaur.discord.sandbox_repo_cache":"all","centaur.discord.sandbox_observability_enabled":"true","centaur.discord.sandbox_sessions_read_enabled":"false","centaur.discord.sandbox_workflows_read_enabled":"true","centaur.discord.sandbox_workflows_write_enabled":"true"}"#
                 } else {
                     "{}"
                 };
@@ -1264,6 +1530,12 @@ mod tests {
                 } else {
                     r#"{"data":[]}"#
                 };
+                let role_grants = r#"{"data":[{"id":"grant_github","role_id":"role_observer","static_secret_id":"ssr_github"}]}"#;
+                let github_secret = r#"{"data":{"id":"ssr_github","kind":"github_token","labels":{"repositories":"508-dev/centaur"},"source":{"source_type":"token_broker","config":{"credential_id":"bcr_github"}}}}"#;
+                let github_credential = format!(
+                    r#"{{"data":{{"id":"bcr_github","grant":"github_app_installation","github_repositories":{}}}}}"#,
+                    config.github_repositories
+                );
                 let (status_line, body) = match (method, path) {
                     (
                         "GET",
@@ -1277,6 +1549,15 @@ mod tests {
                         ("200 OK", grants.to_owned())
                     }
                     ("GET", "/api/v1/roles/lookup/discord-observer") => ("200 OK", role),
+                    ("GET", "/api/v1/roles/role_observer/grants?page=1&limit=100") => {
+                        ("200 OK", role_grants.to_owned())
+                    }
+                    ("GET", "/api/v1/static_secrets/ssr_github") => {
+                        ("200 OK", github_secret.to_owned())
+                    }
+                    ("GET", "/api/v1/broker_credentials/bcr_github") => {
+                        ("200 OK", github_credential)
+                    }
                     ("PUT", "/api/v1/principals/prn_discord/roles") => {
                         ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
                     }
