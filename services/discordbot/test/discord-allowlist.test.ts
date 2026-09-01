@@ -288,12 +288,30 @@ describe("Discord ingress context", () => {
   });
 
   it("treats any missing required human allowlist as inert", () => {
-    expect(isDiscordIngressAllowlistEmpty(options())).toBe(false);
+    // The legacy trigger-role allowlist is not a capability policy and cannot
+    // activate production ingress by itself.
+    expect(isDiscordIngressAllowlistEmpty(options())).toBe(true);
+    const reviewedPolicy = {
+      canApprove: false,
+      capabilityClass: "github:observe",
+      principalRole: "discord-observer",
+      priority: 0,
+      projectScope: [],
+      repositoryScope: ["example/example"],
+      roleId: "R1",
+    };
     expect(
-      isDiscordIngressAllowlistEmpty(options({ channelAllowlist: [] })),
+      isDiscordIngressAllowlistEmpty(
+        options({ roleBindings: [reviewedPolicy] }),
+      ),
+    ).toBe(false);
+    expect(
+      isDiscordIngressAllowlistEmpty(
+        options({ channelAllowlist: [], roleBindings: [reviewedPolicy] }),
+      ),
     ).toBe(true);
     expect(
-      isDiscordIngressAllowlistEmpty(options({ triggerRoleAllowlist: [] })),
+      isDiscordIngressAllowlistEmpty(options({ roleBindings: [] })),
     ).toBe(true);
   });
 });

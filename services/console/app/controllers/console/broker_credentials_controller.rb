@@ -71,9 +71,11 @@ module Console
       fields[:foreign_id] = fields[:foreign_id].presence
       was_github_app_installation = credential.github_app_installation?
       credential.assign_attributes(fields)
+      credential.github_repositories = github_repository_params
       github_app_grant_changed = was_github_app_installation != credential.github_app_installation?
       github_app_identity_changed = credential.github_app_installation? &&
-        (credential.github_installation_id_changed? || credential.client_id_changed?)
+        (credential.github_installation_id_changed? || credential.client_id_changed? ||
+          credential.github_repositories_changed?)
       if github_app_grant_changed || github_app_identity_changed
         reset_refresh_state(credential, discard_access_token: true)
       end
@@ -139,6 +141,10 @@ module Console
     # Scopes are entered one per line (whitespace separated); blanks dropped.
     def scope_params
       credential_params[:scopes].to_s.split.map(&:strip).reject(&:blank?)
+    end
+
+    def github_repository_params
+      credential_params[:github_repositories].to_s.split.map(&:strip).reject(&:blank?)
     end
 
     # Token-endpoint headers use the same key/value row editor as labels

@@ -86,8 +86,18 @@ class RequestRpc(FakeRpc):
                 "run_id": "run-child",
                 "created": True,
             }
+        if message_type == "ctx.proposal.put":
+            return {
+                "created": True,
+                "fingerprint": "sha256:" + ("a" * 64),
+                "status": "pending",
+            }
+        if message_type == "ctx.notification.transition":
+            return {"notify": True, "resolution": False, "state_persisted": True}
         if message_type == "ctx.post_to_slack":
             return {"channel": payload["channel"], "ts": "1710000000.000100"}
+        if message_type == "ctx.post_to_discord":
+            return {"channel_id": payload["channel_id"], "message_id": "1542739830591459999"}
         if message_type == "ctx.sleep":
             return {"slept": True}
         if message_type == "ctx.event.wait":
@@ -470,6 +480,85 @@ class WorkflowHostTests(unittest.TestCase):
                         "icon_emoji": ":female_mage:",
                     },
                 }
+            ],
+        )
+
+    def test_post_to_discord_requires_a_stable_delivery_id(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="weekly_ops_review",
+        )
+
+        result = asyncio.run(
+            ctx.post_to_discord(
+                "1542739830591459369",
+                "One material weekly finding.",
+                delivery_id="weekly-ops:sha256:abc123",
+            )
+        )
+
+        self.assertEqual(result["message_id"], "1542739830591459999")
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.post_to_discord",
+                    "channel_id": "1542739830591459369",
+                    "delivery_id": "weekly-ops:sha256:abc123",
+                    "text": "One material weekly finding.",
+                }
+            ],
+        )
+
+    def test_action_proposal_and_notification_state_use_runtime_primitives(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="weekly_ops_review",
+        )
+        proposal = {
+            "action_type": "github:create_improvement_pr",
+            "repository": "508-dev/508-workflows",
+        }
+
+        created = asyncio.run(
+            ctx.put_action_proposal(proposal, expires_in_seconds=604800)
+        )
+        transition = asyncio.run(
+            ctx.transition_notification_state(
+                "weekly_ops_review:automations",
+                created["fingerprint"],
+                "proposal_pending",
+            )
+        )
+
+        self.assertTrue(created["created"])
+        self.assertTrue(transition["notify"])
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.proposal.put",
+                    "request": {
+                        "proposal": proposal,
+                        "expires_in_seconds": 604800,
+                    },
+                },
+                {
+                    "type": "ctx.notification.transition",
+                    "request": {
+                        "scope": "weekly_ops_review:automations",
+                        "semantic_fingerprint": "sha256:" + ("a" * 64),
+                        "state_class": "proposal_pending",
+                    },
+                },
             ],
         )
 

@@ -19,12 +19,16 @@ import { Hono } from "hono";
 import pg from "pg";
 import {
   discordIngressDenialReason,
-  isAllowedDiscordGuild,
   isAllowedDiscordMessage,
   isDiscordIngressAllowlistEmpty,
   parseDiscordThreadKey,
-  resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
+import {
+  acceptedDiscordAdmissionForMessage,
+  admitDiscordGatewayMessage,
+  discordGatewayEventFromMessage,
+  type DiscordAcceptedAdmission,
+} from "./discord-ingress";
 import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
 import { fetchThreadStarterMessage } from "./discord-starter";
 import {
@@ -35,21 +39,29 @@ import {
 } from "./discord-threading";
 import { setGatewayConnected } from "./gateway";
 import {
+  approveActionProposal,
   collectInitialContext,
   executeSessionTurn,
   forwardToSessionApi,
   isContentlessApiMessage,
   isDiscordPermissionError,
   isRetryableSessionApiError,
+  interruptSessionExecution,
   openSessionEventStream,
   serializeMessage,
   sessionStreamError,
   startingStreamNotification,
 } from "./session-api";
+import {
+  authorizeDiscordDelivery,
+  deliverDiscordNotification,
+  DiscordDeliveryError,
+} from "./discord-delivery";
 import type {
   Discordbot,
   DiscordbotApiMessage,
   DiscordbotExecuteSessionResponse,
+  DiscordExecutionPolicy,
   DiscordbotMessageMode,
   DiscordbotOptions,
   DiscordbotRenderObligation,
@@ -178,10 +190,11 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   if (isDiscordIngressAllowlistEmpty(options)) {
     logger.warn("discordbot_ingress_allowlist_incomplete_inert", {
-      hint: "Set DISCORDBOT_GUILD_ALLOWLIST, DISCORDBOT_CHANNEL_ALLOWLIST, and DISCORDBOT_TRIGGER_ROLE_ALLOWLIST; human messages are ignored until all three are configured.",
+      hint: "Set DISCORDBOT_GUILD_ALLOWLIST, DISCORDBOT_CHANNEL_ALLOWLIST, and reviewed DISCORDBOT_ROLE_BINDINGS_JSON; human messages are ignored until all three are configured.",
     });
   }
 
+  const state = options.state ?? createDefaultState(options, logger);
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
@@ -190,6 +203,12 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     mentionRoleIds: options.mentionRoleIds,
     userName,
     logger,
+    // Direct-mode interactions are intentionally disabled. The reviewed root
+    // trigger is an authenticated Gateway mention; unscoped slash commands
+    // must not bypass the role/channel admission path.
+    allowGatewayInteractions: false,
+    shouldHandleGatewayMessage: async (event) =>
+      (await admitDiscordGatewayMessage(event, options, state, logger)) !== null,
     // Discord delta (patched adapter): gate mentions BEFORE the adapter
     // creates a public thread. The full gate still runs in the handlers below
     // so every follow-up is re-authorized as well.
@@ -214,15 +233,6 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       }
       return denialReason === undefined;
     },
-    // Discord delta (patched adapter): the gateway drops bot-authored
-    // messages by default; forward only allowlisted trigger bots in
-    // allowlisted guilds. The allowlist entry must be the id the message is
-    // authored as (bot user id, or the webhook id for webhook integrations);
-    // isAllowedDiscordMessage applies the broader application_id/webhook_id
-    // matching once the full payload is available.
-    shouldForwardBotMessage: ({ authorId, guildId }) =>
-      isAllowedDiscordGuild(guildId, options) &&
-      resolveTriggerBotAllowlist(options).includes(authorId),
     // Discord delta (patched adapter): the Gateway never redelivers, so a
     // message dropped on a thread-lock conflict is otherwise lost with zero
     // signal — surface it with a 🔁 reaction so the user knows to resend.
@@ -249,7 +259,6 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // 503 once the connection has been down for >60s (see gateway.ts).
     onGatewayStatusChange: (connected) => setGatewayConnected(connected),
   });
-  const state = options.state ?? createDefaultState(options, logger);
   const chat = new Chat<{ discord: typeof discord }, DiscordbotThreadState>({
     userName,
     adapters: { discord },
@@ -279,8 +288,24 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
+    const admission = await discordAdmissionForHandler(
+      message,
+      options,
+      state,
+      logger,
+    );
+    if (!admission) return;
+    if (admission.control === "stop") {
+      await stopDiscordExecution(thread, message, admission, options, logger);
+      return;
+    }
+    if (admission.control === "approve") {
+      await approveDiscordProposal(thread, message, admission, options, logger);
+      return;
+    }
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
+      admission,
       executionLimiter,
       mode: "execute",
       options,
@@ -290,7 +315,23 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
+    const admission = await discordAdmissionForHandler(
+      message,
+      options,
+      state,
+      logger,
+    );
+    if (!admission) return;
+    if (admission.control === "stop") {
+      await stopDiscordExecution(thread, message, admission, options, logger);
+      return;
+    }
+    if (admission.control === "approve") {
+      await approveDiscordProposal(thread, message, admission, options, logger);
+      return;
+    }
     await syncThreadMessageToSession(thread, message, {
+      admission,
       executionLimiter,
       mode: message.isMention === true ? "execute" : "append",
       options,
@@ -308,12 +349,127 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       gatewayActive ? 200 : 503,
     );
   });
+  app.post("/internal/deliveries", async (c) => {
+    try {
+      authorizeDiscordDelivery(c.req.header("authorization"), options.apiKey);
+      const result = await deliverDiscordNotification(
+        await c.req.json(),
+        options,
+        state,
+        logger,
+      );
+      return c.json(result);
+    } catch (error) {
+      const deliveryError =
+        error instanceof DiscordDeliveryError
+          ? error
+          : new DiscordDeliveryError("invalid_request", 400);
+      return new Response(
+        JSON.stringify({ error: deliveryError.code, ok: false }),
+        {
+          headers: { "content-type": "application/json" },
+          status: deliveryError.status,
+        },
+      );
+    }
+  });
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options);
   }
 
   return { app, chat, adapter: discord };
+}
+
+async function discordAdmissionForHandler(
+  message: ChatMessage,
+  options: DiscordbotOptions,
+  state: StateAdapter,
+  logger: Logger,
+): Promise<DiscordAcceptedAdmission | null> {
+  const accepted = await acceptedDiscordAdmissionForMessage(message, state);
+  if (accepted) return accepted;
+  // Production events must already have been admitted by the authenticated
+  // Discord Gateway callback before the adapter creates a thread. The Chat SDK
+  // also exposes an in-process webhook emulator; never treat its forwarded
+  // JSON as transport-authenticated outside explicit tests.
+  if (options.allowInProcessGatewayEmulation !== true) {
+    logger.warn("discordbot_missing_verified_gateway_admission", {
+      message_id: message.id,
+      thread_id: message.threadId,
+    });
+    return null;
+  }
+  const event = discordGatewayEventFromMessage(message, options);
+  if (!event) return null;
+  return admitDiscordGatewayMessage(event, options, state, logger);
+}
+
+async function stopDiscordExecution(
+  thread: Thread<DiscordbotThreadState>,
+  message: ChatMessage,
+  admission: DiscordAcceptedAdmission,
+  options: DiscordbotOptions,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const outcome = await interruptSessionExecution(
+      options,
+      thread.id,
+      `Stopped by Discord actor ${admission.actorId}`,
+    );
+    await thread.post(
+      outcome.interrupted
+        ? "Stopped the current Centaur run for this thread."
+        : "There is no active Centaur run in this thread.",
+    );
+    await reactToDiscordMessage(
+      options,
+      { emoji: "⏹️", messageId: message.id, threadKey: thread.id },
+      logger,
+    );
+  } catch (error) {
+    traceLog(options, "discordbot_stop_failed", undefined, {
+      actor_id: admission.actorId,
+      error: errorMessage(error),
+      message_id: message.id,
+      thread_id: thread.id,
+    });
+    await thread.post("I couldn't stop that run. Check Console and try again.");
+  }
+}
+
+async function approveDiscordProposal(
+  thread: Thread<DiscordbotThreadState>,
+  message: ChatMessage,
+  admission: DiscordAcceptedAdmission,
+  options: DiscordbotOptions,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const outcome = await approveActionProposal(options, admission);
+    const state = outcome.created ? "Queued" : "Already queued";
+    const destination = outcome.console_url
+      ? ` Track it in Console: ${outcome.console_url}`
+      : " Track it in Console.";
+    await thread.post(`${state} the approved improvement action.${destination}`);
+    await reactToDiscordMessage(
+      options,
+      { emoji: "✅", messageId: message.id, threadKey: thread.id },
+      logger,
+    );
+  } catch (error) {
+    traceLog(options, "discordbot_proposal_approval_failed", undefined, {
+      actor_id: admission.actorId,
+      error: errorMessage(error),
+      message_id: message.id,
+      proposal_fingerprint: admission.proposalFingerprint,
+      thread_id: thread.id,
+    });
+    await thread.post(
+      "I couldn't approve that proposal. It may be expired or changed; run a fresh observation and check Console.",
+    );
+  }
 }
 
 function createDefaultState(
@@ -380,6 +536,7 @@ async function syncThreadMessageToSession(
   thread: Thread<DiscordbotThreadState>,
   message: ChatMessage,
   input: {
+    admission: DiscordAcceptedAdmission;
     executionLimiter: GuildExecutionLimiter;
     mode: DiscordbotMessageMode;
     options: DiscordbotOptions;
@@ -541,10 +698,11 @@ async function syncThreadMessageToSession(
     conversationName,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     messages: messagesToAppend,
-    onEventId: (eventId) => {
+    onEventId: (eventId: number) => {
       lastEventId = Math.max(lastEventId, eventId);
     },
     openStream: false,
+    policy: executionPolicy(input.admission),
     threadId: thread.id,
     trace,
   };
@@ -692,6 +850,23 @@ async function syncThreadMessageToSession(
       last_event_id: lastEventId,
     });
   }
+}
+
+function executionPolicy(
+  admission: DiscordAcceptedAdmission,
+): DiscordExecutionPolicy {
+  return {
+    actorId: admission.actorId,
+    capabilityClass: admission.policy.capabilityClass,
+    channelId: admission.channelId,
+    guildId: admission.guildId,
+    policyFingerprint: admission.policy.fingerprint,
+    principalRole: admission.policy.principalRole,
+    projectScope: admission.policy.projectScope,
+    repositoryScope: admission.policy.repositoryScope,
+    rootMessageId: admission.rootMessageId,
+    threadId: admission.threadId,
+  };
 }
 
 function scheduleExecutionRender(
@@ -1033,11 +1208,15 @@ async function recoverRenderObligation(
     threadState.lastEventId ?? 0,
     obligation.afterEventId,
   );
-  const input: ForwardSessionInput = {
+  // Recovery only reopens an already-authorized execution's event stream; it
+  // never creates, appends, or executes a session turn, so it intentionally
+  // carries only the stream cursor contract rather than reconstructing policy
+  // from Discord text or stale process memory.
+  const input = {
     afterEventId: lastEventId,
     executionId: obligation.executionId,
     messages: [],
-    onEventId: (eventId) => {
+    onEventId: (eventId: number) => {
       lastEventId = Math.max(lastEventId, eventId);
     },
     openStream: false,

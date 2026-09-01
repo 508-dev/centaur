@@ -1,5 +1,6 @@
 import type { Logger, Message } from "chat";
 import type { DiscordbotOptions } from "./types";
+import { configuredDiscordRoleIds } from "./discord-policy";
 
 export type DiscordIngressContext = {
   authorIsBot: boolean;
@@ -35,8 +36,7 @@ export function parseDiscordThreadKey(threadKey: string): {
  * Authorization gate for inbound Discord messages.
  *
  * Unlike the Slack allowlist (which is fail-open), this is intentionally **fail-closed**:
- * the api-rs control plane has no ingress auth, so this guard is the primary authorization
- * boundary. Direct messages are denied outright, and all three human ingress
+ * Direct messages are denied outright, and all three human ingress
  * allowlists (guild, parent channel, and trigger role) must be configured.
  */
 export function isAllowedDiscordMessage(
@@ -218,6 +218,8 @@ export function resolveTriggerBotAllowlist(
 export function resolveTriggerRoleAllowlist(
   options: DiscordbotOptions,
 ): string[] {
+  const policyRoleIds = configuredDiscordRoleIds(options);
+  if (policyRoleIds.length > 0) return policyRoleIds;
   return [
     ...(options.triggerRoleAllowlist ??
       splitEnvList(process.env.DISCORDBOT_TRIGGER_ROLE_ALLOWLIST)),
@@ -236,7 +238,7 @@ export function isDiscordIngressAllowlistEmpty(
   return (
     resolveGuildAllowlist(options).length === 0 ||
     resolveChannelAllowlist(options).length === 0 ||
-    resolveTriggerRoleAllowlist(options).length === 0
+    configuredDiscordRoleIds(options).length === 0
   );
 }
 

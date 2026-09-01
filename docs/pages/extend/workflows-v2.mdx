@@ -63,6 +63,9 @@ Supported v2 primitives:
 | `ctx.run_model_ensemble(...)` | Supported for replay-safe cross-model review, bounded fallback, and validated synthesis |
 | `ctx.call_tool(...)` | Supported through the generated `centaur-tools call` bridge in the workflow-host sandbox |
 | `ctx.post_to_slack(...)` | Supported |
+| `ctx.post_to_discord(...)` | Supported for authenticated, allowlisted, idempotent workflow notifications |
+| `ctx.put_action_proposal(...)` | Supported for validated, canonical, expiring action proposals |
+| `ctx.transition_notification_state(...)` | Supported for durable semantic notification suppression/resolution |
 | `ctx._pool` | Supported when the workflow-host sandbox receives `DATABASE_URL` |
 | `WEBHOOKS` | Supported |
 | `SCHEDULE` | Supported |
@@ -112,6 +115,66 @@ async def handler(inp: dict, ctx: WorkflowContext) -> dict:
 `username` and `icon_emoji` are optional. They customize the Slack app identity
 for that message and require the app installation to grant
 `chat:write.customize`. Omitting them preserves the app's default identity.
+
+### Keep observation separate from approval and action
+
+An observer workflow can persist a typed proposal without gaining mutation
+authority. The runtime validates its exact action type, action workflow,
+repository, refs, source IDs, bounded evidence, parameters, and validation
+statuses, then derives the canonical `sha256:` fingerprint:
+
+```python
+proposal = await ctx.put_action_proposal(
+    {
+        "action_type": "github:create_improvement_pr",
+        "action_workflow": "execute_approved_improvement",
+        "repository": "example-org/automation",
+        "base_ref": "0123456789abcdef0123456789abcdef01234567",
+        "head_ref": None,
+        "source_ids": {"sentry_issue": "OPS-42"},
+        "evidence": [
+            {
+                "source_type": "sentry",
+                "source_id": "OPS-42",
+                "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }
+        ],
+        "validations": [{"name": "source_current", "status": "passed"}],
+        "parameters": {"summary": "Bounded operator-facing summary"},
+    },
+    expires_in_seconds=7 * 24 * 60 * 60,
+)
+```
+
+Only authenticated Discord ingress with a reviewed approval role can consume
+that exact fingerprint. Consumption and action-run creation are idempotent;
+repeated approval returns the existing action. Expired, changed, malformed, or
+out-of-scope proposals fail closed and require a new observation. The action
+workflow receives the normalized proposal plus immutable approval context and
+must enforce the tuple again before any write.
+
+For quiet recurring workflows, derive semantic state from stable proposal,
+source, action, and blocker identifiers—not model prose, timestamps, run IDs,
+or raw errors:
+
+```python
+transition = await ctx.transition_notification_state(
+    "weekly_ops_review:automations",
+    semantic_fingerprint,
+    "proposal_pending",
+)
+if transition["notify"]:
+    await ctx.post_to_discord(
+        "1542739830591459369",
+        concise_digest,
+        delivery_id=f"weekly-ops:{semantic_fingerprint}",
+    )
+```
+
+The state is durable. A storage failure returns `state_persisted: false` and
+permits one concise handoff, but never authorizes a mutation. The Discord
+delivery endpoint rejects non-allowlisted channels, disables mentions and
+embeds, and deduplicates a stable delivery ID.
 
 ### Make agent turns explicit
 

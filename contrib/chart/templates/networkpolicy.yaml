@@ -514,7 +514,8 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Only health probes reach discordbot; nothing routes traffic to it (the Gateway is outbound).
+    # Health probes and the API workflow runtime's narrow authenticated delivery
+    # endpoint are the only inbound paths. Discord event ingress remains Gateway-only.
     - from:
 {{- range $ingressSourceNamespaces }}
         - namespaceSelector:
@@ -524,6 +525,15 @@ spec:
       ports:
         - protocol: TCP
           port: 3001
+{{- if .Values.apiRs.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3001
+{{- end }}
   egress:
 {{- if .Values.apiRs.enabled }}
     - to:

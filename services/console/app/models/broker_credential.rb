@@ -20,6 +20,8 @@ class BrokerCredential < ApplicationRecord
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
+  GITHUB_REPOSITORY_FORMAT = /\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/
+  GITHUB_REPOSITORY_LIMIT = 500
 
   PREQIN_TOKEN_ENDPOINT = Broker::CredentialGrants::PREQIN_TOKEN_ENDPOINT
   GITHUB_API_ENDPOINT = Broker::CredentialGrants::GITHUB_API_ENDPOINT
@@ -96,6 +98,7 @@ class BrokerCredential < ApplicationRecord
             numericality: { only_integer: true, greater_than: 0 }
   validate :labels_is_a_hash
   validate :scopes_is_an_array
+  validate :github_repositories_valid
   validate :grant_credentials_present
   validate :token_endpoint_headers_valid
 
@@ -266,6 +269,27 @@ class BrokerCredential < ApplicationRecord
   def scopes_is_an_array
     return if scopes.is_a?(Array) && scopes.all?(String)
     errors.add(:scopes, "must be an array of strings")
+  end
+
+  def github_repositories_valid
+    unless github_repositories.is_a?(Array) && github_repositories.all?(String)
+      errors.add(:github_repositories, "must be an array of owner/repository strings")
+      return
+    end
+    if github_repositories.length > GITHUB_REPOSITORY_LIMIT
+      errors.add(:github_repositories, "must contain at most #{GITHUB_REPOSITORY_LIMIT} repositories")
+    end
+
+    normalized = github_repositories.map(&:downcase)
+    errors.add(:github_repositories, "must not contain duplicates") if normalized.uniq.length != normalized.length
+    unless github_repositories.all? { |repository| repository.match?(GITHUB_REPOSITORY_FORMAT) }
+      errors.add(:github_repositories, "must contain exact owner/repository names without wildcards")
+    end
+
+    owners = github_repositories.filter_map { |repository| repository.split("/", 2).first&.downcase }.uniq
+    if owners.length > 1
+      errors.add(:github_repositories, "must all belong to the same GitHub App installation owner")
+    end
   end
 
   def grant_credentials_present

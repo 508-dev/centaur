@@ -7,6 +7,8 @@
 //! in console or ``centaur-perms`` remain sticky. The principal is derived from
 //! the thread key (see [`crate::derive_principal`]).
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::IronControlClient;
@@ -20,6 +22,8 @@ use crate::principal::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SessionPrincipalMetadata<'a> {
     actor_user_id: Option<&'a str>,
+    discord_actor_user_id: Option<&'a str>,
+    discord_policy_roles: Option<&'a Value>,
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
@@ -36,6 +40,10 @@ impl<'a> SessionPrincipalMetadata<'a> {
                 .or_else(|| metadata.get("aad_object_id"))
                 .or_else(|| metadata.get("user_id"))
                 .and_then(Value::as_str),
+            discord_actor_user_id: metadata
+                .get("discord_actor_user_id")
+                .and_then(Value::as_str),
+            discord_policy_roles: metadata.get("discord_policy_role_foreign_ids"),
             slack_team_id: metadata.get("slack_team_id").and_then(Value::as_str),
             slack_user_email: metadata.get("slack_user_email").and_then(Value::as_str),
             conversation_name: metadata
@@ -75,9 +83,15 @@ impl SessionRegistrar {
         metadata: Option<&Value>,
     ) -> Result<Principal> {
         let metadata = SessionPrincipalMetadata::from_session_metadata(metadata);
+        let is_discord = thread_key.starts_with("discord:");
+        let actor_user_id = if is_discord {
+            metadata.discord_actor_user_id
+        } else {
+            metadata.actor_user_id
+        };
         let principal = derive_principal_with_slack_team(
             thread_key,
-            metadata.actor_user_id,
+            actor_user_id,
             metadata.slack_team_id,
             metadata.conversation_name,
         )?;
@@ -98,6 +112,16 @@ impl SessionRegistrar {
             self.client
                 .upsert_slack_channel_permission(&record.id, &permission)
                 .await?;
+        }
+        if is_discord
+            && (metadata.discord_actor_user_id.is_some() || metadata.discord_policy_roles.is_some())
+        {
+            self.reconcile_discord_policy_roles(
+                &record,
+                metadata.discord_actor_user_id,
+                metadata.discord_policy_roles,
+            )
+            .await?;
         }
         Ok(record)
     }
@@ -194,6 +218,117 @@ impl SessionRegistrar {
         input.labels = labels;
         Ok(true)
     }
+
+    /// Replace every role on an actor-scoped Discord principal with the one
+    /// reviewed policy role asserted by the authenticated Discord ingress.
+    /// Defaults and stale roles are removed before the desired role is added,
+    /// so a partial failure can only narrow access. Direct grants are never
+    /// deleted implicitly; their presence fails session creation for an
+    /// operator to reconcile explicitly.
+    async fn reconcile_discord_policy_roles(
+        &self,
+        principal: &Principal,
+        actor_user_id: Option<&str>,
+        role_value: Option<&Value>,
+    ) -> Result<()> {
+        let actor_user_id = actor_user_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IronControlError::DiscordPolicy(
+                    "actor-scoped Discord session is missing discord_actor_user_id".to_owned(),
+                )
+            })?;
+        let role_foreign_ids = parse_discord_policy_roles(role_value)?;
+        if principal.labels.get("discord_user_id").map(String::as_str) != Some(actor_user_id)
+            || principal
+                .labels
+                .get("centaur_discord_policy_managed")
+                .map(String::as_str)
+                != Some("true")
+        {
+            return Err(IronControlError::DiscordPolicy(
+                "resolved principal is not the expected policy-managed Discord actor".to_owned(),
+            ));
+        }
+
+        let direct_grants = self.client.list_principal_grants(&principal.id).await?;
+        if !direct_grants.is_empty() {
+            return Err(IronControlError::DiscordPolicy(format!(
+                "principal {} has direct grants outside the reviewed role bundle",
+                principal.foreign_id.as_deref().unwrap_or(&principal.id)
+            )));
+        }
+
+        let mut desired_roles = Vec::with_capacity(role_foreign_ids.len());
+        for foreign_id in role_foreign_ids {
+            let role = self.client.get_role(foreign_id).await?;
+            if role.foreign_id.as_deref() != Some(foreign_id)
+                || role
+                    .labels
+                    .get("centaur_discord_policy_managed")
+                    .map(String::as_str)
+                    != Some("true")
+            {
+                return Err(IronControlError::DiscordPolicy(format!(
+                    "role {foreign_id} is not marked as a reviewed Discord policy role"
+                )));
+            }
+            desired_roles.push(role);
+        }
+
+        let desired_ids = desired_roles
+            .iter()
+            .map(|role| role.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let current_roles = self.client.list_principal_roles(&principal.id).await?;
+        for role in &current_roles {
+            if !desired_ids.contains(role.id.as_str()) {
+                self.client.unassign_role(&principal.id, &role.id).await?;
+            }
+        }
+        let current_ids = current_roles
+            .iter()
+            .map(|role| role.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for role in desired_roles {
+            if !current_ids.contains(role.id.as_str()) {
+                self.client.assign_role(&principal.id, &role.id).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_discord_policy_roles(value: Option<&Value>) -> Result<Vec<&str>> {
+    let roles = value.and_then(Value::as_array).ok_or_else(|| {
+        IronControlError::DiscordPolicy(
+            "discord_policy_role_foreign_ids must be an array".to_owned(),
+        )
+    })?;
+    if roles.len() != 1 {
+        return Err(IronControlError::DiscordPolicy(
+            "discord_policy_role_foreign_ids must select exactly one role".to_owned(),
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for role in roles {
+        let role = role
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or_else(|| {
+                IronControlError::DiscordPolicy(
+                    "Discord policy role foreign IDs must be non-empty strings".to_owned(),
+                )
+            })?;
+        if !unique.insert(role) {
+            return Err(IronControlError::DiscordPolicy(
+                "Discord policy role foreign IDs must be unique".to_owned(),
+            ));
+        }
+    }
+    Ok(unique.into_iter().collect())
 }
 
 fn eligible_slack_requester_team(metadata: &Value) -> Option<&str> {
@@ -303,6 +438,35 @@ mod tests {
             .actor_user_id,
             Some("teams-user-1")
         );
+    }
+
+    #[test]
+    fn session_principal_metadata_keeps_discord_actor_separate() {
+        let value = json!({
+            "discord_actor_user_id": "discord-user-1",
+            "user_id": "generic-user-1",
+            "discord_policy_role_foreign_ids": ["discord-observer"]
+        });
+        let metadata = SessionPrincipalMetadata::from_session_metadata(Some(&value));
+        assert_eq!(metadata.discord_actor_user_id, Some("discord-user-1"));
+        assert_eq!(metadata.actor_user_id, Some("generic-user-1"));
+        assert_eq!(
+            parse_discord_policy_roles(metadata.discord_policy_roles).unwrap(),
+            vec!["discord-observer"]
+        );
+    }
+
+    #[test]
+    fn discord_policy_roles_require_one_bounded_role() {
+        for value in [
+            None,
+            Some(json!([])),
+            Some(json!(["one", "two"])),
+            Some(json!([""])),
+            Some(json!([1])),
+        ] {
+            assert!(parse_discord_policy_roles(value.as_ref()).is_err());
+        }
     }
 
     #[test]
@@ -514,6 +678,99 @@ mod tests {
                 .iter()
                 .any(|request| request == "POST /api/v1/principals/prn_user/roles"),
             "existing DM principals must not have manually removed roles restored"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_reconciles_discord_actor_to_the_exact_reviewed_role() {
+        let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
+            current_stale_role: true,
+            direct_grant: false,
+            reviewed_role: true,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = discord_policy_metadata();
+
+        let principal = registrar
+            .register_session(
+                "discord:200000000000000001:300000000000000001:400000000000000001",
+                Some(&metadata),
+            )
+            .await
+            .unwrap();
+        assert_eq!(principal.id, "prn_discord");
+
+        let requests = requests.lock().unwrap();
+        let remove = requests
+            .iter()
+            .position(|request| request == "DELETE /api/v1/principals/prn_discord/roles/role_stale")
+            .expect("stale/default role is removed");
+        let assign = requests
+            .iter()
+            .position(|request| request == "POST /api/v1/principals/prn_discord/roles")
+            .expect("reviewed role is assigned");
+        assert!(
+            remove < assign,
+            "role reconciliation narrows before widening"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_rejects_discord_principal_direct_grants() {
+        let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
+            current_stale_role: false,
+            direct_grant: true,
+            reviewed_role: true,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let error = registrar
+            .register_session(
+                "discord:200000000000000001:300000000000000001:400000000000000001",
+                Some(&discord_policy_metadata()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IronControlError::DiscordPolicy(_)));
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/roles")),
+            "a direct grant blocks before any role mutation"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_rejects_unreviewed_discord_policy_role() {
+        let (base_url, requests, server) = spawn_discord_policy_stub(DiscordPolicyStub {
+            current_stale_role: true,
+            direct_grant: false,
+            reviewed_role: false,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let error = registrar
+            .register_session(
+                "discord:200000000000000001:300000000000000001:400000000000000001",
+                Some(&discord_policy_metadata()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IronControlError::DiscordPolicy(_)));
+        assert!(
+            !requests.lock().unwrap().iter().any(|request| {
+                request.starts_with("DELETE ")
+                    || request == "POST /api/v1/principals/prn_discord/roles"
+            }),
+            "an unreviewed role blocks before any assignment mutation"
         );
         server.abort();
     }
@@ -830,6 +1087,100 @@ mod tests {
             slack_permission_for_thread("slack:D123:ts", Some("D123"), None),
             None
         );
+    }
+
+    fn discord_policy_metadata() -> Value {
+        json!({
+            "discord_actor_user_id": "100000000000000001",
+            "discord_policy_role_foreign_ids": ["discord-observer"]
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    struct DiscordPolicyStub {
+        current_stale_role: bool,
+        direct_grant: bool,
+        reviewed_role: bool,
+    }
+
+    async fn spawn_discord_policy_stub(
+        config: DiscordPolicyStub,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                seen.lock().unwrap().push(format!("{method} {path}"));
+
+                let principal = r#"{"data":{"id":"prn_discord","foreign_id":"discord-user-200000000000000001-100000000000000001","name":"Discord User","labels":{"managed-by":"centaur","discord_guild_id":"200000000000000001","discord_channel_id":"300000000000000001","discord_user_id":"100000000000000001","centaur_discord_policy_managed":"true"}}}"#;
+                let role_labels = if config.reviewed_role {
+                    r#"{"centaur_discord_policy_managed":"true"}"#
+                } else {
+                    "{}"
+                };
+                let role = format!(
+                    r#"{{"data":{{"id":"role_observer","foreign_id":"discord-observer","name":"Discord Observer","labels":{role_labels}}}}}"#
+                );
+                let grants = if config.direct_grant {
+                    r#"{"data":[{"id":"grant_direct","principal_id":"prn_discord"}]}"#
+                } else {
+                    r#"{"data":[]}"#
+                };
+                let roles = if config.current_stale_role {
+                    r#"{"data":[{"id":"role_stale","foreign_id":"default-agent","name":"Default Agent","labels":{}}]}"#
+                } else {
+                    r#"{"data":[]}"#
+                };
+                let (status_line, body) = match (method, path) {
+                    (
+                        "GET",
+                        "/api/v1/principals/lookup/discord-user-200000000000000001-100000000000000001",
+                    ) => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
+                    (
+                        "PUT",
+                        "/api/v1/principals/discord-user-200000000000000001-100000000000000001",
+                    ) => ("200 OK", principal.to_owned()),
+                    ("GET", "/api/v1/principals/prn_discord/grants?page=1&limit=100") => {
+                        ("200 OK", grants.to_owned())
+                    }
+                    ("GET", "/api/v1/roles/lookup/discord-observer") => ("200 OK", role),
+                    ("GET", "/api/v1/principals/prn_discord/roles") => ("200 OK", roles.to_owned()),
+                    ("DELETE", "/api/v1/principals/prn_discord/roles/role_stale")
+                    | ("POST", "/api/v1/principals/prn_discord/roles") => {
+                        ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+                    }
+                    _ => (
+                        "500 Internal Server Error",
+                        r#"{"error":"unexpected"}"#.to_owned(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, handle)
     }
 
     async fn spawn_iron_control_stub(

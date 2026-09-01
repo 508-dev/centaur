@@ -9,6 +9,10 @@ pub enum IronControlError {
     /// canonical principal.
     #[error(transparent)]
     PrincipalDerivation(#[from] PrincipalDerivationError),
+    /// Trusted ingress policy metadata or its reviewed iron-control role did
+    /// not satisfy the fail-closed Discord authorization contract.
+    #[error("Discord policy reconciliation failed: {0}")]
+    DiscordPolicy(String),
     /// The HTTP request could not be sent or the response could not be read.
     #[error("iron-control request to {path} failed: {source}")]
     Transport {

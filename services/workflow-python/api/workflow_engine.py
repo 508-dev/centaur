@@ -210,6 +210,41 @@ class WorkflowContext:
             request["idempotency_key"] = idempotency_key
         return await self._rpc.request(request)
 
+    async def put_action_proposal(
+        self,
+        proposal: dict[str, Any],
+        *,
+        expires_in_seconds: int,
+    ) -> dict[str, Any]:
+        """Validate and persist one canonical, expiring action proposal."""
+        return await self._rpc.request(
+            {
+                "type": "ctx.proposal.put",
+                "request": {
+                    "proposal": proposal,
+                    "expires_in_seconds": expires_in_seconds,
+                },
+            }
+        )
+
+    async def transition_notification_state(
+        self,
+        scope: str,
+        semantic_fingerprint: str | None,
+        state_class: str,
+    ) -> dict[str, Any]:
+        """Claim only new/material/resolved operator notification states."""
+        return await self._rpc.request(
+            {
+                "type": "ctx.notification.transition",
+                "request": {
+                    "scope": scope,
+                    "semantic_fingerprint": semantic_fingerprint,
+                    "state_class": state_class,
+                },
+            }
+        )
+
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         return await WorkflowToolManager(self._rpc).call_tool_raw(tool, method, args or {})
 
@@ -220,6 +255,23 @@ class WorkflowContext:
                 "channel": channel,
                 "text": text,
                 "args": kwargs,
+            }
+        )
+
+    async def post_to_discord(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        delivery_id: str,
+    ) -> Any:
+        """Post one idempotent, non-mentioning message through discordbot."""
+        return await self._rpc.request(
+            {
+                "type": "ctx.post_to_discord",
+                "channel_id": channel_id,
+                "delivery_id": delivery_id,
+                "text": text,
             }
         )
 

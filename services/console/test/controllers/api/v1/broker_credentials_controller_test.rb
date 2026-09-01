@@ -181,7 +181,8 @@ module Api
             grant: "github_app_installation",
             token_endpoint: "https://untrusted.example/token",
             client_id: "Iv1.0123456789abcdef",
-            github_installation_id: "12345678"
+            github_installation_id: "12345678",
+            github_repositories: [ "508-dev/centaur", "508-dev/centaur-overlay" ]
           }
         }
 
@@ -194,9 +195,11 @@ module Api
         assert_equal BrokerCredential::GITHUB_API_ENDPOINT, data["token_endpoint"]
         assert_equal "Iv1.0123456789abcdef", data["client_id"]
         assert_equal "12345678", data["github_installation_id"]
+        assert_equal [ "508-dev/centaur", "508-dev/centaur-overlay" ], data["github_repositories"]
 
         created = BrokerCredential.find_by_oid(data["id"])
         assert_equal "12345678", created.github_installation_id
+        assert_equal [ "508-dev/centaur", "508-dev/centaur-overlay" ], created.github_repositories
         assert created.next_attempt_at.present?
       end
 
@@ -225,6 +228,31 @@ module Api
         assert_nil credential.expires_at
         assert_nil credential.last_refresh
         assert credential.next_attempt_at.present?
+      end
+
+      test "updating a GitHub App repository scope discards the wider token" do
+        credential = BrokerCredential.create!(
+          foreign_id: "github-app-rescope",
+          grant: "github_app_installation",
+          client_id: "Iv1.0123456789abcdef",
+          github_installation_id: "12345678",
+          github_repositories: [ "508-dev/centaur", "508-dev/508-infra" ],
+          access_token: "ghs-wide-token",
+          expires_at: 30.minutes.from_now,
+          last_refresh: Time.current,
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_broker_credential_url(id: credential.oid), params: {
+          data: { github_repositories: [ "508-dev/centaur" ] }
+        }.to_json, headers: auth_headers
+
+        assert_response :ok
+        credential.reload
+        assert_equal [ "508-dev/centaur" ], credential.github_repositories
+        assert_nil credential.access_token
+        assert_nil credential.expires_at
+        assert_nil credential.last_refresh
       end
 
       test "updating a stale GitHub App record locks and discards a concurrently minted token" do

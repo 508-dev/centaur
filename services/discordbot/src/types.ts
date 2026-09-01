@@ -77,6 +77,23 @@ export type DiscordbotExecuteSessionResponse = {
   thread_key: string;
 };
 
+export type DiscordbotInterruptSessionResponse = {
+  execution_id?: string;
+  interrupted: boolean;
+  ok: boolean;
+  thread_key: string;
+};
+
+export type DiscordbotApproveProposalResponse = {
+  action_run_id: string;
+  action_task_id: string;
+  action_workflow: string;
+  console_url?: string;
+  created: boolean;
+  fingerprint: string;
+  ok: boolean;
+};
+
 export type DiscordbotFetch = (
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -89,6 +106,8 @@ export type DiscordbotOptions = {
    * wedge the thread forever — Gateway ingress has no redelivery to kick it).
    */
   activeExecutionTtlMs?: number;
+  /** Test-only escape hatch for the adapter's in-process event emulator. */
+  allowInProcessGatewayEmulation?: boolean;
   /** Discord delta: edit cadence for the in-progress answer message. */
   answerEditIntervalMs?: number;
   apiKey?: string;
@@ -102,6 +121,12 @@ export type DiscordbotOptions = {
    * unset is fail-closed so a guild-wide bot cannot be activated accidentally.
    */
   channelAllowlist?: readonly string[];
+  /** Maximum age of a Gateway MESSAGE_CREATE accepted at ingress. Default 5 minutes. */
+  ingressMaxEventAgeMs?: number;
+  /** Durable inbound-delivery dedup/audit retention. Default 7 days. */
+  ingressDeliveryTtlMs?: number;
+  /** Authorized root-to-follow-up lifetime. Default 24 hours. */
+  continuationTtlMs?: number;
   guildAllowlist?: readonly string[];
   idleTimeoutMs?: number;
   /** Liveness probe for `/health`; reflects the Gateway connection state. */
@@ -117,6 +142,8 @@ export type DiscordbotOptions = {
   postgresUrl?: string;
   publicKey: string;
   recoverRenderObligationsOnStart?: boolean;
+  /** Reviewed Discord role-to-Centaur permission bundles. Empty is inert. */
+  roleBindings?: readonly DiscordRoleBinding[];
   state?: StateAdapter;
   stateKeyPrefix?: string;
   /**
@@ -130,6 +157,36 @@ export type DiscordbotOptions = {
    */
   triggerRoleAllowlist?: readonly string[];
   userName?: string;
+};
+
+export type DiscordRoleBinding = {
+  /** Whether this reviewed role may atomically consume action proposals. */
+  canApprove: boolean;
+  /** Stable, machine-readable capability class recorded on every run. */
+  capabilityClass: string;
+  /** Existing iron-control role foreign ID reconciled onto the actor principal. */
+  principalRole: string;
+  /** Higher wins; equal-priority, non-identical matches fail closed. */
+  priority: number;
+  /** Exact project identifiers this actor bundle may address. */
+  projectScope: readonly string[];
+  /** Exact owner/repository names; wildcards are forbidden. */
+  repositoryScope: readonly string[];
+  /** Immutable numeric Discord role ID. */
+  roleId: string;
+};
+
+export type DiscordExecutionPolicy = {
+  actorId: string;
+  capabilityClass: string;
+  channelId: string;
+  guildId: string;
+  policyFingerprint: string;
+  principalRole: string;
+  projectScope: string[];
+  repositoryScope: string[];
+  rootMessageId: string;
+  threadId: string;
 };
 
 export type Discordbot = {
@@ -185,6 +242,7 @@ export type ForwardSessionInput = {
   messages: DiscordbotApiMessage[];
   onEventId(eventId: number): void;
   openStream: boolean;
+  policy: DiscordExecutionPolicy;
   threadId: string;
   trace?: DiscordbotTrace;
 };

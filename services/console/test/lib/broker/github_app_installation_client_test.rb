@@ -57,6 +57,83 @@ module Broker
       end
     end
 
+    test "mints and verifies a repository-scoped installation token" do
+      repositories = [ "508-dev/centaur", "508-dev/centaur-overlay" ]
+      with_private_key do |path, _key|
+        http = expect_http_call(
+          status: 201,
+          body: {
+            token: "ghs_scoped_token",
+            expires_at: (NOW + 1.hour).iso8601,
+            repositories: repositories.reverse.map { |full_name| { full_name: full_name } }
+          }.to_json
+        ) do |request|
+          assert_equal({ "repositories" => %w[centaur centaur-overlay] }, JSON.parse(request[:body]))
+          assert_equal "application/json", request[:headers]["Content-Type"]
+        end
+
+        client = GithubAppInstallationClient.new(
+          http: http, private_key_path: path, clock: -> { NOW }
+        )
+        result = client.refresh(
+          client_id: CLIENT_ID,
+          installation_id: INSTALLATION_ID,
+          repositories: repositories
+        )
+
+        http.verify
+        assert_equal "ghs_scoped_token", result.access_token
+      end
+    end
+
+    test "rejects a token whose returned repository scope is missing or wider" do
+      repositories = [ "508-dev/centaur" ]
+      responses = [
+        { token: "ghs_missing_scope", expires_at: (NOW + 1.hour).iso8601 },
+        {
+          token: "ghs_wide_scope",
+          expires_at: (NOW + 1.hour).iso8601,
+          repositories: [ { full_name: "508-dev/centaur" }, { full_name: "508-dev/508-infra" } ]
+        }
+      ]
+
+      responses.each do |body|
+        with_private_key do |path, _key|
+          http = expect_http_call(status: 201, body: body.to_json)
+          client = GithubAppInstallationClient.new(
+            http: http, private_key_path: path, clock: -> { NOW }
+          )
+
+          error = assert_raises(RefreshError) do
+            client.refresh(
+              client_id: CLIENT_ID,
+              installation_id: INSTALLATION_ID,
+              repositories: repositories
+            )
+          end
+
+          http.verify
+          refute error.retryable?
+          assert_equal "github_app_repository_scope", error.code
+        end
+      end
+    end
+
+    test "rejects invalid repository scope before calling GitHub" do
+      client = GithubAppInstallationClient.new(private_key_path: "/unused/key.pem", clock: -> { NOW })
+
+      error = assert_raises(RefreshError) do
+        client.refresh(
+          client_id: CLIENT_ID,
+          installation_id: INSTALLATION_ID,
+          repositories: [ "508-dev/*" ]
+        )
+      end
+
+      refute error.retryable?
+      assert_equal "github_app_repositories", error.code
+    end
+
     test "retries without calling GitHub while the private key path is missing or unavailable" do
       [ nil, "/missing/github-app.pem" ].each do |path|
         client = GithubAppInstallationClient.new(private_key_path: path, clock: -> { NOW })
