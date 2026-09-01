@@ -7,7 +7,7 @@
 //! in console or ``centaur-perms`` remain sticky. The principal is derived from
 //! the thread key (see [`crate::derive_principal`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -27,6 +27,52 @@ struct SessionPrincipalMetadata<'a> {
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
+}
+
+const DISCORD_REPO_CACHE_LABEL: &str = "centaur.discord.sandbox_repo_cache";
+const DISCORD_OBSERVABILITY_LABEL: &str = "centaur.discord.sandbox_observability_enabled";
+const DISCORD_SESSIONS_READ_LABEL: &str = "centaur.discord.sandbox_sessions_read_enabled";
+const DISCORD_WORKFLOWS_READ_LABEL: &str = "centaur.discord.sandbox_workflows_read_enabled";
+const DISCORD_WORKFLOWS_WRITE_LABEL: &str = "centaur.discord.sandbox_workflows_write_enabled";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscordPrincipalCapabilities {
+    repo_cache: String,
+    observability: bool,
+    sessions_read: bool,
+    workflows_read: bool,
+    workflows_write: bool,
+}
+
+impl DiscordPrincipalCapabilities {
+    fn safe() -> Self {
+        Self {
+            repo_cache: "none".to_owned(),
+            observability: false,
+            sessions_read: false,
+            workflows_read: false,
+            workflows_write: false,
+        }
+    }
+
+    fn from_role_labels(labels: &BTreeMap<String, String>) -> Result<Self> {
+        let repo_cache = labels
+            .get(DISCORD_REPO_CACHE_LABEL)
+            .map(String::as_str)
+            .unwrap_or("none");
+        if !matches!(repo_cache, "none" | "public" | "all") {
+            return Err(IronControlError::DiscordPolicy(format!(
+                "reviewed Discord role has invalid {DISCORD_REPO_CACHE_LABEL}"
+            )));
+        }
+        Ok(Self {
+            repo_cache: repo_cache.to_owned(),
+            observability: discord_capability_bool(labels, DISCORD_OBSERVABILITY_LABEL)?,
+            sessions_read: discord_capability_bool(labels, DISCORD_SESSIONS_READ_LABEL)?,
+            workflows_read: discord_capability_bool(labels, DISCORD_WORKFLOWS_READ_LABEL)?,
+            workflows_write: discord_capability_bool(labels, DISCORD_WORKFLOWS_WRITE_LABEL)?,
+        })
+    }
 }
 
 impl<'a> SessionPrincipalMetadata<'a> {
@@ -107,7 +153,7 @@ impl SessionRegistrar {
             || slack_permission
                 .as_ref()
                 .is_some_and(|permission| is_direct_message(Some(&permission.channel_id)));
-        let record = self.client.upsert_principal(&input).await?;
+        let mut record = self.client.upsert_principal(&input).await?;
         if should_upsert_slack_permission && let Some(permission) = slack_permission {
             self.client
                 .upsert_slack_channel_permission(&record.id, &permission)
@@ -116,12 +162,13 @@ impl SessionRegistrar {
         if is_discord
             && (metadata.discord_actor_user_id.is_some() || metadata.discord_policy_roles.is_some())
         {
-            self.reconcile_discord_policy_roles(
-                &record,
-                metadata.discord_actor_user_id,
-                metadata.discord_policy_roles,
-            )
-            .await?;
+            record = self
+                .reconcile_discord_policy_roles(
+                    &record,
+                    metadata.discord_actor_user_id,
+                    metadata.discord_policy_roles,
+                )
+                .await?;
         }
         Ok(record)
     }
@@ -230,7 +277,7 @@ impl SessionRegistrar {
         principal: &Principal,
         actor_user_id: Option<&str>,
         role_value: Option<&Value>,
-    ) -> Result<()> {
+    ) -> Result<Principal> {
         let actor_user_id = actor_user_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -276,15 +323,31 @@ impl SessionRegistrar {
             }
             desired_roles.push(role);
         }
+        let capabilities = DiscordPrincipalCapabilities::from_role_labels(
+            &desired_roles
+                .first()
+                .ok_or_else(|| {
+                    IronControlError::DiscordPolicy(
+                        "Discord policy did not resolve a reviewed role".to_owned(),
+                    )
+                })?
+                .labels,
+        )?;
 
+        // Persist a conservative baseline before removing defaults or changing
+        // role assignments. If a later API call fails, the stored principal is
+        // no more capable than the global defaults.
+        let narrowed = self
+            .apply_discord_principal_capabilities(principal, &DiscordPrincipalCapabilities::safe())
+            .await?;
         let desired_ids = desired_roles
             .iter()
             .map(|role| role.id.as_str())
             .collect::<BTreeSet<_>>();
-        let current_roles = self.client.list_principal_roles(&principal.id).await?;
+        let current_roles = self.client.list_principal_roles(&narrowed.id).await?;
         for role in &current_roles {
             if !desired_ids.contains(role.id.as_str()) {
-                self.client.unassign_role(&principal.id, &role.id).await?;
+                self.client.unassign_role(&narrowed.id, &role.id).await?;
             }
         }
         let current_ids = current_roles
@@ -293,10 +356,50 @@ impl SessionRegistrar {
             .collect::<BTreeSet<_>>();
         for role in desired_roles {
             if !current_ids.contains(role.id.as_str()) {
-                self.client.assign_role(&principal.id, &role.id).await?;
+                self.client.assign_role(&narrowed.id, &role.id).await?;
             }
         }
-        Ok(())
+        self.apply_discord_principal_capabilities(&narrowed, &capabilities)
+            .await
+    }
+
+    async fn apply_discord_principal_capabilities(
+        &self,
+        principal: &Principal,
+        capabilities: &DiscordPrincipalCapabilities,
+    ) -> Result<Principal> {
+        let foreign_id = principal.foreign_id.clone().ok_or_else(|| {
+            IronControlError::DiscordPolicy(
+                "policy-managed Discord principal has no foreign ID".to_owned(),
+            )
+        })?;
+        self.client
+            .upsert_principal(&PrincipalInput {
+                foreign_id,
+                name: principal.name.clone(),
+                labels: BTreeMap::new(),
+                kind: None,
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
+                sandbox_repo_cache: Some(capabilities.repo_cache.clone()),
+                sandbox_observability_enabled: Some(capabilities.observability),
+                sandbox_sessions_read_enabled: Some(capabilities.sessions_read),
+                sandbox_workflows_read_enabled: Some(capabilities.workflows_read),
+                sandbox_workflows_write_enabled: Some(capabilities.workflows_write),
+            })
+            .await
+    }
+}
+
+fn discord_capability_bool(labels: &BTreeMap<String, String>, key: &str) -> Result<bool> {
+    match labels.get(key).map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(IronControlError::DiscordPolicy(format!(
+            "reviewed Discord role has invalid {key}"
+        ))),
     }
 }
 
@@ -466,6 +569,37 @@ mod tests {
             Some(json!([1])),
         ] {
             assert!(parse_discord_policy_roles(value.as_ref()).is_err());
+        }
+    }
+
+    #[test]
+    fn discord_role_capabilities_are_typed_and_fail_closed() {
+        let labels = BTreeMap::from([
+            (DISCORD_REPO_CACHE_LABEL.to_owned(), "all".to_owned()),
+            (DISCORD_OBSERVABILITY_LABEL.to_owned(), "true".to_owned()),
+            (DISCORD_SESSIONS_READ_LABEL.to_owned(), "false".to_owned()),
+            (DISCORD_WORKFLOWS_READ_LABEL.to_owned(), "true".to_owned()),
+            (DISCORD_WORKFLOWS_WRITE_LABEL.to_owned(), "true".to_owned()),
+        ]);
+        assert_eq!(
+            DiscordPrincipalCapabilities::from_role_labels(&labels).unwrap(),
+            DiscordPrincipalCapabilities {
+                repo_cache: "all".to_owned(),
+                observability: true,
+                sessions_read: false,
+                workflows_read: true,
+                workflows_write: true,
+            }
+        );
+        assert_eq!(
+            DiscordPrincipalCapabilities::from_role_labels(&BTreeMap::new()).unwrap(),
+            DiscordPrincipalCapabilities::safe()
+        );
+        for labels in [
+            BTreeMap::from([(DISCORD_REPO_CACHE_LABEL.to_owned(), "everything".to_owned())]),
+            BTreeMap::from([(DISCORD_OBSERVABILITY_LABEL.to_owned(), "yes".to_owned())]),
+        ] {
+            assert!(DiscordPrincipalCapabilities::from_role_labels(&labels).is_err());
         }
     }
 
@@ -703,6 +837,20 @@ mod tests {
         assert_eq!(principal.id, "prn_discord");
 
         let requests = requests.lock().unwrap();
+        let principal_updates = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                (request
+                    == "PUT /api/v1/principals/discord-user-200000000000000001-100000000000000001")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            principal_updates.len(),
+            3,
+            "initial upsert, conservative baseline, then reviewed capabilities"
+        );
         let remove = requests
             .iter()
             .position(|request| request == "DELETE /api/v1/principals/prn_discord/roles/role_stale")
@@ -712,8 +860,8 @@ mod tests {
             .position(|request| request == "POST /api/v1/principals/prn_discord/roles")
             .expect("reviewed role is assigned");
         assert!(
-            remove < assign,
-            "role reconciliation narrows before widening"
+            principal_updates[1] < remove && remove < assign && assign < principal_updates[2],
+            "capabilities and roles reconcile from a conservative baseline before widening"
         );
         server.abort();
     }
@@ -1132,7 +1280,7 @@ mod tests {
 
                 let principal = r#"{"data":{"id":"prn_discord","foreign_id":"discord-user-200000000000000001-100000000000000001","name":"Discord User","labels":{"managed-by":"centaur","discord_guild_id":"200000000000000001","discord_channel_id":"300000000000000001","discord_user_id":"100000000000000001","centaur_discord_policy_managed":"true"}}}"#;
                 let role_labels = if config.reviewed_role {
-                    r#"{"centaur_discord_policy_managed":"true"}"#
+                    r#"{"centaur_discord_policy_managed":"true","centaur.discord.sandbox_repo_cache":"all","centaur.discord.sandbox_observability_enabled":"true","centaur.discord.sandbox_sessions_read_enabled":"false","centaur.discord.sandbox_workflows_read_enabled":"true","centaur.discord.sandbox_workflows_write_enabled":"true"}"#
                 } else {
                     "{}"
                 };

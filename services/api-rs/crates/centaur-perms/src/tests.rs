@@ -50,7 +50,7 @@ fn secret_type_routes_by_oid_prefix() {
 #[test]
 fn parses_http_replace_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["GET"], paths = ["/api/conversations.*"]}"#),
         &[],
     )
     .unwrap();
@@ -63,6 +63,8 @@ fn parses_http_replace_secret() {
     assert_eq!(http.replacer, "SLACK_BOT_TOKEN");
     assert_eq!(http.match_headers, vec!["Authorization".to_owned()]);
     assert_eq!(http.hosts, vec!["slack.com".to_owned()]);
+    assert_eq!(http.http_methods, vec!["GET".to_owned()]);
+    assert_eq!(http.paths, vec!["/api/conversations.*".to_owned()]);
 }
 
 #[test]
@@ -448,7 +450,7 @@ fn legacy_string_shim_is_replace_secret() {
 fn translates_http_replace_to_static_input() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["GET"], paths = ["/api/conversations.*"]}"#),
             &[],
         )
         .unwrap(),
@@ -470,6 +472,23 @@ fn translates_http_replace_to_static_input() {
     );
     assert_eq!(input.rules.len(), 1);
     assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(input.rules[0].http_methods, vec!["GET".to_owned()]);
+    assert_eq!(
+        input.rules[0].paths,
+        vec!["/api/conversations.*".to_owned()]
+    );
+}
+
+#[test]
+fn http_request_scope_rejects_invalid_methods_and_paths() {
+    for source in [
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = ["TRACE"]}"#,
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = ["relative/*"]}"#,
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = "GET"}"#,
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = [""]}"#,
+    ] {
+        assert!(tools::parse_secret(&entry(source), &[]).is_err());
+    }
 }
 
 #[test]

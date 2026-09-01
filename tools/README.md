@@ -40,6 +40,15 @@ Secrets are resolved in this order:
 3. **Environment variables** — for Docker, k8s, sops, 1Password, etc.
 
 Use `secret("KEY")` to access. Never use `os.environ` — tool secrets are scoped.
+For HTTP credentials, add `http_methods` and `paths` to the secret entry when a
+tool needs less than all operations on an allowed host. The proxy enforces these
+lists independently of the client wrapper; paths are slash-prefixed globs.
+
+```toml
+secrets = [
+  {type = "http", name = "API_TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = ["GET"], paths = ["/v1/reports/*"]},
+]
+```
 
 ## Sandbox CLI shims
 

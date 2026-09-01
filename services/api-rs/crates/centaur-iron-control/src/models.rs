@@ -467,6 +467,16 @@ pub struct PrincipalInput {
     pub slack_team_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slack_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_repo_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_observability_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_sessions_read_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_workflows_read_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_workflows_write_enabled: Option<bool>,
 }
 
 /// A principal as returned by iron-control. Unknown fields are ignored, so this
