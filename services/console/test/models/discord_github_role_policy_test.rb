@@ -59,6 +59,16 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     [ principal.reload, role, github_token_wrapper, credential ]
   end
 
+  def policy_test_nonstatic_credentials
+    [
+      [ :gcp_auth_secret, gcp_auth_secrets(:acme_bigquery) ],
+      [ :gcp_id_token_secret, gcp_id_token_secrets(:acme_cloud_run) ],
+      [ :aws_auth_secret, aws_auth_secrets(:acme_cloudwatch_aws) ],
+      [ :oauth_token_secret, oauth_token_secrets(:acme_gmail_oauth) ],
+      [ :hmac_secret, hmac_secrets(:acme_webhook_hmac) ]
+    ]
+  end
+
   test "rejects a custom wrapper around a GitHub App credential" do
     _principal, role, _secret, credential = build_policy_binding
     custom = StaticSecret.new(
@@ -214,5 +224,44 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     config = PrincipalSyncConfigSnapshot.config_for(principal)
 
     assert_empty config.fetch("secrets")
+  end
+
+  test "rejects every non-static credential type that targets GitHub" do
+    _principal, role, _secret, _credential = build_policy_binding
+
+    policy_test_nonstatic_credentials.each do |association, credential|
+      credential.rules.first.update_columns(host: "api.github.com")
+      grant = Grant.new(role: role, association => credential, created_by: users(:acme_admin))
+
+      assert_not grant.valid?, "expected #{credential.class.name} GitHub grant to be rejected"
+      assert grant.errors[:base].any? { |message| message.include?("may not grant") }
+    end
+  end
+
+  test "rejects later GitHub rule widening for every non-static credential type" do
+    _principal, role, _secret, _credential = build_policy_binding
+
+    policy_test_nonstatic_credentials.each do |association, credential|
+      Grant.create!(role: role, association => credential, created_by: users(:acme_admin))
+      rule = credential.rules.first
+      rule.host = "api.github.com"
+
+      assert_not rule.valid?, "expected #{credential.class.name} GitHub rule to be rejected"
+      assert rule.errors[:base].any? { |message| message.include?("may not grant") }
+    end
+  end
+
+  test "proxy rendering excludes legacy GitHub-targetable non-static credentials" do
+    principal, role, _secret, _credential = build_policy_binding
+
+    policy_test_nonstatic_credentials.each do |association, credential|
+      Grant.create!(role: role, association => credential, created_by: users(:acme_admin))
+      credential.rules.first.update_columns(host: "api.github.com")
+      assert_not DiscordGithubRolePolicy.credential_allowed_for_principal?(principal, credential)
+    end
+
+    transforms = PrincipalSyncConfigSnapshot.config_for(principal).fetch("transforms")
+    denied_transform_names = %w[gcp_auth gcp_id_token aws_auth hmac_sign oauth_token]
+    assert_empty transforms.select { |transform| denied_transform_names.include?(transform.fetch("name")) }
   end
 end
