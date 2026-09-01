@@ -8,6 +8,7 @@ import {
   resolveDiscordPermissionBundle,
   type DiscordPermissionBundle,
 } from "./discord-policy";
+import { discordMentionRoutingDecision } from "./discord-mention-routing";
 import type { DiscordbotOptions } from "./types";
 
 const DEFAULT_DELIVERY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -42,6 +43,7 @@ export type DiscordIngressReason =
   | "bot_message"
   | "channel_not_allowlisted"
   | "direct_message"
+  | "directed_to_other_discord_member"
   | "duplicate_delivery"
   | "future_delivery"
   | "gateway_identity_unverified"
@@ -190,6 +192,7 @@ export function discordGatewayEventFromMessage(
     : {};
   const parsed = parseDiscordThreadKey(message.threadId);
   if (!parsed.guildId || !parsed.channelId) return null;
+  if (typeof raw.content !== "string") return null;
   const member = raw.member && typeof raw.member === "object"
     ? (raw.member as Record<string, unknown>)
     : {};
@@ -203,7 +206,10 @@ export function discordGatewayEventFromMessage(
     authorIsBot: message.author.isBot === true,
     authorIsSelf: message.author.isMe === true,
     channelId: parsed.channelId,
-    content: message.text,
+    // Keep the canonical Discord syntax. Chat adapters may strip member
+    // mentions from their rendered `message.text`, but addressee routing must
+    // compare immutable user IDs rather than mutable display text.
+    content: raw.content,
     createdTimestamp: message.metadata.dateSent.getTime(),
     gatewayIdentityVerified: true,
     guildId: parsed.guildId,
@@ -294,6 +300,20 @@ async function evaluateAdmission(
     if (root.actorId !== event.authorId) return deny("actor_mismatch");
     if (root.policy.fingerprint !== policy.fingerprint) {
       return deny("policy_changed_requires_root_trigger");
+    }
+    // This subscribed-thread path is the legacy all-replies continuation
+    // mode. Preserve the actor/permission/root checks above, then veto an
+    // explicit addressee boundary before the message can append to (and steer)
+    // a Centaur session. Direct Centaur mentions take the mentioned path and
+    // retain their normal behavior, even when another member is also named.
+    if (
+      discordMentionRoutingDecision(
+        event.content,
+        event.isMentioned,
+        options.applicationId,
+      ) === "other_member"
+    ) {
+      return deny("directed_to_other_discord_member");
     }
     return accepted(event, root, policy, now);
   }

@@ -261,6 +261,59 @@ describe("Discord Gateway admission", () => {
     }
   });
 
+  it("vetoes another member as an unmentioned addressee but keeps direct Centaur mentions", async () => {
+    const { audits, logger, state } = await harness();
+    const configured = options();
+    await admitDiscordGatewayMessage(
+      event(THREAD),
+      configured,
+      state,
+      logger,
+      NOW,
+    );
+
+    const addressedElsewhere = event("600000000000000065", {
+      content:
+        `<@${OTHER_USER}> great. Can you write a small summary of where the service is at?`,
+      isMentioned: false,
+      threadId: THREAD,
+    });
+    expect(
+      await admitDiscordGatewayMessage(
+        addressedElsewhere,
+        configured,
+        state,
+        logger,
+        NOW + 100,
+      ),
+    ).toBeNull();
+    expect(audits.at(-1)?.data.reason).toBe(
+      "directed_to_other_discord_member",
+    );
+
+    const directCentaurMention = event("600000000000000066", {
+      content:
+        `<@${APP}> ask <@${OTHER_USER}> for context, then write the summary`,
+      isMentioned: true,
+      threadId: THREAD,
+    });
+    expect(
+      await admitDiscordGatewayMessage(
+        directCentaurMention,
+        configured,
+        state,
+        logger,
+        NOW + 100,
+      ),
+    ).toEqual(
+      expect.objectContaining({
+        actorId: USER,
+        decision: "allow",
+        messageId: directCentaurMention.messageId,
+      }),
+    );
+  });
+
   it("accepts only an actor-scoped, idempotent stop control", async () => {
     const { audits, logger, state } = await harness();
     const configured = options();
