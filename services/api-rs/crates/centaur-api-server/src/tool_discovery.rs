@@ -1502,7 +1502,7 @@ fn http_rules(
         .map(|host| {
             let mut rule = BTreeMap::from([("host", yaml_string(&host))]);
             if !methods.is_empty() {
-                rule.insert("http_methods", yaml_value(methods)?);
+                rule.insert("methods", yaml_value(methods)?);
             }
             if !paths.is_empty() {
                 rule.insert("paths", yaml_value(paths)?);
@@ -1821,7 +1821,8 @@ secrets = [
             secrets[0].rules[0]["host"].as_str(),
             Some("api.overlay.test")
         );
-        assert_eq!(secrets[0].rules[0]["http_methods"][0].as_str(), Some("GET"));
+        assert_eq!(secrets[0].rules[0]["methods"][0].as_str(), Some("GET"));
+        assert!(secrets[0].rules[0].get("http_methods").is_none());
         assert_eq!(secrets[0].rules[0]["paths"][0].as_str(), Some("/v1/*"));
         let labels = secrets[0]
             .extra

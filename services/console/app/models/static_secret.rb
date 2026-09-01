@@ -52,7 +52,11 @@ class StaticSecret < ApplicationRecord
     CredentialProfiles::Registry.apply_defaults(self, rules: rules)
   end
 
-  attr_writer :kind_rules_for_validation
+  # API replacement validates a transient, complete rule set before it swaps
+  # the persisted associations. Policy validators need the same candidate view
+  # as the credential-profile validator so they cannot authorize the old rules
+  # and then persist a newly widened target.
+  attr_accessor :kind_rules_for_validation
 
   def validate_kind_rules(rules: self.rules)
     CredentialProfiles::Registry.validate_rules(self, rules: rules)
