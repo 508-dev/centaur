@@ -32,6 +32,7 @@ import {
 } from "bun:test";
 import type { ServerNotification } from "@centaur/harness-events";
 import { createMemoryState } from "@chat-adapter/state-memory";
+import type { Logger, StateAdapter } from "chat";
 import {
   createDiscordbot,
   type Discordbot,
@@ -42,6 +43,7 @@ import {
   type DiscordbotOptions,
   type DiscordbotSessionMessage,
 } from "../src/index";
+import { admitDiscordGatewayMessage } from "../src/discord-ingress";
 
 const BOT_TOKEN = "discordbot-emulate-token";
 const APP_ID = "900000000000000001";
@@ -55,6 +57,16 @@ const PUBLIC_KEY = "a".repeat(64);
 let discordApi: FakeDiscordApi;
 let codexApi: MockSessionApi;
 let bot: Discordbot;
+let botOptions: DiscordbotOptions;
+let botState: StateAdapter;
+
+const testLogger: Logger = {
+  child: () => testLogger,
+  debug: () => undefined,
+  error: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+};
 
 beforeAll(async () => {
   discordApi = await startFakeDiscordApi();
@@ -1296,7 +1308,7 @@ describe("discordbot", () => {
     ).toBe(false);
   });
 
-  it("keeps fail-closed guild, channel, role, and trigger-bot behavior", async () => {
+  it("keeps fail-closed guild, channel, role, policy, and bot behavior", async () => {
     // A mention from a non-allowlisted guild is dropped before any mutation.
     await dispatchMessage({
       channelId: CHANNEL_ID,
@@ -1336,7 +1348,21 @@ describe("discordbot", () => {
     ).toBe(false);
     expect(codexApi.executes).toHaveLength(0);
 
-    // A bot-authored mention is ignored unless the bot is allowlisted.
+    // A missing reviewed role policy is inert even when the legacy trigger
+    // role allowlist matches.
+    bot = createTestBot({ roleBindings: undefined });
+    await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> with no capability policy`,
+      mention: true,
+    });
+    await sleep(50);
+    expect(codexApi.creates).toHaveLength(0);
+    expect(codexApi.executes).toHaveLength(0);
+
+    // Bot-authored messages are always denied. A legacy trigger-bot allowlist
+    // cannot bypass the actor-aware human policy boundary.
+    bot = createTestBot({ triggerBotAllowlist: [TRIGGER_BOT_ID] });
     const threadId = discordApi.nextId();
     discordApi.seedThreadChannel(threadId, CHANNEL_ID);
     const deniedBotMentionId = await dispatchMessage({
@@ -1351,28 +1377,26 @@ describe("discordbot", () => {
     expect(codexApi.executes).toHaveLength(0);
     expect(reactionsOn(threadId, deniedBotMentionId)).toEqual([]);
 
-    bot = createTestBot({ triggerBotAllowlist: [TRIGGER_BOT_ID] });
-    const allowedThreadId = discordApi.nextId();
-    discordApi.seedThreadChannel(allowedThreadId, CHANNEL_ID);
-    const allowedBotMentionId = await dispatchMessage({
-      authorBot: true,
-      authorId: TRIGGER_BOT_ID,
-      channelId: allowedThreadId,
-      content: `<@${APP_ID}> from an allowed bot`,
+    // Follow-ups are re-authorized; removing the human role blocks new context
+    // even inside a previously authorized thread.
+    bot = createTestBot();
+    const authorizedThreadId = discordApi.nextId();
+    discordApi.seedThreadChannel(authorizedThreadId, CHANNEL_ID);
+    const authorizedMentionId = await dispatchMessage({
+      channelId: authorizedThreadId,
+      content: `<@${APP_ID}> establish an authorized root`,
       mention: true,
-      thread: { id: allowedThreadId, parentId: CHANNEL_ID },
+      thread: { id: authorizedThreadId, parentId: CHANNEL_ID },
     });
-    await waitForSettle(allowedThreadId, allowedBotMentionId);
+    await waitForSettle(authorizedThreadId, authorizedMentionId);
     expect(codexApi.executes).toHaveLength(1);
 
-    // Follow-ups are re-authorized; removing the human role blocks new context
-    // even inside an already-active thread.
     const appendCount = codexApi.appends.length;
     await dispatchMessage({
-      channelId: allowedThreadId,
+      channelId: authorizedThreadId,
       content: "unauthorized follow-up",
       roleIds: [],
-      thread: { id: allowedThreadId, parentId: CHANNEL_ID },
+      thread: { id: authorizedThreadId, parentId: CHANNEL_ID },
     });
     await sleep(50);
     expect(codexApi.appends).toHaveLength(appendCount);
@@ -1380,9 +1404,11 @@ describe("discordbot", () => {
 });
 
 function createTestBot(overrides: Partial<DiscordbotOptions> = {}): Discordbot {
-  return createDiscordbot({
+  const state = overrides.state ?? createMemoryState();
+  const options: DiscordbotOptions = {
     apiKey: "discordbot-test-key",
     apiUrl: codexApi.url,
+    allowInProcessGatewayEmulation: true,
     applicationId: APP_ID,
     botToken: BOT_TOKEN,
     discordApiUrl: discordApi.url,
@@ -1390,10 +1416,24 @@ function createTestBot(overrides: Partial<DiscordbotOptions> = {}): Discordbot {
     guildAllowlist: [GUILD_ID],
     publicKey: PUBLIC_KEY,
     recoverRenderObligationsOnStart: false,
-    state: createMemoryState(),
+    roleBindings: [
+      {
+        canApprove: false,
+        capabilityClass: "github:observe",
+        principalRole: "discord-observer",
+        priority: 0,
+        projectScope: [],
+        repositoryScope: ["508-dev/centaur"],
+        roleId: TRIGGER_ROLE_ID,
+      },
+    ],
     triggerRoleAllowlist: [TRIGGER_ROLE_ID],
     ...overrides,
-  });
+    state,
+  };
+  botOptions = options;
+  botState = state;
+  return createDiscordbot(options);
 }
 
 function threadKey(threadId: string): string {
@@ -1402,9 +1442,9 @@ function threadKey(threadId: string): string {
 
 /**
  * Seeds the raw message into the fake Discord store and dispatches it to the
- * bot through the REAL adapter's forwarded-Gateway-event webhook path, the
- * production ingress shape (`startGatewayListener` direct mode constructs the
- * identical payloads).
+ * bot through the real adapter's in-process webhook emulator. Production uses
+ * the authenticated Gateway listener; tests explicitly pre-authorize the root
+ * that production admits before it creates a Discord thread.
  */
 async function dispatchMessage(input: {
   attachments?: Record<string, unknown>[];
@@ -1414,9 +1454,14 @@ async function dispatchMessage(input: {
   content: string;
   guildId?: string;
   mention?: boolean;
+  /** Existing-thread tests seed the durable root production creates upstream. */
+  preauthorizeRoot?: boolean;
   roleIds?: string[];
   thread?: { id: string; parentId: string };
 }): Promise<string> {
+  if (input.thread && input.mention && input.preauthorizeRoot !== false) {
+    await preauthorizeTestThreadRoot({ ...input, thread: input.thread });
+  }
   const raw = discordApi.seedRawMessage(input.channelId, {
     attachments: input.attachments ?? [],
     author: {
@@ -1427,6 +1472,28 @@ async function dispatchMessage(input: {
     },
     content: input.content,
   });
+  if (!input.thread && input.mention) {
+    await botState.connect();
+    await admitDiscordGatewayMessage(
+      {
+        authorId: input.authorId ?? USER_ID,
+        authorIsBot: input.authorBot === true,
+        authorIsSelf: false,
+        channelId: input.channelId,
+        content: input.content,
+        createdTimestamp: Date.now(),
+        gatewayIdentityVerified: true,
+        guildId: input.guildId ?? GUILD_ID,
+        isMentioned: true,
+        messageId: String(raw.id),
+        messageType: 0,
+        roleIds: input.roleIds ?? [TRIGGER_ROLE_ID],
+      },
+      botOptions,
+      botState,
+      testLogger,
+    );
+  }
   const data: Record<string, unknown> = {
     ...raw,
     guild_id: input.guildId ?? GUILD_ID,
@@ -1454,6 +1521,40 @@ async function dispatchMessage(input: {
   );
   expect(response.status).toBe(200);
   return String(raw.id);
+}
+
+async function preauthorizeTestThreadRoot(input: {
+  authorBot?: boolean;
+  authorId?: string;
+  content: string;
+  guildId?: string;
+  roleIds?: string[];
+  thread: { id: string; parentId: string };
+}): Promise<void> {
+  await botState.connect();
+  const rootKey = `discordbot:ingress:root:${
+    input.guildId ?? GUILD_ID
+  }:${input.thread.parentId}:${input.thread.id}`;
+  if (await botState.get(rootKey)) return;
+  await admitDiscordGatewayMessage(
+    {
+      authorId: input.authorId ?? USER_ID,
+      authorIsBot: input.authorBot === true,
+      authorIsSelf: false,
+      channelId: input.thread.parentId,
+      content: input.content,
+      createdTimestamp: Date.now(),
+      gatewayIdentityVerified: true,
+      guildId: input.guildId ?? GUILD_ID,
+      isMentioned: true,
+      messageId: input.thread.id,
+      messageType: 0,
+      roleIds: input.roleIds ?? [TRIGGER_ROLE_ID],
+    },
+    botOptions,
+    botState,
+    testLogger,
+  );
 }
 
 function recoveryApiMessage(

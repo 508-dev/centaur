@@ -36,6 +36,13 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+mod action_proposals;
+pub use action_proposals::{
+    ActionProposal, ActionProposalState, ApproveActionProposalRequest,
+    ApproveActionProposalResponse, NotificationTransitionRequest, NotificationTransitionResponse,
+    ProposalEvidence, ProposalValidation, PutActionProposalRequest,
+};
+
 pub const WORKFLOW_QUEUE: &str = "centaur_workflows";
 pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
 pub const WORKFLOW_ETL_QUEUE: &str = "centaur_workflows_etl";
@@ -46,6 +53,8 @@ pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const DISCORDBOT_INTERNAL_URL_ENV: &str = "DISCORDBOT_INTERNAL_URL";
+const DISCORDBOT_API_KEY_ENV: &str = "DISCORDBOT_API_KEY";
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
@@ -3420,6 +3429,56 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.proposal.put") => {
+            let request = message
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "ctx.proposal.put requires request".to_owned())
+                .and_then(|value| {
+                    serde_json::from_value::<PutActionProposalRequest>(value)
+                        .map_err(|error| error.to_string())
+                });
+            match request {
+                Ok(request) => match action_proposals::put_action_proposal(
+                    &workflow_clients.standard,
+                    request,
+                    &input.workflow_name,
+                    ctx.task_id(),
+                    ctx.run_id(),
+                )
+                .await
+                {
+                    Ok(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        Some("ctx.notification.transition") => {
+            let request = message
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "ctx.notification.transition requires request".to_owned())
+                .and_then(|value| {
+                    serde_json::from_value::<NotificationTransitionRequest>(value)
+                        .map_err(|error| error.to_string())
+                });
+            match request {
+                Ok(request) => {
+                    match action_proposals::transition_notification_state(
+                        &workflow_clients.standard,
+                        request,
+                        ctx.run_id(),
+                    )
+                    .await
+                    {
+                        Ok(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -3430,6 +3489,10 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.post_to_discord") => match post_python_discord_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         other => Err(format!("unsupported context request type {other:?}")),
     };
     Ok(match result {
@@ -4122,6 +4185,43 @@ async fn post_python_slack_message(
     let response = send_slack_message(&token, payload).await?;
     serde_json::to_value(slack_post_result_from_response(channel, response))
         .map_err(WorkflowRuntimeError::from)
+}
+
+async fn post_python_discord_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let channel_id = required_python_string(message, "channel_id", "ctx.post_to_discord")?;
+    let delivery_id = required_python_string(message, "delivery_id", "ctx.post_to_discord")?;
+    let text = required_python_string(message, "text", "ctx.post_to_discord")?;
+    let base_url = env::var(DISCORDBOT_INTERNAL_URL_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{DISCORDBOT_INTERNAL_URL_ENV} must be set for ctx.post_to_discord"
+        ))
+    })?;
+    let api_key = env::var(DISCORDBOT_API_KEY_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{DISCORDBOT_API_KEY_ENV} must be set for ctx.post_to_discord"
+        ))
+    })?;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/internal/deliveries",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "channel_id": channel_id,
+            "delivery_id": delivery_id,
+            "text": text,
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "ctx.post_to_discord failed with status {status}"
+        )));
+    }
+    Ok(body)
 }
 
 fn python_slack_message_payload(

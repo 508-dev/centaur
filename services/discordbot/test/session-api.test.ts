@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Attachment } from "chat";
 import {
+  approveActionProposal,
   codexAttachmentInput,
   forwardToSessionApi,
   isContentlessApiMessage,
@@ -11,10 +12,12 @@ import {
   SessionApiError,
   toCodexInputLines,
 } from "../src/session-api";
+import type { DiscordAcceptedAdmission } from "../src/discord-ingress";
 import type {
   DiscordbotApiMessage,
   DiscordbotFetch,
   DiscordbotOptions,
+  DiscordExecutionPolicy,
   ForwardSessionInput,
 } from "../src/types";
 
@@ -43,6 +46,21 @@ function apiMessage(
     threadId: "discord:G1:C1:T1",
     timestamp: "2026-01-01T00:00:00.000Z",
     ...overrides,
+  };
+}
+
+function executionPolicy(): DiscordExecutionPolicy {
+  return {
+    actorId: "100000000000000001",
+    capabilityClass: "github:observe",
+    channelId: "100000000000000002",
+    guildId: "100000000000000003",
+    policyFingerprint: "sha256:test",
+    principalRole: "discord-observer",
+    projectScope: [],
+    repositoryScope: ["508-dev/centaur"],
+    rootMessageId: "100000000000000004",
+    threadId: "100000000000000005",
   };
 }
 
@@ -163,6 +181,7 @@ describe("forwardToSessionApi principal naming", () => {
       messages: [apiMessage()],
       onEventId: () => undefined,
       openStream: false,
+      policy: executionPolicy(),
       threadId: "discord:G1:C1:T1",
       ...overrides,
     };
@@ -190,6 +209,116 @@ describe("forwardToSessionApi principal naming", () => {
       "discord_conversation_name" in
         (creates[0] as { metadata: object }).metadata,
     ).toBe(false);
+  });
+});
+
+describe("approveActionProposal", () => {
+  function admission(
+    fingerprint: string,
+  ): DiscordAcceptedAdmission {
+    return {
+      actorId: "100000000000000001",
+      channelId: "300000000000000001",
+      control: "approve",
+      decision: "allow",
+      guildId: "200000000000000001",
+      messageId: "600000000000000001",
+      policy: {
+        canApprove: true,
+        capabilityClass: "github:approve",
+        fingerprint: `sha256:${"b".repeat(64)}`,
+        principalRole: "discord-operator",
+        projectScope: ["operations"],
+        repositoryScope: ["508-dev/508-workflows"],
+        sourceRoleId: "500000000000000001",
+      },
+      proposalFingerprint: fingerprint,
+      reason: "accepted",
+      receivedAt: Date.now(),
+      rootMessageId: "600000000000000001",
+      roleIds: ["500000000000000001"],
+      threadId: "600000000000000001",
+      version: 1,
+    };
+  }
+
+  it("sends only the authenticated actor policy and exact proposal fingerprint", async () => {
+    let requestUrl = "";
+    let requestBody: JsonRecord = {};
+    let authorization = "";
+    const fingerprint = `sha256:${"a".repeat(64)}`;
+    const fetchFn: DiscordbotFetch = async (input, init) => {
+      requestUrl = String(input);
+      requestBody = JSON.parse(String(init?.body)) as JsonRecord;
+      authorization = new Headers(init?.headers).get("authorization") ?? "";
+      return Response.json({
+        action_run_id: "run-1",
+        action_task_id: "task-1",
+        action_workflow: "execute_approved_improvement",
+        console_url:
+          "https://centaur.test/console/workflows/execute_approved_improvement",
+        created: true,
+        fingerprint,
+        ok: true,
+      });
+    };
+    const accepted = admission(fingerprint);
+
+    const result = await approveActionProposal(
+      {
+        apiKey: "discord-api-key",
+        apiUrl: "http://api.test",
+        applicationId: "app",
+        botToken: "token",
+        fetch: fetchFn,
+        publicKey: "key",
+      },
+      accepted,
+    );
+
+    expect(requestUrl).toBe(
+      `http://api.test/api/workflows/proposals/${encodeURIComponent(fingerprint)}/approve`,
+    );
+    expect(authorization).toBe("Bearer discord-api-key");
+    expect(requestBody).toEqual({
+      actor_id: accepted.actorId,
+      capability_class: accepted.policy.capabilityClass,
+      channel_id: accepted.channelId,
+      guild_id: accepted.guildId,
+      message_id: accepted.messageId,
+      policy_fingerprint: accepted.policy.fingerprint,
+      principal_role: accepted.policy.principalRole,
+      repository_scope: accepted.policy.repositoryScope,
+      root_message_id: accepted.rootMessageId,
+      thread_id: accepted.threadId,
+    });
+    expect(result.created).toBe(true);
+  });
+
+  it("rejects a mismatched success response", async () => {
+    const fingerprint = `sha256:${"a".repeat(64)}`;
+    const fetchFn: DiscordbotFetch = async () =>
+      Response.json({
+        action_run_id: "run-1",
+        action_task_id: "task-1",
+        action_workflow: "execute_approved_improvement",
+        created: true,
+        fingerprint: `sha256:${"c".repeat(64)}`,
+        ok: true,
+      });
+
+    await expect(
+      approveActionProposal(
+        {
+          apiUrl: "http://api.test",
+          applicationId: "app",
+          botToken: "token",
+          fetch: fetchFn,
+          publicKey: "key",
+        },
+        admission(fingerprint),
+      ),
+    ).rejects.toMatchObject({ status: 502 });
   });
 });
 
@@ -341,7 +470,11 @@ describe("toCodexInputLines", () => {
       ],
     });
 
-    const lines = toCodexInputLines(message, message.threadId);
+    const lines = toCodexInputLines(
+      message,
+      message.threadId,
+      executionPolicy(),
+    );
 
     expect(lines).toHaveLength(1);
     const content = JSON.parse(lines[0]!).message.content as JsonRecord[];
@@ -362,7 +495,11 @@ describe("toCodexInputLines", () => {
       ],
     });
 
-    const lines = toCodexInputLines(message, message.threadId);
+    const lines = toCodexInputLines(
+      message,
+      message.threadId,
+      executionPolicy(),
+    );
 
     expect(lines.length).toBeGreaterThan(1);
     const chunks = lines.slice(0, -1).map((line) => JSON.parse(line));

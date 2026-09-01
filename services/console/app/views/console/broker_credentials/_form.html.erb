@@ -56,6 +56,12 @@
           <%= field_error(credential, :scopes) %>
           <p class="form-hint">One scope per line. Not used for Preqin.</p>
         </div>
+        <div>
+          <label class="form-label" for="credential_github_repositories">GitHub repositories</label>
+          <%= text_area_tag "credential[github_repositories]", Array(credential.github_repositories).join("\n"), id: "credential_github_repositories", rows: 4, class: "form-input #{field_error_class(credential, :github_repositories)}", placeholder: "508-dev/centaur" %>
+          <%= field_error(credential, :github_repositories) %>
+          <p class="form-hint">Optional exact owner/repository allowlist for a GitHub App installation token, one per line. Empty means the installation-selected repository set.</p>
+        </div>
       </div>
     </section>
 
@@ -109,7 +115,7 @@
       </div>
 
       <div data-toggle-target="panel" data-toggle-key="github_app_installation">
-        <p class="form-hint">Uses the GitHub App Client ID and installation ID above. The Console worker signs a short-lived App JWT with its read-only private-key mount, then exchanges it for an installation token. The private key is never entered or stored in this form.</p>
+        <p class="form-hint">Uses the GitHub App Client ID and installation ID above. The Console worker signs a short-lived App JWT with its read-only private-key mount, then exchanges it for an installation token restricted to the configured GitHub repositories. The private key is never entered or stored in this form.</p>
       </div>
 
       <div data-toggle-target="panel" data-toggle-key="refresh_token">

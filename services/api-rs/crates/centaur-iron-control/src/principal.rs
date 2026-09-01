@@ -1,8 +1,9 @@
 //! Derive the iron-control principal a session's proxy should act as.
 //!
 //! A principal is the identity that holds roles and owns proxies. For Centaur
-//! the principal is the conversation: a Discord **channel** (every thread in it
-//! shares one principal), a Linear **issue** (every agent session on it shares
+//! the principal is the conversation or verified actor: Discord policy-bound
+//! sessions use a **user** principal while legacy sessions without trusted
+//! actor metadata retain the channel fallback; a Linear **issue** (every agent session on it shares
 //! one principal), a Microsoft Teams **channel/conversation** (or **user** for
 //! a personal/user-scoped run when the acting user is known), or — for Slack —
 //! a **user** for a 1:1 DM and a **channel** for a multi-party channel/group
@@ -31,6 +32,7 @@ use crate::util::{managed_labels, slugify};
 const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
 const DISCORD_CHANNEL_KIND: &str = "discord_channel";
+const DISCORD_USER_KIND: &str = "discord_user";
 const LINEAR_ISSUE_KIND: &str = "linear_issue";
 const TEAMS_USER_KIND: &str = "teams_user";
 const TEAMS_CONVERSATION_KIND: &str = "teams_conversation";
@@ -113,18 +115,35 @@ pub fn derive_principal_with_slack_team(
         .map(str::trim)
         .filter(|name| !name.is_empty());
 
-    // Discord sessions key on the channel so every thread in a channel shares
-    // one principal (mirrors the Slack channel model). The thread key is
-    // ``discord:<guild_id>:<channel_id>[:<thread_id>]``; the guild id is folded
-    // into the key so the same channel id in two guilds never collides.
+    // Actor-aware Discord sessions key on the verified human, scoped by guild,
+    // so no role or grant learned from one message can be inherited by another
+    // participant in the channel. Legacy sessions without trusted actor
+    // metadata keep the historical channel principal for compatibility; the
+    // Discord ingress fails closed before creating such a session.
     if let Some((guild_id, channel_id)) = parse_discord_segments(thread_key) {
         let mut labels = BTreeMap::new();
         labels.insert("discord_guild_id".to_owned(), guild_id.to_owned());
-        let scope = format!("{}-", slugify(guild_id));
-        let key_id = channel_id.unwrap_or(guild_id);
         if let Some(channel) = channel_id {
             labels.insert("discord_channel_id".to_owned(), channel.to_owned());
         }
+        if let Some(user) = actor_user_id.map(str::trim).filter(|user| !user.is_empty()) {
+            labels.insert("discord_user_id".to_owned(), user.to_owned());
+            labels.insert(
+                "centaur_discord_policy_managed".to_owned(),
+                "true".to_owned(),
+            );
+            return Ok(PrincipalRef {
+                foreign_id: format!("discord-user-{}-{}", slugify(guild_id), slugify(user)),
+                name: format!("Discord User {user} (guild {guild_id})"),
+                kind: Some(DISCORD_USER_KIND.to_owned()),
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                labels,
+            });
+        }
+        let scope = format!("{}-", slugify(guild_id));
+        let key_id = channel_id.unwrap_or(guild_id);
         return Ok(PrincipalRef {
             foreign_id: format!("discord-channel-{scope}{}", slugify(key_id)),
             name: display_name
@@ -549,7 +568,8 @@ mod tests {
 
     #[test]
     fn discord_sessions_key_on_the_channel() {
-        // Two threads in the same channel resolve to one principal.
+        // Legacy sessions without authenticated actor metadata retain the
+        // channel principal and cannot inherit a user's policy grants.
         let thread_a = derive_principal("discord:111:222:333", None, None);
         let thread_b = derive_principal("discord:111:222:444", None, None);
         assert_eq!(thread_a.foreign_id, "discord-channel-111-222");
@@ -568,6 +588,30 @@ mod tests {
         );
         assert_eq!(thread_a.kind.as_deref(), Some("discord_channel"));
         assert!(!thread_a.labels.contains_key("kind"));
+    }
+
+    #[test]
+    fn discord_sessions_with_verified_actors_key_on_the_user() {
+        let actor_a = derive_principal("discord:111:222:333", Some("777"), Some("general"));
+        let actor_a_other_thread = derive_principal("discord:111:222:444", Some("777"), None);
+        let actor_b = derive_principal("discord:111:222:333", Some("888"), None);
+
+        assert_eq!(actor_a.foreign_id, "discord-user-111-777");
+        assert_eq!(actor_a.foreign_id, actor_a_other_thread.foreign_id);
+        assert_ne!(actor_a.foreign_id, actor_b.foreign_id);
+        assert_eq!(actor_a.name, "Discord User 777 (guild 111)");
+        assert_eq!(actor_a.kind.as_deref(), Some("discord_user"));
+        assert_eq!(
+            actor_a.labels.get("discord_user_id").map(String::as_str),
+            Some("777")
+        );
+        assert_eq!(
+            actor_a
+                .labels
+                .get("centaur_discord_policy_managed")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]

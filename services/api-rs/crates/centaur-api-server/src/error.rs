@@ -73,6 +73,9 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::IronControl(
                 centaur_iron_control::IronControlError::PrincipalDerivation(_),
             )) => StatusCode::BAD_REQUEST,
+            Self::Runtime(SessionRuntimeError::IronControl(
+                centaur_iron_control::IronControlError::DiscordPolicy(_),
+            )) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,

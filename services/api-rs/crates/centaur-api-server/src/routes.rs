@@ -38,8 +38,8 @@ use centaur_telemetry::{
     record_http_request_finished, record_http_request_started,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime, WorkflowWebhookAuth,
-    WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
+    ApproveActionProposalRequest, CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime,
+    WorkflowWebhookAuth, WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
@@ -271,6 +271,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(cancel_workflow_run),
         )
         .route("/api/workflows/events", post(emit_workflow_event))
+        .route(
+            "/api/workflows/proposals/{fingerprint}/approve",
+            post(approve_workflow_proposal),
+        )
         .route(
             "/api/admin/slack/archive-imports",
             get(list_slack_archive_imports).post(presign_slack_archive_import),
@@ -552,6 +556,9 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
             capability(Capability::WorkflowsWrite)
         }
         (&Method::POST, "/api/workflows/events") => capability(Capability::WorkflowsEvents),
+        (&Method::POST, "/api/workflows/proposals/{fingerprint}/approve") => {
+            capability(Capability::WorkflowApprovals)
+        }
         (&Method::POST, "/api/admin/slack/archive-imports/{import_id}/download-url") => {
             Some(RouteAccess::ArchiveDownload)
         }
@@ -621,10 +628,12 @@ fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
 
 async fn create_or_get_session(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
-    Json(request): Json<CreateSessionRequest>,
+    Json(mut request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    request.metadata = sanitize_session_metadata(&caller, &thread_key, request.metadata)?;
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
@@ -745,10 +754,19 @@ async fn get_session_context(
 
 async fn append_messages(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
-    Json(request): Json<AppendMessagesRequest>,
+    Json(mut request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    for message in &mut request.messages {
+        message.metadata = sanitize_session_metadata(
+            &caller,
+            &thread_key,
+            Some(std::mem::take(&mut message.metadata)),
+        )?
+        .unwrap_or_else(|| json!({}));
+    }
     let message_ids = state
         .runtime()?
         .append_messages(&thread_key, &request.messages)
@@ -766,7 +784,7 @@ async fn execute_session(
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let metadata = sanitize_execute_metadata(caller.class(), request.metadata);
+    let metadata = sanitize_session_metadata(&caller, &thread_key, request.metadata)?;
     let execution = state
         .runtime()?
         .enqueue_session_execution(
@@ -788,20 +806,266 @@ async fn execute_session(
     }))
 }
 
-/// `requester_principal_foreign_id` is an identity assertion made by the
-/// authenticated Console service, not ordinary caller-controlled metadata.
-/// Strip it from every other caller class before the execution is persisted so
-/// the runtime can safely honor Console requesters on any thread namespace.
-fn sanitize_execute_metadata(
+/// Strip reserved identity assertions unless the authenticated service owns
+/// them, then validate trusted Discord policy metadata against the immutable
+/// session key. This applies equally to create, append, and execute so durable
+/// audit records cannot claim a different actor or repository scope than the
+/// policy that selected the session principal.
+fn sanitize_session_metadata(
+    caller: &AuthenticatedCaller,
+    thread_key: &ThreadKey,
+    metadata: Option<Value>,
+) -> Result<Option<Value>, ApiError> {
+    sanitize_session_metadata_for(caller.class(), caller.identity(), thread_key, metadata)
+}
+
+fn sanitize_session_metadata_for(
     caller_class: CallerClass,
+    caller_identity: &str,
+    thread_key: &ThreadKey,
     mut metadata: Option<Value>,
-) -> Option<Value> {
+) -> Result<Option<Value>, ApiError> {
     if caller_class != CallerClass::Console
         && let Some(Value::Object(fields)) = metadata.as_mut()
     {
         fields.remove("requester_principal_foreign_id");
     }
-    metadata
+    let trusted_discord = caller_class == CallerClass::Ingress && caller_identity == "discordbot";
+    if !trusted_discord {
+        if let Some(Value::Object(fields)) = metadata.as_mut() {
+            for field in DISCORD_POLICY_METADATA_FIELDS {
+                fields.remove(*field);
+            }
+        }
+        return Ok(metadata);
+    }
+    validate_discord_policy_metadata(thread_key, metadata.as_ref())?;
+    Ok(metadata)
+}
+
+const DISCORD_POLICY_METADATA_FIELDS: &[&str] = &[
+    "discord_actor_user_id",
+    "discord_capability_class",
+    "discord_channel_id",
+    "discord_conversation_name",
+    "discord_guild_id",
+    "discord_policy_fingerprint",
+    "discord_policy_role_foreign_ids",
+    "discord_project_scope",
+    "discord_repository_scope",
+    "discord_root_message_id",
+    "discord_thread_id",
+];
+
+fn validate_discord_policy_metadata(
+    thread_key: &ThreadKey,
+    metadata: Option<&Value>,
+) -> Result<(), ApiError> {
+    let Some(Value::Object(fields)) = metadata else {
+        return Err(ApiError::BadRequest(
+            "authenticated Discord ingress requires policy metadata".to_owned(),
+        ));
+    };
+    let Some(ChatDestination::Discord {
+        guild_id,
+        channel_id,
+        thread_id: Some(thread_id),
+    }) = thread_key.chat_destination()
+    else {
+        return Err(ApiError::BadRequest(
+            "Discord policy metadata requires a Discord thread session key".to_owned(),
+        ));
+    };
+
+    let actor_id = required_metadata_string(fields, "discord_actor_user_id")?;
+    let metadata_guild = required_metadata_string(fields, "discord_guild_id")?;
+    let metadata_channel = required_metadata_string(fields, "discord_channel_id")?;
+    let metadata_thread = required_metadata_string(fields, "discord_thread_id")?;
+    let root_message = required_metadata_string(fields, "discord_root_message_id")?;
+    for (name, value) in [
+        ("discord_actor_user_id", actor_id),
+        ("discord_guild_id", metadata_guild),
+        ("discord_channel_id", metadata_channel),
+        ("discord_thread_id", metadata_thread),
+        ("discord_root_message_id", root_message),
+    ] {
+        if !is_discord_snowflake(value) {
+            return Err(ApiError::BadRequest(format!(
+                "{name} must be a numeric Discord ID"
+            )));
+        }
+    }
+    if let Some(message_id) = fields.get("message_id") {
+        let message_id = message_id.as_str().unwrap_or_default();
+        if !is_discord_snowflake(message_id) {
+            return Err(ApiError::BadRequest(
+                "message_id must be a numeric Discord ID".to_owned(),
+            ));
+        }
+    }
+    if let Some(user_id) = fields.get("user_id")
+        && user_id.as_str() != Some(actor_id)
+    {
+        return Err(ApiError::BadRequest(
+            "Discord message actor does not match the authenticated policy actor".to_owned(),
+        ));
+    }
+    if metadata_guild != guild_id
+        || metadata_channel != channel_id
+        || metadata_thread != thread_id
+        || root_message != thread_id
+    {
+        return Err(ApiError::BadRequest(
+            "Discord policy scope does not match the immutable session key".to_owned(),
+        ));
+    }
+
+    let capability = required_metadata_string(fields, "discord_capability_class")?;
+    if capability.len() > 64
+        || !capability.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_lowercase()
+            } else {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b':' | b'_' | b'-')
+            }
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "discord_capability_class is invalid".to_owned(),
+        ));
+    }
+    let fingerprint = required_metadata_string(fields, "discord_policy_fingerprint")?;
+    if fingerprint.len() != 71
+        || !fingerprint.starts_with("sha256:")
+        || !fingerprint[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError::BadRequest(
+            "discord_policy_fingerprint must be a sha256 fingerprint".to_owned(),
+        ));
+    }
+    let roles = required_metadata_array(fields, "discord_policy_role_foreign_ids")?;
+    if roles.len() != 1
+        || roles.iter().any(|role| {
+            role.as_str().is_none_or(|role| {
+                let role = role.trim();
+                role.is_empty()
+                    || role.len() > 128
+                    || !role.bytes().enumerate().all(|(index, byte)| {
+                        if index == 0 {
+                            byte.is_ascii_alphanumeric()
+                        } else {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'_' | b'-' | b'.' | b':')
+                        }
+                    })
+            })
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "discord_policy_role_foreign_ids must select exactly one role".to_owned(),
+        ));
+    }
+    validate_discord_string_scope(fields, "discord_project_scope", false)?;
+    validate_discord_string_scope(fields, "discord_repository_scope", true)?;
+    if let Some(name) = fields.get("discord_conversation_name") {
+        let valid = name.as_str().map(str::trim).is_some_and(|name| {
+            !name.is_empty() && name.len() <= 100 && !name.chars().any(char::is_control)
+        });
+        if !valid {
+            return Err(ApiError::BadRequest(
+                "discord_conversation_name must be a non-empty string".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_discord_string_scope(
+    fields: &serde_json::Map<String, Value>,
+    name: &str,
+    repositories: bool,
+) -> Result<(), ApiError> {
+    let values = required_metadata_array(fields, name)?;
+    if values.len() > 64 || (repositories && values.is_empty()) {
+        return Err(ApiError::BadRequest(format!("{name} has an invalid size")));
+    }
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let Some(value) = value.as_str().map(str::trim) else {
+            return Err(ApiError::BadRequest(format!(
+                "{name} entries must be strings"
+            )));
+        };
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphanumeric()
+                } else {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'_' | b'-' | b'.' | b':')
+                        || (repositories && byte == b'/')
+                }
+            })
+            || !unique.insert(value.to_ascii_lowercase())
+        {
+            return Err(ApiError::BadRequest(format!(
+                "{name} entries must be unique bounded strings"
+            )));
+        }
+        if repositories {
+            let mut parts = value.split('/');
+            let owner = parts.next().unwrap_or_default();
+            let repo = parts.next().unwrap_or_default();
+            if owner.is_empty()
+                || repo.is_empty()
+                || parts.next().is_some()
+                || value.contains('*')
+                || !owner.bytes().all(is_github_name_byte)
+                || !repo.bytes().all(is_github_name_byte)
+            {
+                return Err(ApiError::BadRequest(
+                    "discord_repository_scope entries must be exact owner/repository names"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_metadata_string<'a>(
+    fields: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a str, ApiError> {
+    fields
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest(format!("{name} is required")))
+}
+
+fn required_metadata_array<'a>(
+    fields: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a Vec<Value>, ApiError> {
+    fields
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::BadRequest(format!("{name} must be an array")))
+}
+
+fn is_discord_snowflake(value: &str) -> bool {
+    (16..=22).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_github_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 async fn interrupt_session_execution(
@@ -815,7 +1079,7 @@ async fn interrupt_session_execution(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("Interrupted from Slack");
+        .unwrap_or("Interrupted by authenticated ingress");
     let outcome = state
         .runtime()?
         .interrupt_active_execution(&thread_key, reason)
@@ -905,10 +1169,31 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
 #[cfg(test)]
 mod session_authorization_tests {
     use super::{
-        CallerClass, principal_subject_owns_session, sanitize_execute_metadata,
+        CallerClass, principal_subject_owns_session, sanitize_session_metadata_for,
         thread_key_matches_platform,
     };
+    use centaur_session_core::ThreadKey;
     use serde_json::json;
+
+    fn thread_key(value: &str) -> ThreadKey {
+        ThreadKey::parse(value).expect("valid test thread key")
+    }
+
+    fn discord_policy_metadata() -> serde_json::Value {
+        json!({
+            "source": "discordbot",
+            "discord_actor_user_id": "100000000000000001",
+            "discord_capability_class": "github:observe",
+            "discord_channel_id": "300000000000000001",
+            "discord_guild_id": "200000000000000001",
+            "discord_policy_fingerprint": format!("sha256:{}", "a".repeat(64)),
+            "discord_policy_role_foreign_ids": ["discord-observer"],
+            "discord_project_scope": ["operations"],
+            "discord_repository_scope": ["508-dev/centaur"],
+            "discord_root_message_id": "400000000000000001",
+            "discord_thread_id": "400000000000000001"
+        })
+    }
 
     #[test]
     fn ingress_scope_covers_every_family_the_bot_mints() {
@@ -961,7 +1246,13 @@ mod session_authorization_tests {
         });
 
         assert_eq!(
-            sanitize_execute_metadata(CallerClass::Console, Some(metadata.clone())),
+            sanitize_session_metadata_for(
+                CallerClass::Console,
+                "console-service",
+                &thread_key("console:test"),
+                Some(metadata.clone())
+            )
+            .unwrap(),
             Some(metadata.clone())
         );
         for caller_class in [
@@ -970,10 +1261,76 @@ mod session_authorization_tests {
             CallerClass::Principal,
         ] {
             assert_eq!(
-                sanitize_execute_metadata(caller_class, Some(metadata.clone())),
+                sanitize_session_metadata_for(
+                    caller_class,
+                    "not-console",
+                    &thread_key("console:test"),
+                    Some(metadata.clone())
+                )
+                .unwrap(),
                 Some(json!({ "source": "console" }))
             );
         }
+    }
+
+    #[test]
+    fn only_authenticated_discord_ingress_may_assert_actor_policy_scope() {
+        let key = thread_key("discord:200000000000000001:300000000000000001:400000000000000001");
+        let metadata = discord_policy_metadata();
+        assert_eq!(
+            sanitize_session_metadata_for(
+                CallerClass::Ingress,
+                "discordbot",
+                &key,
+                Some(metadata.clone())
+            )
+            .unwrap(),
+            Some(metadata.clone())
+        );
+
+        for (class, identity) in [
+            (CallerClass::Admin, "admin"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Principal, "discord-user-spoof"),
+        ] {
+            assert_eq!(
+                sanitize_session_metadata_for(class, identity, &key, Some(metadata.clone()))
+                    .unwrap(),
+                Some(json!({ "source": "discordbot" }))
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_discord_policy_must_match_the_immutable_thread_scope() {
+        let key = thread_key("discord:200000000000000001:300000000000000001:400000000000000001");
+        let mut metadata = discord_policy_metadata();
+        metadata["discord_repository_scope"] = json!(["508-dev/*"]);
+        assert!(
+            sanitize_session_metadata_for(CallerClass::Ingress, "discordbot", &key, Some(metadata))
+                .is_err()
+        );
+
+        let mut metadata = discord_policy_metadata();
+        metadata["discord_repository_scope"] = json!(["508-dev/centaur", "508-DEV/CENTAUR"]);
+        assert!(
+            sanitize_session_metadata_for(CallerClass::Ingress, "discordbot", &key, Some(metadata))
+                .is_err()
+        );
+
+        let mut metadata = discord_policy_metadata();
+        metadata["discord_thread_id"] = json!("400000000000000099");
+        assert!(
+            sanitize_session_metadata_for(CallerClass::Ingress, "discordbot", &key, Some(metadata))
+                .is_err()
+        );
+
+        let mut metadata = discord_policy_metadata();
+        metadata["user_id"] = json!("100000000000000099");
+        assert!(
+            sanitize_session_metadata_for(CallerClass::Ingress, "discordbot", &key, Some(metadata))
+                .is_err()
+        );
     }
 }
 
@@ -2905,6 +3262,24 @@ async fn emit_workflow_event(
     };
     workflows.emit_event(&event_name, request.payload).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn approve_workflow_proposal(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(fingerprint): Path<String>,
+    Json(request): Json<ApproveActionProposalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if caller.class() != CallerClass::Ingress || caller.identity() != "discordbot" {
+        return Err(ApiError::Forbidden(
+            "only authenticated Discord ingress may approve workflow proposals".to_owned(),
+        ));
+    }
+    let workflows = workflow_runtime(&state)?;
+    let approval = workflows
+        .approve_action_proposal(&fingerprint, request)
+        .await?;
+    Ok(Json(serde_json::to_value(approval)?))
 }
 
 async fn invoke_workflow_webhook(

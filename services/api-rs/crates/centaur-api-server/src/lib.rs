@@ -56,6 +56,10 @@ mod tests {
         ApiAuthConfig::testing_with_slack_ingress("test-slackbot-key", "test-secret")
     }
 
+    fn test_auth_with_discord() -> ApiAuthConfig {
+        ApiAuthConfig::testing_with_discord_ingress("test-discordbot-key", "test-secret")
+    }
+
     fn console_token() -> String {
         encode(
             &Header::new(Algorithm::HS256),
@@ -433,6 +437,61 @@ mod tests {
         ] {
             let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
                 .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_proposal_approval_is_discord_ingress_only() {
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        let path = format!("/api/workflows/proposals/{fingerprint}/approve");
+        let body = json!({
+            "actor_id": "100000000000000001",
+            "capability_class": "github:approve",
+            "channel_id": "300000000000000001",
+            "guild_id": "200000000000000001",
+            "message_id": "600000000000000001",
+            "policy_fingerprint": format!("sha256:{}", "b".repeat(64)),
+            "principal_role": "discord-operator",
+            "repository_scope": ["508-dev/508-workflows"],
+            "root_message_id": "600000000000000001",
+            "thread_id": "600000000000000001"
+        });
+        let discord_response =
+            build_router_with_app_state(AppState::unready(test_auth_with_discord()))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, "Bearer test-discordbot-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(discord_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for (auth, token, expected) in [
+            (
+                test_auth_with_slack(),
+                "test-slackbot-key",
+                StatusCode::FORBIDDEN,
+            ),
+            (test_auth(), "not-a-valid-token", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(auth))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);
