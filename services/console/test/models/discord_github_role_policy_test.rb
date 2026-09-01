@@ -20,7 +20,7 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       last_refresh: Time.current
     )
 
-    secret = StaticSecret.new(
+    github_token_wrapper = StaticSecret.new(
       foreign_id: "discord-github-token-#{SecureRandom.hex(4)}",
       name: "Discord GitHub token",
       kind: CredentialProfiles::GithubToken::KIND,
@@ -28,14 +28,14 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       replace_config: CredentialProfiles::GithubToken::REPLACE_CONFIG.deep_dup,
       created_by: admin
     )
-    secret.build_source(
+    github_token_wrapper.build_source(
       source_type: "token_broker",
       config: { "credential_id" => credential.foreign_id }
     )
     CredentialProfiles::GithubToken::RULE_ATTRIBUTES.each do |attributes|
-      secret.rules.build(attributes)
+      github_token_wrapper.rules.build(attributes)
     end
-    secret.save!
+    github_token_wrapper.save!
 
     role = Role.create!(
       foreign_id: "discord-policy-#{SecureRandom.hex(4)}",
@@ -46,7 +46,7 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       },
       created_by: admin
     )
-    Grant.create!(role: role, static_secret: secret, created_by: admin)
+    Grant.create!(role: role, static_secret_id: github_token_wrapper.id, created_by: admin)
 
     principal = Principal.create!(
       foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
@@ -56,7 +56,7 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     )
     PrincipalRole.create!(principal: principal, role: role)
 
-    [ principal.reload, role, secret, credential ]
+    [ principal.reload, role, github_token_wrapper, credential ]
   end
 
   test "rejects a custom wrapper around a GitHub App credential" do
@@ -119,6 +119,36 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
 
     assert_not grant.valid?
     assert grant.errors[:base].any? { |message| message.include?("may not receive direct grants") }
+  end
+
+  test "Discord actor identity preserves the managed marker across label replacement" do
+    principal, _role, _secret, _credential = build_policy_binding
+
+    principal.update!(labels: { "operator-note" => "reviewed" })
+
+    assert_equal "true", principal.reload.labels["centaur_discord_policy_managed"]
+    direct_grant = Grant.new(
+      principal: principal,
+      static_secret: static_secrets(:acme_prod_api_key),
+      created_by: users(:acme_admin)
+    )
+    assert_not direct_grant.valid?
+    assert direct_grant.errors[:base].any? { |message| message.include?("may not receive direct grants") }
+  end
+
+  test "Discord actor foreign ID remains fail-closed after a legacy marker removal" do
+    principal, _role, _secret, _credential = build_policy_binding
+    principal.update_columns(labels: {}, kind: "unknown")
+    principal.reload
+
+    assert_not DiscordGithubRolePolicy.static_secret_allowed_for_principal?(principal, static_secrets(:acme_prod_api_key))
+    direct_grant = Grant.new(
+      principal: principal,
+      static_secret: static_secrets(:acme_prod_api_key),
+      created_by: users(:acme_admin)
+    )
+    assert_not direct_grant.valid?
+    assert direct_grant.errors[:base].any? { |message| message.include?("may not receive direct grants") }
   end
 
   test "rejects changing the wrapper declaration or policy role scope after assignment" do

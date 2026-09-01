@@ -4,7 +4,6 @@
 # mutation cannot widen credentials already assigned to a Discord actor.
 class DiscordGithubRolePolicy
   MANAGED_ROLE_LABEL = "centaur_discord_policy_managed".freeze
-  MANAGED_PRINCIPAL_LABEL = "centaur_discord_policy_managed".freeze
   REPOSITORY_SCOPE_LABEL = "repository_scope".freeze
   SECRET_REPOSITORIES_LABEL = "repositories".freeze
   TOKEN_BROKER_SOURCE = "token_broker".freeze
@@ -111,7 +110,7 @@ class DiscordGithubRolePolicy
     end
 
     def managed_principal?(principal)
-      principal&.labels.to_h[MANAGED_PRINCIPAL_LABEL] == "true"
+      principal&.discord_actor_principal?
     end
 
     def policy_errors(role, replacement_static_secret: nil, replacement_source: nil,
