@@ -154,21 +154,38 @@ export function isAllowedTriggerBotMessage(
   message: Pick<Message, "author" | "raw">,
   allowlist: readonly string[] | undefined,
 ): boolean {
-  if (!allowlist?.length) return false;
   const raw =
     message.raw && typeof message.raw === "object"
       ? (message.raw as { application_id?: unknown; webhook_id?: unknown })
       : {};
-  const identifiers = new Set(
-    [
-      message.author.userId,
-      typeof raw.application_id === "string" ? raw.application_id : undefined,
-      typeof raw.webhook_id === "string" ? raw.webhook_id : undefined,
-    ]
+  return isAllowedTriggerBotIdentifiers(
+    {
+      applicationId:
+        typeof raw.application_id === "string" ? raw.application_id : undefined,
+      authorId: message.author.userId,
+      webhookId:
+        typeof raw.webhook_id === "string" ? raw.webhook_id : undefined,
+    },
+    allowlist,
+  );
+}
+
+/** Apply the same immutable multi-ID bot policy at pre- and post-admission gates. */
+export function isAllowedTriggerBotIdentifiers(
+  identifiers: {
+    applicationId?: string;
+    authorId: string;
+    webhookId?: string;
+  },
+  allowlist: readonly string[] | undefined,
+): boolean {
+  if (!allowlist?.length) return false;
+  const reviewedIdentifiers = new Set(
+    [identifiers.authorId, identifiers.applicationId, identifiers.webhookId]
       .map((value) => value?.trim())
       .filter((value): value is string => Boolean(value)),
   );
-  return allowlist.some((entry) => identifiers.has(entry.trim()));
+  return allowlist.some((entry) => reviewedIdentifiers.has(entry.trim()));
 }
 
 /**
