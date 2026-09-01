@@ -163,12 +163,20 @@ class DiscordGithubRolePolicy
 
     def github_related_secret?(secret, replacement_static_secret, replacement_source, replacement_broker)
       return true if secret.kind == CredentialProfiles::GithubToken::KIND
+      return true if secret.rules.to_a.any? { |rule| github_host_rule?(rule) }
 
       broker = broker_for(
         source_for(secret, replacement_static_secret, replacement_source),
         replacement_broker
       )
       broker&.grant == GITHUB_APP_INSTALLATION_GRANT
+    end
+
+    def github_host_rule?(rule)
+      host = rule.host.to_s
+      CredentialProfiles::GithubToken::ALLOWED_HOSTS.any? do |github_host|
+        File.fnmatch?(host, github_host)
+      end
     end
 
     def github_secret_errors(secret, expected_scope, replacement_static_secret,
