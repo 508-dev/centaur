@@ -598,6 +598,10 @@ impl SandboxBackend for AgentSandboxBackend {
         }
     }
 
+    async fn cleanup_terminal_auxiliaries(&self, id: &SandboxId) -> SandboxResult<usize> {
+        self.cleanup_terminal_proxy_pods(id).await
+    }
+
     async fn assign_iron_control_proxy_principal(
         &self,
         id: &SandboxId,

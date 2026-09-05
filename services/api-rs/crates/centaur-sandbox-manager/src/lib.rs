@@ -31,6 +31,32 @@ mod tests {
     use super::{DriftReason, ReconcileOutcome, SandboxManager};
 
     #[tokio::test]
+    async fn reaper_cleans_terminal_auxiliaries_without_stopping_or_changing_desired_state() {
+        let backend = Arc::new(FakeBackend::new([
+            ("failed", SandboxStatus::Stopped),
+            ("active", SandboxStatus::Running),
+            ("absent", SandboxStatus::Gone),
+        ]));
+        let manager = Arc::new(SandboxManager::new(backend.clone()));
+        let desired = DesiredSandboxState::Running(SandboxSpec::new("image"));
+        manager.set_desired_state("failed".into(), desired.clone());
+        let reaper = super::SandboxReaper::new(
+            manager.clone(),
+            super::SandboxReaperConfig {
+                interval: std::time::Duration::from_secs(60),
+                max_lifetime: Some(std::time::Duration::from_secs(100)),
+            },
+        );
+        assert_eq!(reaper.reap_once().await.unwrap(), 0);
+        assert_eq!(backend.operations(), ["cleanup:failed"]);
+        assert_eq!(backend.status_of("failed"), Some(SandboxStatus::Stopped));
+        assert_eq!(manager.desired_state(&"failed".into()), Some(desired));
+        backend.fail_operation("cleanup");
+        assert_eq!(reaper.reap_once().await.unwrap(), 0);
+        assert_eq!(backend.operations(), ["cleanup:failed", "cleanup:failed"]);
+    }
+
+    #[tokio::test]
     async fn reconcile_resumes_suspended_sandbox_desired_running() {
         let backend = Arc::new(FakeBackend::new([("sandbox-1", SandboxStatus::Suspended)]));
         let manager = SandboxManager::new(backend.clone());
@@ -277,6 +303,12 @@ mod tests {
             self.maybe_fail("stop")?;
             self.set_status(id, SandboxStatus::Stopped);
             Ok(())
+        }
+
+        async fn cleanup_terminal_auxiliaries(&self, id: &SandboxId) -> SandboxResult<usize> {
+            self.push_operation("cleanup", id);
+            self.maybe_fail("cleanup")?;
+            Ok(1)
         }
 
         async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
