@@ -5938,7 +5938,7 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
                 reason: "turn_interrupted",
             }
         }
-        Some(_status) if !prior_final_answer_text.trim().is_empty() => {
+        Some("interrupted") if !prior_final_answer_text.trim().is_empty() => {
             completed_terminal_output_with_fallback(
                 value,
                 "turn_completed",
@@ -5946,7 +5946,11 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
             )
         }
         Some(status) => TerminalOutput::Failed {
-            error: format!("turn completed with status {status} before final answer"),
+            // An adapter can emit its API/auth error as a final-answer item
+            // before settling the turn. Text is not evidence of success: the
+            // structured terminal status remains authoritative.
+            error: nested_codex_error_text(value)
+                .unwrap_or_else(|| format!("turn completed with status {status}")),
         },
     }
 }
@@ -6108,7 +6112,9 @@ fn error_notification_will_retry(value: &Value) -> bool {
 
 fn nested_codex_error_text(value: &Value) -> Option<String> {
     let error = value
-        .pointer("/params/error")
+        .pointer("/params/turn/error")
+        .or_else(|| value.pointer("/turn/error"))
+        .or_else(|| value.pointer("/params/error"))
         .or_else(|| value.get("error"))?;
     if !error.is_object() {
         return None;
@@ -7523,6 +7529,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_turn_is_not_successful_even_after_final_answer_text() {
+        for event in [
+            json!({"method": "turn/completed", "params": {"turn": {
+                "status": "failed", "error": {"message": "Provider authentication failed"}
+            }}}),
+            json!({"type": "turn.completed", "turn": {
+                "status": "failed", "error": {"message": "Provider authentication failed"}
+            }}),
+        ] {
+            for prior_text in ["", "Provider authentication failed", "Partial answer"] {
+                assert_eq!(
+                    terminal_output(&event, prior_text),
+                    Some(TerminalOutput::Failed {
+                        error: "Provider authentication failed".to_owned(),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_status_cannot_be_rescued_by_assistant_text() {
+        let event = json!({"method": "turn/completed", "params": {"turn": {
+            "status": "unexpected_status"
+        }}});
+        assert_eq!(
+            terminal_output(&event, "Partial answer"),
+            Some(TerminalOutput::Failed {
+                error: "turn completed with status unexpected_status".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn interrupted_turn_completed_after_answer_stays_terminal() {
         let event = json!({
             "method": "turn/completed",
@@ -8575,6 +8615,7 @@ mod adoption_tests {
         ios: Mutex<VecDeque<SandboxIo>>,
         recorded_output: std::sync::Mutex<Vec<String>>,
         open_count: AtomicUsize,
+        opened_ids: std::sync::Mutex<Vec<String>>,
         create_started: tokio::sync::Notify,
         create_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
         status: std::sync::Mutex<SandboxStatus>,
@@ -8593,6 +8634,7 @@ mod adoption_tests {
                 ios: Mutex::new(VecDeque::new()),
                 recorded_output: std::sync::Mutex::new(recorded_output),
                 open_count: AtomicUsize::new(0),
+                opened_ids: std::sync::Mutex::new(Vec::new()),
                 create_started: tokio::sync::Notify::new(),
                 create_gate: std::sync::Mutex::new(None),
                 status: std::sync::Mutex::new(status),
@@ -8687,8 +8729,9 @@ mod adoption_tests {
             ))
         }
 
-        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+        async fn open_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
+            self.opened_ids.lock().unwrap().push(id.as_str().to_owned());
             self.ios
                 .lock()
                 .await
@@ -9789,6 +9832,10 @@ mod adoption_tests {
                 BTreeMap::from([
                     ("centaur.slack_channel_id".to_owned(), "C123".to_owned()),
                     ("centaur.slack_team_id".to_owned(), "T123".to_owned()),
+                    (
+                        "centaur.thread_key".to_owned(),
+                        thread_key.as_str().to_owned()
+                    ),
                 ])
             )]
         );
@@ -10450,6 +10497,58 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_turn_with_error_text_persists_failure_not_completion() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:provider-failed-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-provider-failed"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime.claim_stdout_owner(&execution_id).await.unwrap();
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-provider-failed")
+            .await
+            .unwrap();
+        let lines = [
+            json!({"method": "item/completed", "params": {"item": {
+                "type": "agentMessage", "phase": "final_answer", "text": "Provider authentication failed"
+            }}}),
+            json!({"method": "turn/completed", "params": {"turn": {
+                "status": "failed", "error": {"message": "Provider authentication failed"}
+            }}}),
+        ];
+        for line in lines {
+            stdout
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.execution_id, execution_id);
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+        assert_eq!(
+            execution.error.as_deref(),
+            Some("Provider authentication failed")
+        );
+        let all = events(&store, &thread_key).await;
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_completed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_eof_recovers_terminal_output_from_recorded_logs() {
         let Some(store) = test_store().await else {
             return;
@@ -10457,13 +10556,15 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime.claim_stdout_owner(&execution_id).await.unwrap();
         runtime
             .ensure_session_pipe(&thread_key, "sbx-recorded")
             .await
@@ -10507,7 +10608,8 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (first_io, mut first_stdout, _first_stdin) = mock_io();
@@ -10516,6 +10618,7 @@ mod adoption_tests {
         backend.push_io(second_io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime.claim_stdout_owner(&execution_id).await.unwrap();
         runtime
             .ensure_session_pipe(&thread_key, "sbx-reattach")
             .await
@@ -10628,13 +10731,14 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime.claim_stdout_owner(&execution_id).await.unwrap();
         runtime
             .ensure_session_pipe(&thread_key, "sbx-gone")
             .await
@@ -10770,7 +10874,17 @@ mod adoption_tests {
             error.contains("sandbox no longer accepts io"),
             "expected status detail: {error}"
         );
-        assert_eq!(backend.opens(), 0);
+        // The adoption scan is database-wide and can also start another
+        // test's deliberately queued request. Assert this gone sandbox was
+        // never attached, not that no unrelated sandbox was ever opened.
+        assert!(
+            !backend
+                .opened_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "sbx-mock")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

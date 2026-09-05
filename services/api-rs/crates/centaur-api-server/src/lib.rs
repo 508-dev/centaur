@@ -939,6 +939,139 @@ mod tests {
         assert!(body.get("linear").is_none());
     }
 
+    /// Exercise real HTTP, local-process I/O, SSE replay, and Postgres together.
+    /// An emitted answer must never override the harness's terminal status.
+    #[tokio::test]
+    async fn terminal_status_agrees_across_http_sse_and_durable_state() {
+        use centaur_sandbox_local::LocalSandboxBackend;
+        use centaur_session_core::{ExecutionStatus, ThreadKey};
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+        use std::time::Duration;
+
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = PgSessionStore::new(PgPool::connect(&url).await.unwrap());
+        store.run_migrations().await.unwrap();
+        for (status, expected, event_type) in [
+            (
+                "failed",
+                ExecutionStatus::Failed,
+                "session.execution_failed",
+            ),
+            (
+                "unexpected",
+                ExecutionStatus::Failed,
+                "session.execution_failed",
+            ),
+            (
+                "completed",
+                ExecutionStatus::Completed,
+                "session.execution_completed",
+            ),
+        ] {
+            let terminal = json!({"method":"turn/completed", "params":{"turn":{
+                "status":status, "error":{"message":"Synthetic provider error"}
+            }}});
+            let script = format!(
+                r#"while IFS= read -r line; do
+printf '%s\n' '{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","phase":"final_answer","text":"Synthetic answer"}}}}}}'
+printf '%s\n' '{terminal}'
+done"#
+            );
+            let runtime = SandboxRuntime::backend(
+                Arc::new(LocalSandboxBackend::default()),
+                SandboxSpec::new("local-proof")
+                    .command(["/bin/sh", "-c"])
+                    .args([script]),
+            );
+            let app = build_router_with_runtime(store.clone(), runtime);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::new();
+            let key =
+                ThreadKey::parse(format!("test:terminal-http-{}", uuid::Uuid::new_v4())).unwrap();
+            let base = format!(
+                "http://{address}/api/session/{}",
+                urlencoding::encode(key.as_str())
+            );
+            for (path, body) in [
+                (base.clone(), json!({"harness_type":"codex"})),
+                (
+                    format!("{base}/messages"),
+                    json!({"messages":[{
+                        "client_message_id":"proof-message", "role":"user",
+                        "parts":[{"type":"text", "text":"Synthetic proof"}]
+                    }]}),
+                ),
+                (
+                    format!("{base}/execute"),
+                    json!({
+                        "input_lines":["{\"type\":\"user\"}"], "idempotency_key":"proof-execute"
+                    }),
+                ),
+            ] {
+                let response = client
+                    .post(path)
+                    .bearer_auth(console_token())
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    response.status().is_success(),
+                    "{}",
+                    response.text().await.unwrap()
+                );
+            }
+            let response = client
+                .get(format!("{base}/events?after_event_id=0"))
+                .bearer_auth(console_token())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let mut events = response.bytes_stream().eventsource();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while let Some(event) = events.next().await {
+                    let event = event.unwrap();
+                    if event.event == event_type {
+                        return;
+                    }
+                    if expected == ExecutionStatus::Failed {
+                        assert!(event.event != "session.execution_completed");
+                    }
+                }
+                panic!("SSE ended before terminal event");
+            })
+            .await
+            .expect("terminal SSE event");
+            let execution = store
+                .latest_execution_for_thread(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.status, expected);
+            if expected == ExecutionStatus::Failed {
+                assert_eq!(execution.error.as_deref(), Some("Synthetic provider error"));
+            }
+            let durable = store.list_events_after(&key, 0, None, 100).await.unwrap();
+            assert!(durable.iter().any(|event| event.event_type == event_type));
+            if expected == ExecutionStatus::Failed {
+                assert!(
+                    !durable
+                        .iter()
+                        .any(|event| event.event_type == "session.execution_completed")
+                );
+            }
+            server.abort();
+        }
+    }
+
     #[derive(Default)]
     struct TestBackend {
         next_id: AtomicU64,
