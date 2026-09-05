@@ -41,6 +41,7 @@ class RequestRule < ApplicationRecord
   validate :http_methods_are_valid
   validate :paths_are_valid
   validate :at_most_one_owner
+  validate :discord_github_policy_valid
 
   private
 
@@ -52,6 +53,10 @@ class RequestRule < ApplicationRecord
     set = OWNER_ASSOCIATIONS.count { |assoc| send(assoc).present? }
     return if set <= 1
     errors.add(:base, "must belong to at most one of #{OWNER_ASSOCIATIONS.join(", ")}")
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_request_rule(self)
   end
 
   def host_xor_cidr

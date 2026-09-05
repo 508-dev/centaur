@@ -1,6 +1,6 @@
 import type { Attachment, Logger } from "chat";
+import { resolveDiscordApiBase } from "./discord-api";
 import { parseDiscordThreadKey } from "./discord-allowlist";
-import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type {
   DiscordbotApiAttachment,
   DiscordbotApiMessage,
@@ -29,9 +29,9 @@ export async function fetchThreadStarterMessage(
   if (!channelId || !threadId) return null;
 
   const fetchFn = options.fetch ?? fetch;
-  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
-    /\/$/,
-    "",
+  const apiBase = resolveDiscordApiBase(
+    options.discordApiUrl,
+    options.allowInProcessGatewayEmulation === true,
   );
   try {
     const response = await fetchFn(

@@ -134,7 +134,8 @@ module Console
           credential: {
             foreign_id: "github-app-installation", name: "GitHub App installation",
             grant: "github_app_installation", token_endpoint: "https://untrusted.example/token",
-            client_id: "Iv1.0123456789abcdef", github_installation_id: "12345678"
+            client_id: "Iv1.0123456789abcdef", github_installation_id: "12345678",
+            github_repositories: "508-dev/centaur\n508-dev/centaur-overlay"
           }
         }
       end
@@ -144,6 +145,7 @@ module Console
       assert_equal "github_app_installation", cred.grant
       assert_equal BrokerCredential::GITHUB_API_ENDPOINT, cred.token_endpoint
       assert_equal "12345678", cred.github_installation_id
+      assert_equal [ "508-dev/centaur", "508-dev/centaur-overlay" ], cred.github_repositories
       assert_nil cred.refresh_token
     end
 
@@ -212,6 +214,37 @@ module Console
       assert_nil cred.expires_at
       assert_nil cred.last_refresh
       assert cred.next_attempt_at.present?
+    end
+
+    test "PATCH GitHub App repository rescope discards the previous token" do
+      cred = BrokerCredential.create!(
+        foreign_id: "github-app-console-rescope",
+        grant: "github_app_installation",
+        client_id: "Iv1.0123456789abcdef",
+        github_installation_id: "12345678",
+        github_repositories: [ "508-dev/centaur", "508-dev/508-infra" ],
+        access_token: "ghs-wide-token",
+        expires_at: 30.minutes.from_now,
+        last_refresh: Time.current,
+        created_by: @operator
+      )
+
+      patch console_broker_credential_url(cred.oid), params: {
+        credential: {
+          foreign_id: cred.foreign_id,
+          grant: "github_app_installation",
+          client_id: cred.client_id,
+          github_installation_id: cred.github_installation_id,
+          github_repositories: "508-dev/centaur"
+        }
+      }
+
+      assert_redirected_to console_credential_path(cred.oid)
+      cred.reload
+      assert_equal [ "508-dev/centaur" ], cred.github_repositories
+      assert_nil cred.access_token
+      assert_nil cred.expires_at
+      assert_nil cred.last_refresh
     end
 
     test "PATCH changing the GitHub App grant in either direction discards the prior token" do

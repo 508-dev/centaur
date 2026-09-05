@@ -226,6 +226,7 @@ Rails.application.routes.draw do
         # Grants whose grantee is this role. :role_id is the role's oid.
         resources :grants, only: %i[index], controller: :grantee_grants
       end
+      put "principals/:principal_id/roles", to: "principal_roles#replace"
       resources :principals, only: %i[index show create update] do
         collection do
           get "lookup/default/:foreign_id/effective_config",

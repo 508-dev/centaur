@@ -472,6 +472,13 @@ apiRs:
   workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
+  # Reviewed observer/action bindings for durable action proposals. The runtime
+  # rejects persistence and approval unless the exact observer_workflow +
+  # action_type tuple selects the proposed action_workflow.
+  actionProposalBindings: []
+  # - observer_workflow: weekly_ops_review
+  #   action_type: github:create_improvement_pr
+  #   action_workflow: execute_approved_improvement
   # Requests/limits for the workflow-host sandbox pod (k8s resources map).
   workflowHostResources: {}
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
@@ -733,7 +740,7 @@ githubbot:
 
 # Discord chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over a
 # persistent Discord Gateway connection. Off by default; needs a Discord app + Message Content
-# Intent + guild/channel/role allowlists. Always exactly one replica (singleton Gateway session).
+# Intent + guild/channel/role policy. Always exactly one replica (singleton Gateway session).
 discordbot:
   enabled: false
   image:
@@ -745,9 +752,28 @@ discordbot:
   guildAllowlist: ""
   # Comma/space-separated parent channel IDs. Required and fail-closed.
   channelAllowlist: ""
-  # Comma/space-separated immutable role IDs allowed to trigger/continue human turns.
-  # Required and fail-closed. Role names are never used for authorization.
-  triggerRoleAllowlist: ""
+  # Reviewed immutable Discord-role bindings. Enabling the deployment with an
+  # empty list fails Helm rendering. Multiple matching roles use explicit
+  # priority; an equal-priority semantic conflict is denied. Use exact repo
+  # names only; wildcards and role names are rejected at process startup.
+  roleBindings: []
+  # - role_id: "100000000000000001"
+  #   capability_class: github:observe
+  #   principal_role: discord-observer
+  #   can_approve: false
+  #   priority: 0
+  #   repository_scope: [example-org/example-repo]
+  #   project_scope: []
+  # Root-to-continuation TTL and replay/audit retention, in milliseconds.
+  continuationTtlMs: 86400000
+  ingressMaxEventAgeMs: 300000
+  ingressDeliveryTtlMs: 604800000
+  # Exact non-human identities bound to an existing, non-approver role policy.
+  # A bare bot/webhook allowlist is intentionally insufficient: the identity
+  # must select one reviewed bundle and cannot approve a proposal.
+  triggerBotBindings: []
+  # - identity_id: "100000000000000001" # bot user, application, or webhook ID
+  #   role_id: "100000000000000002"     # one entry in roleBindings
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.

@@ -52,7 +52,11 @@ class StaticSecret < ApplicationRecord
     CredentialProfiles::Registry.apply_defaults(self, rules: rules)
   end
 
-  attr_writer :kind_rules_for_validation
+  # API replacement validates a transient, complete rule set before it swaps
+  # the persisted associations. Policy validators need the same candidate view
+  # as the credential-profile validator so they cannot authorize the old rules
+  # and then persist a newly widened target.
+  attr_accessor :kind_rules_for_validation
 
   def validate_kind_rules(rules: self.rules)
     CredentialProfiles::Registry.validate_rules(self, rules: rules)
@@ -104,6 +108,7 @@ class StaticSecret < ApplicationRecord
   validate :replace_config_matches_schema
   validate :kind_config_matches_profile
   validate :kind_rules_match_profile
+  validate :discord_github_policy_valid
 
   private
 
@@ -138,6 +143,10 @@ class StaticSecret < ApplicationRecord
 
   def kind_rules_match_profile
     validate_kind_rules(rules: @kind_rules_for_validation || rules)
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_static_secret(self)
   end
 
   def validate_against_schema(attr, value, schema)

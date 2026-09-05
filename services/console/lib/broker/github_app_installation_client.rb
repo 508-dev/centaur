@@ -28,11 +28,14 @@ module Broker
       @clock = clock
     end
 
-    def refresh(client_id:, installation_id:, timeout: Broker::RefreshClient::DEFAULT_TIMEOUT)
-      validate_inputs!(client_id, installation_id)
+    def refresh(client_id:, installation_id:, repositories: [],
+                timeout: Broker::RefreshClient::DEFAULT_TIMEOUT)
+      validate_inputs!(client_id, installation_id, repositories)
       signed_jwt = app_jwt(client_id)
+      request_body = repositories.present? ? { repositories: repositories.map { |name| name.split("/", 2).last } } : nil
       response = http_client_for(timeout).post(
         "#{API_ENDPOINT}/app/installations/#{installation_id}/access_tokens",
+        json: request_body,
         headers: {
           "Accept" => "application/vnd.github+json",
           "Authorization" => "Bearer #{signed_jwt}",
@@ -42,7 +45,7 @@ module Broker
       )
 
       classify_error!(response) unless response.success?
-      parse_success(response)
+      parse_success(response, repositories: repositories)
     rescue Broker::RefreshError
       raise
     rescue OpenSSL::PKey::PKeyError, OpenSSL::OpenSSLError, Errno::ENOENT, Errno::EACCES
@@ -71,7 +74,7 @@ module Broker
       )
     end
 
-    def validate_inputs!(client_id, installation_id)
+    def validate_inputs!(client_id, installation_id, repositories)
       unless client_id.to_s.match?(/\A[A-Za-z][A-Za-z0-9._-]*\z/)
         raise RefreshError.new("GitHub App client ID is missing or invalid",
                                stage: "configuration", code: "github_app_client_id", retryable: false)
@@ -79,6 +82,14 @@ module Broker
       unless installation_id.to_s.match?(/\A[1-9]\d*\z/)
         raise RefreshError.new("GitHub App installation ID is invalid",
                                stage: "configuration", code: "github_app_installation_id", retryable: false)
+      end
+      unless repositories.is_a?(Array) && repositories.length <= BrokerCredential::GITHUB_REPOSITORY_LIMIT &&
+             repositories.all? { |repository| repository.is_a?(String) &&
+               repository.match?(BrokerCredential::GITHUB_REPOSITORY_FORMAT) } &&
+             repositories.map(&:downcase).uniq.length == repositories.length &&
+             repositories.map { |repository| repository.split("/", 2).first.downcase }.uniq.length <= 1
+        raise RefreshError.new("GitHub App repository scope is invalid",
+                               stage: "configuration", code: "github_app_repositories", retryable: false)
       end
       if @private_key_path.blank?
         raise RefreshError.new("GitHub App private key path is not configured",
@@ -122,13 +133,15 @@ module Broker
       response["retry-after"].present? || response["x-ratelimit-remaining"].to_s == "0"
     end
 
-    def parse_success(response)
+    def parse_success(response, repositories:)
       parsed = response.json
       access_token = parsed.fetch("token")
       expires_at = Time.iso8601(parsed.fetch("expires_at"))
       if access_token.blank? || expires_at <= @clock.call
         raise KeyError
       end
+
+      verify_repository_scope!(parsed, repositories) if repositories.present?
 
       RefreshClient::Result.new(
         access_token: access_token,
@@ -138,6 +151,17 @@ module Broker
     rescue JSON::ParserError, KeyError, ArgumentError, TypeError
       raise RefreshError.new("GitHub App installation token response was invalid",
                              stage: "parse", code: "github_app_response", retryable: true)
+    end
+
+    def verify_repository_scope!(parsed, requested)
+      returned = parsed.fetch("repositories").map { |repository| repository.fetch("full_name") }
+      return if returned.map(&:downcase).sort == requested.map(&:downcase).sort
+
+      raise RefreshError.new("GitHub App installation token repository scope did not match the request",
+                             stage: "parse", code: "github_app_repository_scope", retryable: false)
+    rescue KeyError, NoMethodError, TypeError
+      raise RefreshError.new("GitHub App installation token repository scope was missing or invalid",
+                             stage: "parse", code: "github_app_repository_scope", retryable: false)
     end
   end
 end

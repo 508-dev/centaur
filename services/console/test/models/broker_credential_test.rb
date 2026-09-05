@@ -126,6 +126,28 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert bc.valid?, bc.errors.full_messages.to_sentence
   end
 
+  test "GitHub App repository scope is exact, unique, and installation-owner bounded" do
+    bc = build_credential(
+      grant: "github_app_installation",
+      client_id: "Iv1.0123456789abcdef",
+      github_installation_id: "12345678",
+      refresh_token: nil
+    )
+
+    bc.github_repositories = [ "508-dev/centaur", "508-dev/centaur-overlay" ]
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+
+    [
+      [ "508-dev/*" ],
+      [ "508-dev/centaur", "508-DEV/CENTAUR" ],
+      [ "508-dev/centaur", "someone-else/repository" ]
+    ].each do |scope|
+      bc.github_repositories = scope
+      refute bc.valid?, "expected #{scope.inspect} to be rejected"
+      assert bc.errors[:github_repositories].any?
+    end
+  end
+
   # --- oauth_app provenance (flow-minted credentials) -----------------------
 
   def build_app(**overrides)
@@ -396,6 +418,7 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     client.expect(:refresh, result(access_token: "ghs-token", refresh_token: nil, expires_in: 3600)) do |**request|
       assert_equal "Iv1.0123456789abcdef", request[:client_id]
       assert_equal "12345678", request[:installation_id]
+      assert_equal [ "508-dev/centaur" ], request[:repositories]
       assert_equal 30, request[:timeout]
       true
     end
@@ -403,6 +426,7 @@ class BrokerCredentialTest < ActiveSupport::TestCase
       grant: "github_app_installation",
       client_id: "Iv1.0123456789abcdef",
       github_installation_id: "12345678",
+      github_repositories: [ "508-dev/centaur" ],
       refresh_token: nil
     )
     bc.github_app_installation_client = client

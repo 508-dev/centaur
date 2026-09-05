@@ -613,6 +613,8 @@ struct HttpSecret {
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -733,6 +735,8 @@ fn parse_secret(
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: Vec::new(),
+            paths: Vec::new(),
             replacer: name,
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -786,6 +790,23 @@ fn parse_http_secret(
         )));
     }
     let mode = optional_str(table, "mode").unwrap_or("replace");
+    let http_methods = optional_string_array(table.get("http_methods"))?.unwrap_or_default();
+    if http_methods.iter().any(|method| {
+        !matches!(
+            method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "*"
+        )
+    }) {
+        return Err(ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} 'http_methods' contains an unsupported method"
+        )));
+    }
+    let paths = optional_string_array(table.get("paths"))?.unwrap_or_default();
+    if paths.iter().any(|path| !path.starts_with('/')) {
+        return Err(ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} 'paths' entries must start with '/'"
+        )));
+    }
     match mode {
         "replace" => {
             let match_headers =
@@ -804,6 +825,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -839,6 +862,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: Vec::new(),
                 match_path: false,
@@ -1108,7 +1133,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut entry = Secret {
             id: Some(key.name.clone()),
             source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
-            rules: host_rules(hosts)?,
+            rules: http_rules(hosts, &key.http_methods, &key.paths)?,
             ..Default::default()
         };
         entry.extra.insert("labels".to_owned(), yaml_value(labels)?);
@@ -1157,6 +1182,8 @@ struct HttpSecretKey {
     name: String,
     secret_ref: String,
     mode: HttpSecretMode,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -1172,6 +1199,8 @@ impl From<&HttpSecret> for HttpSecretKey {
             name: secret.name.clone(),
             secret_ref: secret.secret_ref.clone(),
             mode: secret.mode.clone(),
+            http_methods: secret.http_methods.clone(),
+            paths: secret.paths.clone(),
             replacer: secret.replacer.clone(),
             match_headers: secret.match_headers.clone(),
             match_path: secret.match_path,
@@ -1463,6 +1492,26 @@ fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryEr
         .collect()
 }
 
+fn http_rules(
+    hosts: BTreeSet<String>,
+    methods: &[String],
+    paths: &[String],
+) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
+    hosts
+        .into_iter()
+        .map(|host| {
+            let mut rule = BTreeMap::from([("host", yaml_string(&host))]);
+            if !methods.is_empty() {
+                rule.insert("methods", yaml_value(methods)?);
+            }
+            if !paths.is_empty() {
+                rule.insert("paths", yaml_value(paths)?);
+            }
+            yaml_value(rule)
+        })
+        .collect()
+}
+
 fn host_rules_set(hosts: &[String]) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     host_rules(hosts.iter().cloned().collect())
 }
@@ -1745,7 +1794,7 @@ secrets = [{type = "http", name = "BASE_TOKEN", match_headers = ["Authorization"
 description = "overlay alpha"
 
 [tool.centaur]
-secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"]}]
+secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"], http_methods = ["GET"], paths = ["/v1/*"]}]
 "#,
         );
         write_tool(
@@ -1768,6 +1817,13 @@ secrets = [
         let secrets = discovered.fragment.transforms[0].config.secrets.clone();
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].id.as_deref(), Some("OVERLAY_TOKEN"));
+        assert_eq!(
+            secrets[0].rules[0]["host"].as_str(),
+            Some("api.overlay.test")
+        );
+        assert_eq!(secrets[0].rules[0]["methods"][0].as_str(), Some("GET"));
+        assert!(secrets[0].rules[0].get("http_methods").is_none());
+        assert_eq!(secrets[0].rules[0]["paths"][0].as_str(), Some("/v1/*"));
         let labels = secrets[0]
             .extra
             .get("labels")

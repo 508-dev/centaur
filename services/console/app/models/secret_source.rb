@@ -99,6 +99,7 @@ class SecretSource < ApplicationRecord
   validate :at_most_one_owner
   validate :role_matches_owner
   validate :token_broker_reference_resolves
+  validate :discord_github_policy_valid
 
   private
 
@@ -132,6 +133,10 @@ class SecretSource < ApplicationRecord
     if brokered_credential.nil?
       errors.add(:config, "credential_id #{ref.inspect} does not reference an existing broker credential")
     end
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_secret_source(self)
   end
 
   def at_most_one_owner

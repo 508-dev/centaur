@@ -52,7 +52,7 @@ module Api
                             :grant, :client_id, :github_installation_id,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
-                            labels: {}, scopes: [])
+                            labels: {}, scopes: [], github_repositories: [])
         # A PUT upsert by foreign_id sets identity before assignment; a blank body
         # value must not wipe it.
         base.delete(:foreign_id) if base[:foreign_id].blank? && ref.foreign_id.present?
@@ -67,7 +67,7 @@ module Api
           ref.assign_attributes(base)
           github_app_grant_changed = was_github_app_installation != ref.github_app_installation?
           github_app_identity_changed = ref.github_app_installation? &&
-            (ref.github_installation_id_changed? || ref.client_id_changed?)
+            (ref.github_installation_id_changed? || ref.client_id_changed? || ref.github_repositories_changed?)
           if github_app_grant_changed || github_app_identity_changed
             reset_refresh_state(ref, discard_access_token: true)
           end
@@ -148,6 +148,7 @@ module Api
           scopes: ref.scopes,
           client_id: ref.client_id,
           github_installation_id: ref.github_installation_id,
+          github_repositories: ref.github_repositories,
           token_endpoint_header_names: (ref.token_endpoint_headers || {}).keys,
           early_refresh_slack_seconds: ref.early_refresh_slack_seconds,
           early_refresh_fraction: ref.early_refresh_fraction,

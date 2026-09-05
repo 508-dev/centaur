@@ -30,6 +30,11 @@ pub fn resolve_principal(
             slack_channel_id: None,
             slack_team_id: None,
             slack_email: None,
+            sandbox_repo_cache: None,
+            sandbox_observability_enabled: None,
+            sandbox_sessions_read_enabled: None,
+            sandbox_workflows_read_enabled: None,
+            sandbox_workflows_write_enabled: None,
         })
     }
 }

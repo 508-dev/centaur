@@ -4,12 +4,13 @@ import {
   discordIngressDenialReason,
   discordRoleIdsFromRaw,
   isAllowedDiscordMessage,
+  isAllowedTriggerBotIdentifiers,
   isAllowedTriggerBotMessage,
   isDiscordIngressAllowlistEmpty,
   isGuildAllowlistEmpty,
   parseDiscordThreadKey,
 } from "../src/discord-allowlist";
-import type { DiscordbotOptions } from "../src/types";
+import type { DiscordbotOptions, DiscordTriggerBotBinding } from "../src/types";
 
 const silentLogger: Logger = {
   debug: () => undefined,
@@ -53,6 +54,12 @@ function options(
     triggerRoleAllowlist: ["R1"],
     ...overrides,
   };
+}
+
+function triggerBotBinding(
+  identityId = "u1",
+): DiscordTriggerBotBinding {
+  return { identityId, roleId: "R1" };
 }
 
 describe("parseDiscordThreadKey", () => {
@@ -177,31 +184,31 @@ describe("isAllowedDiscordMessage", () => {
     ).toBe(false);
   });
 
-  it("allows an allowlisted trigger bot through the bot gate", () => {
+  it("allows a bot identity with a reviewed policy binding through the bot gate", () => {
     expect(
       isAllowedDiscordMessage(
         message({ threadId: "discord:G1:C1:T1", isBot: true }),
-        options({ triggerBotAllowlist: ["u1"] }),
+        options({ triggerBotBindings: [triggerBotBinding()] }),
         silentLogger,
       ),
     ).toBe(true);
   });
 
-  it("still denies a bot not on the trigger allowlist", () => {
+  it("still denies a bot without a reviewed identity binding", () => {
     expect(
       isAllowedDiscordMessage(
         message({ threadId: "discord:G1:C1:T1", isBot: true }),
-        options({ triggerBotAllowlist: ["someone-else"] }),
+        options({ triggerBotBindings: [triggerBotBinding("someone-else")] }),
         silentLogger,
       ),
     ).toBe(false);
   });
 
-  it("still denies the bot’s own messages even when allowlisted", () => {
+  it("still denies the bot’s own messages even when its identity is bound", () => {
     expect(
       isAllowedDiscordMessage(
         message({ threadId: "discord:G1:C1:T1", isBot: true, isMe: true }),
-        options({ triggerBotAllowlist: ["u1"] }),
+        options({ triggerBotBindings: [triggerBotBinding()] }),
         silentLogger,
       ),
     ).toBe(false);
@@ -254,6 +261,20 @@ describe("isAllowedTriggerBotMessage", () => {
   });
 });
 
+describe("isAllowedTriggerBotIdentifiers", () => {
+  it("uses the same author, application, and webhook identities at adapter forwarding", () => {
+    const identifiers = {
+      applicationId: "app-9",
+      authorId: "bot-1",
+      webhookId: "hook-7",
+    };
+    for (const allowed of ["bot-1", "app-9", "hook-7"]) {
+      expect(isAllowedTriggerBotIdentifiers(identifiers, [allowed])).toBe(true);
+    }
+    expect(isAllowedTriggerBotIdentifiers(identifiers, ["other"])).toBe(false);
+  });
+});
+
 describe("isGuildAllowlistEmpty", () => {
   it("is true when no guilds are configured", () => {
     expect(isGuildAllowlistEmpty(options({ guildAllowlist: [] }))).toBe(true);
@@ -288,12 +309,44 @@ describe("Discord ingress context", () => {
   });
 
   it("treats any missing required human allowlist as inert", () => {
-    expect(isDiscordIngressAllowlistEmpty(options())).toBe(false);
+    // The legacy trigger-role allowlist is not a capability policy and cannot
+    // activate production ingress by itself.
+    expect(isDiscordIngressAllowlistEmpty(options())).toBe(true);
+    const reviewedPolicy = {
+      canApprove: false,
+      capabilityClass: "github:observe",
+      principalRole: "discord-observer",
+      priority: 0,
+      projectScope: [],
+      repositoryScope: ["example/example"],
+      roleId: "R1",
+    };
     expect(
-      isDiscordIngressAllowlistEmpty(options({ channelAllowlist: [] })),
+      isDiscordIngressAllowlistEmpty(
+        options({ roleBindings: [reviewedPolicy] }),
+      ),
+    ).toBe(false);
+    expect(
+      isDiscordIngressAllowlistEmpty(
+        options({ channelAllowlist: [], roleBindings: [reviewedPolicy] }),
+      ),
     ).toBe(true);
     expect(
-      isDiscordIngressAllowlistEmpty(options({ triggerRoleAllowlist: [] })),
+      isDiscordIngressAllowlistEmpty(options({ roleBindings: [] })),
     ).toBe(true);
+  });
+
+  it("does not let a legacy role reactivate an explicitly empty policy", () => {
+    expect(
+      discordIngressDenialReason(
+        {
+          authorIsBot: false,
+          channelId: "C1",
+          guildId: "G1",
+          roleIds: ["R1"],
+        },
+        options({ roleBindings: [], triggerRoleAllowlist: ["R1"] }),
+      ),
+    ).toBe("role_allowlist_empty");
   });
 });

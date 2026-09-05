@@ -1,11 +1,28 @@
 import { createGatewayController } from "./gateway";
 import { createDiscordbot, type DiscordbotOptions } from "./index";
+import {
+  parseDiscordRoleBindings,
+  parseDiscordTriggerBotBindings,
+} from "./discord-policy";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
 const botToken = requiredEnv("DISCORD_BOT_TOKEN");
 const publicKey = requiredEnv("DISCORD_PUBLIC_KEY");
 const applicationId = requiredEnv("DISCORD_APPLICATION_ID");
+const guildAllowlist = optionalList("DISCORDBOT_GUILD_ALLOWLIST");
+const channelAllowlist = optionalList("DISCORDBOT_CHANNEL_ALLOWLIST");
+const mentionRoleIds = optionalList("DISCORD_MENTION_ROLE_IDS");
+validateDiscordIds("DISCORDBOT_GUILD_ALLOWLIST", guildAllowlist);
+validateDiscordIds("DISCORDBOT_CHANNEL_ALLOWLIST", channelAllowlist);
+validateDiscordIds("DISCORD_MENTION_ROLE_IDS", mentionRoleIds);
+const roleBindings = parseDiscordRoleBindings(
+  optionalEnv("DISCORDBOT_ROLE_BINDINGS_JSON"),
+);
+const triggerBotBindings = parseDiscordTriggerBotBindings(
+  optionalEnv("DISCORDBOT_TRIGGER_BOT_BINDINGS_JSON"),
+  roleBindings,
+);
 
 const consoleLogger = {
   debug: (message: string, data?: unknown) => log("debug", message, data),
@@ -38,21 +55,24 @@ const options: DiscordbotOptions = {
   applicationId,
   botToken,
   publicKey,
-  channelAllowlist: optionalList("DISCORDBOT_CHANNEL_ALLOWLIST"),
+  channelAllowlist,
+  continuationTtlMs: optionalNumberEnv("DISCORDBOT_CONTINUATION_TTL_MS"),
   discordApiUrl: optionalEnv("DISCORD_API_URL"),
-  guildAllowlist: optionalList("DISCORDBOT_GUILD_ALLOWLIST"),
+  guildAllowlist,
+  ingressDeliveryTtlMs: optionalNumberEnv("DISCORDBOT_INGRESS_DELIVERY_TTL_MS"),
+  ingressMaxEventAgeMs: optionalNumberEnv("DISCORDBOT_INGRESS_MAX_EVENT_AGE_MS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   isGatewayActive: () => gateway.isActive(),
   maxConcurrentExecutionsPerGuild: optionalNumberEnv(
     "DISCORDBOT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD",
   ),
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
-  mentionRoleIds: optionalList("DISCORD_MENTION_ROLE_IDS"),
+  mentionRoleIds,
   nameThreads: optionalEnv("DISCORDBOT_NAME_THREADS") !== "false",
   postgresUrl,
+  roleBindings,
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
-  triggerBotAllowlist: optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST"),
-  triggerRoleAllowlist: optionalList("DISCORDBOT_TRIGGER_ROLE_ALLOWLIST"),
+  triggerBotBindings,
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),
   logger: consoleLogger,
 };
@@ -116,6 +136,17 @@ function optionalNumberEnv(name: string): number | undefined {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function validateDiscordIds(
+  name: string,
+  values: readonly string[] | undefined,
+): void {
+  for (const value of values ?? []) {
+    if (!/^\d{16,22}$/.test(value)) {
+      throw new Error(`${name} must contain only numeric Discord IDs`);
+    }
+  }
 }
 
 function log(level: string, message: string, data?: unknown): void {

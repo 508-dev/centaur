@@ -1,10 +1,10 @@
 import type { Logger } from "chat";
+import { resolveDiscordApiBase } from "./discord-api";
 import { parseDiscordThreadKey } from "./discord-allowlist";
 import type { DiscordbotOptions } from "./types";
 import { sliceSurrogateSafe } from "./utils";
 
 const DISCORD_THREAD_NAME_LIMIT = 100;
-export const DEFAULT_DISCORD_API_URL = "https://discord.com/api/v10";
 
 /**
  * Derive a Discord thread name from the triggering message text. The `@chat-adapter/discord`
@@ -55,9 +55,9 @@ export async function renameThreadFromMessage(
   if (!threadId) return;
 
   const fetchFn = options.fetch ?? fetch;
-  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
-    /\/$/,
-    "",
+  const apiBase = resolveDiscordApiBase(
+    options.discordApiUrl,
+    options.allowInProcessGatewayEmulation === true,
   );
   try {
     const response = await fetchFn(`${apiBase}/channels/${threadId}`, {
@@ -94,9 +94,9 @@ export async function fetchDiscordChannelName(
   logger: Logger,
 ): Promise<string | undefined> {
   const fetchFn = options.fetch ?? fetch;
-  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
-    /\/$/,
-    "",
+  const apiBase = resolveDiscordApiBase(
+    options.discordApiUrl,
+    options.allowInProcessGatewayEmulation === true,
   );
   try {
     const response = await fetchFn(`${apiBase}/channels/${channelId}`, {

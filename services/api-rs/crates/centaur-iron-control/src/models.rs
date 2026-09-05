@@ -467,6 +467,27 @@ pub struct PrincipalInput {
     pub slack_team_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slack_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_repo_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_observability_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_sessions_read_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_workflows_read_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_workflows_write_enabled: Option<bool>,
+}
+
+/// Atomic replacement body for one principal's role set and sandbox policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PrincipalPolicyInput {
+    pub role_ids: Vec<String>,
+    pub sandbox_repo_cache: String,
+    pub sandbox_observability_enabled: bool,
+    pub sandbox_sessions_read_enabled: bool,
+    pub sandbox_workflows_read_enabled: bool,
+    pub sandbox_workflows_write_enabled: bool,
 }
 
 /// A principal as returned by iron-control. Unknown fields are ignored, so this

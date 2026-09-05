@@ -1,14 +1,18 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import { isRetryableCodexErrorNotification } from "@centaur/rendering";
 import type { Attachment, Message } from "chat";
+import type { DiscordAcceptedAdmission } from "./discord-ingress";
 import { withDiscordEmbedText } from "./discord-starter";
 import type {
+  DiscordbotApproveProposalResponse,
   DiscordbotApiAttachment,
   DiscordbotApiMessage,
   DiscordbotAppendMessagesRequest,
   DiscordbotCreateSessionRequest,
   DiscordbotExecuteSessionRequest,
   DiscordbotExecuteSessionResponse,
+  DiscordExecutionPolicy,
+  DiscordbotInterruptSessionResponse,
   DiscordbotOptions,
   DiscordbotRendererSource,
   DiscordbotSessionMessage,
@@ -70,6 +74,7 @@ type ForwardSessionApiCallbacks = {
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message,
+  actorId: string,
 ): Promise<DiscordbotApiMessage[]> {
   const messages: Message[] = [];
   try {
@@ -78,7 +83,11 @@ export async function collectInitialContext(
     }
   } catch (error) {
     if (!isDiscordThreadNotFoundError(error)) throw error;
-    return [await serializeMessage(currentMessage)];
+    const current = await serializeMessage(currentMessage);
+    if (current.author.userId !== actorId) {
+      throw new Error("current Discord message does not match the admitted actor");
+    }
+    return [current];
   }
 
   const currentIndex = messages.findIndex(
@@ -92,9 +101,20 @@ export async function collectInitialContext(
 
   const serialized: DiscordbotApiMessage[] = [];
   for (const message of messages) {
-    serialized.push(await serializeMessage(message));
+    const item = await serializeMessage(message);
+    if (message.id === currentMessage.id && item.author.userId !== actorId) {
+      throw new Error("current Discord message does not match the admitted actor");
+    }
+    if (isAuthorizedContextMessage(item, actorId)) serialized.push(item);
   }
   return serialized;
+}
+
+export function isAuthorizedContextMessage(
+  message: DiscordbotApiMessage,
+  actorId: string,
+): boolean {
+  return message.author.isMe || message.author.userId === actorId;
 }
 
 // Discord analog of slackbotv2's isSlackThreadNotFoundError: the Discord
@@ -189,13 +209,23 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<DiscordbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  await createSession(options, input.threadId, input.conversationName);
+  await createSession(
+    options,
+    input.threadId,
+    input.policy,
+    input.conversationName,
+  );
   traceLog(options, "discordbot_session_create_complete", input.trace, {
     phase_ms: elapsedMs(createStartedAtMs),
   });
   if (input.messages.length > 0) {
     const appendStartedAtMs = nowMs();
-    await appendSessionMessages(options, input.threadId, input.messages);
+    await appendSessionMessages(
+      options,
+      input.threadId,
+      input.messages,
+      input.policy,
+    );
     traceLog(options, "discordbot_session_append_complete", input.trace, {
       message_count: input.messages.length,
       phase_ms: elapsedMs(appendStartedAtMs),
@@ -213,6 +243,7 @@ export async function forwardToSessionApi(
     options,
     input.threadId,
     input.executeMessage,
+    input.policy,
   );
   traceLog(options, "discordbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -241,6 +272,7 @@ export async function executeSessionTurn(
     options,
     input.threadId,
     input.executeMessage,
+    input.policy,
   );
   traceLog(options, "discordbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -390,6 +422,7 @@ async function bytesToBase64(data: Buffer | Blob): Promise<string> {
 async function createSession(
   options: DiscordbotOptions,
   threadId: string,
+  policy: DiscordExecutionPolicy,
   conversationName?: string,
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch;
@@ -400,6 +433,7 @@ async function createSession(
       source: "discordbot",
       platform: "discord",
       thread_id: threadId,
+      ...policyMetadata(policy),
       // api-rs reads this as the session principal's display name.
       ...(name ? { discord_conversation_name: name } : {}),
     },
@@ -416,10 +450,11 @@ async function appendSessionMessages(
   options: DiscordbotOptions,
   threadId: string,
   messages: DiscordbotApiMessage[],
+  policy: DiscordExecutionPolicy,
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch;
   const body: DiscordbotAppendMessagesRequest = {
-    messages: messages.map(toSessionMessage),
+    messages: messages.map((message) => toSessionMessage(message, policy)),
   };
   const response = await fetchFn(
     apiSessionUrl(options.apiUrl, threadId, "messages"),
@@ -436,12 +471,13 @@ async function executeSession(
   options: DiscordbotOptions,
   threadId: string,
   message: DiscordbotApiMessage,
+  policy: DiscordExecutionPolicy,
 ): Promise<DiscordbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: DiscordbotExecuteSessionRequest = {
     idempotency_key: message.id,
-    metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId),
+    metadata: sessionMetadata(message, policy, { action: "execute" }),
+    input_lines: toCodexInputLines(message, threadId, policy),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -459,6 +495,71 @@ async function executeSession(
   );
   await ensureApiOk(response, "execute session", options);
   return (await response.json()) as DiscordbotExecuteSessionResponse;
+}
+
+export async function interruptSessionExecution(
+  options: DiscordbotOptions,
+  threadId: string,
+  reason: string,
+): Promise<DiscordbotInterruptSessionResponse> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(
+    apiSessionUrl(options.apiUrl, threadId, "interrupt"),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify({ reason: reason.slice(0, 500) }),
+    },
+  );
+  await ensureApiOk(response, "interrupt session", options);
+  return (await response.json()) as DiscordbotInterruptSessionResponse;
+}
+
+/**
+ * Atomically consume one exact, previously observed workflow proposal. The
+ * authenticated Discord admission is the authority; message text contributes
+ * only the canonical fingerprint selected by the operator.
+ */
+export async function approveActionProposal(
+  options: DiscordbotOptions,
+  admission: DiscordAcceptedAdmission,
+): Promise<DiscordbotApproveProposalResponse> {
+  const fingerprint = admission.proposalFingerprint;
+  if (!fingerprint || admission.control !== "approve") {
+    throw new Error("a canonical proposal fingerprint is required");
+  }
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(
+    apiWorkflowProposalApprovalUrl(options.apiUrl, fingerprint),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify({
+        actor_id: admission.actorId,
+        capability_class: admission.policy.capabilityClass,
+        channel_id: admission.channelId,
+        guild_id: admission.guildId,
+        message_id: admission.messageId,
+        policy_fingerprint: admission.policy.fingerprint,
+        principal_role: admission.policy.principalRole,
+        repository_scope: admission.policy.repositoryScope,
+        root_message_id: admission.rootMessageId,
+        thread_id: admission.threadId,
+      }),
+    },
+  );
+  await ensureApiOk(response, "approve workflow proposal", options);
+  const value: unknown = await response.json();
+  if (!isApprovalResponse(value, fingerprint)) {
+    throw new SessionApiError({
+      action: "approve workflow proposal",
+      body: "invalid success response",
+      retryable: false,
+      status: 502,
+      statusText: "Bad Gateway",
+    });
+  }
+  return value;
 }
 
 async function ensureApiOk(
@@ -520,10 +621,37 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: "messages" | "execute" | "events",
+  suffix?: "messages" | "execute" | "events" | "interrupt",
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ""}`;
   return new URL(path, ensureTrailingSlash(apiUrl)).toString();
+}
+
+function apiWorkflowProposalApprovalUrl(
+  apiUrl: string,
+  fingerprint: string,
+): string {
+  const path = `/api/workflows/proposals/${encodeURIComponent(fingerprint)}/approve`;
+  return new URL(path, ensureTrailingSlash(apiUrl)).toString();
+}
+
+function isApprovalResponse(
+  value: unknown,
+  fingerprint: string,
+): value is DiscordbotApproveProposalResponse {
+  if (!isJsonObject(value)) return false;
+  return (
+    value.ok === true &&
+    value.fingerprint === fingerprint &&
+    typeof value.created === "boolean" &&
+    typeof value.action_run_id === "string" &&
+    value.action_run_id.length > 0 &&
+    typeof value.action_task_id === "string" &&
+    value.action_task_id.length > 0 &&
+    typeof value.action_workflow === "string" &&
+    value.action_workflow.length > 0 &&
+    (value.console_url === undefined || typeof value.console_url === "string")
+  );
 }
 
 function ensureTrailingSlash(value: string): string {
@@ -540,12 +668,13 @@ function apiHeaders(options: DiscordbotOptions, jsonBody = true): HeadersInit {
 
 function toSessionMessage(
   message: DiscordbotApiMessage,
+  policy: DiscordExecutionPolicy,
 ): DiscordbotSessionMessage {
   return {
     client_message_id: message.id,
     role: message.author.isMe ? "assistant" : "user",
     parts: sessionMessageParts(message),
-    metadata: sessionMetadata(message),
+    metadata: sessionMetadata(message, policy),
   };
 }
 
@@ -580,6 +709,7 @@ function sessionAttachmentPart(attachment: DiscordbotApiAttachment): JsonObject 
 
 function sessionMetadata(
   message: DiscordbotApiMessage,
+  policy: DiscordExecutionPolicy,
   extra: JsonObject = {},
 ): JsonObject {
   return {
@@ -591,7 +721,23 @@ function sessionMetadata(
     timestamp: message.timestamp,
     user_id: message.author.userId,
     user_name: message.author.userName,
+    ...policyMetadata(policy),
     ...extra,
+  };
+}
+
+function policyMetadata(policy: DiscordExecutionPolicy): JsonObject {
+  return {
+    discord_actor_user_id: policy.actorId,
+    discord_capability_class: policy.capabilityClass,
+    discord_channel_id: policy.channelId,
+    discord_guild_id: policy.guildId,
+    discord_policy_fingerprint: policy.policyFingerprint,
+    discord_policy_role_foreign_ids: [policy.principalRole],
+    discord_project_scope: policy.projectScope,
+    discord_repository_scope: policy.repositoryScope,
+    discord_root_message_id: policy.rootMessageId,
+    discord_thread_id: policy.threadId,
   };
 }
 
@@ -604,12 +750,18 @@ function sessionMetadata(
 export function toCodexInputLines(
   message: DiscordbotApiMessage,
   threadId: string,
+  policy: DiscordExecutionPolicy,
 ): string[] {
   const staged = new Map<DiscordbotApiAttachment, string>();
   const lines: string[] = [];
   for (const attachment of message.attachments) {
     if (!attachment.dataBase64) continue;
-    const inlineLine = toCodexInputLineWithStaged(message, threadId, staged);
+    const inlineLine = toCodexInputLineWithStaged(
+      message,
+      threadId,
+      policy,
+      staged,
+    );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
       attachment.dataBase64.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -620,19 +772,20 @@ export function toCodexInputLines(
     staged.set(attachment, stagedAttachmentId);
     lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
   }
-  lines.push(toCodexInputLineWithStaged(message, threadId, staged));
+  lines.push(toCodexInputLineWithStaged(message, threadId, policy, staged));
   return lines;
 }
 
 function toCodexInputLineWithStaged(
   message: DiscordbotApiMessage,
   threadId: string,
+  policy: DiscordExecutionPolicy,
   staged: Map<DiscordbotApiAttachment, string>,
 ): string {
   return JSON.stringify({
     type: "user",
     thread_key: threadId,
-    trace_metadata: sessionMetadata(message, { action: "execute" }),
+    trace_metadata: sessionMetadata(message, policy, { action: "execute" }),
     message: {
       role: "user",
       content: codexInputContent(message, staged),

@@ -328,13 +328,16 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # non-deliverable winner never suppresses a credential that would otherwise
   # serve.
   def self.served_credentials_for(principal, extra_static: [])
-    static = principal.granted_static_secrets.select { |ss| ss.source&.deliverable? }
+    static = filter_discord_github_policy_credentials(
+      principal,
+      principal.granted_static_secrets.select { |secret| secret.source&.deliverable? }
+    )
     static = merge_static_credentials(static, extra_static) if extra_static.any?
-    gcp_auth = principal.granted_gcp_auth_secrets.to_a
-    gcp_id_token = principal.granted_gcp_id_token_secrets.to_a
-    aws_auth = principal.granted_aws_auth_secrets.to_a
-    hmac = principal.granted_hmac_secrets.to_a
-    oauth = principal.granted_oauth_token_secrets.to_a
+    gcp_auth = filter_discord_github_policy_credentials(principal, principal.granted_gcp_auth_secrets.to_a)
+    gcp_id_token = filter_discord_github_policy_credentials(principal, principal.granted_gcp_id_token_secrets.to_a)
+    aws_auth = filter_discord_github_policy_credentials(principal, principal.granted_aws_auth_secrets.to_a)
+    hmac = filter_discord_github_policy_credentials(principal, principal.granted_hmac_secrets.to_a)
+    oauth = filter_discord_github_policy_credentials(principal, principal.granted_oauth_token_secrets.to_a)
 
     suppressed = suppressed_conflict_credentials(static + gcp_auth + gcp_id_token + aws_auth + hmac + oauth)
 
@@ -348,6 +351,18 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     }
   end
   private_class_method :served_credentials_for
+
+  def self.filter_discord_github_policy_credentials(principal, credentials)
+    credentials.select do |credential|
+      next true if DiscordGithubRolePolicy.credential_allowed_for_principal?(principal, credential)
+
+      Rails.logger.warn do
+        "discord_github_policy_credential_denied principal=#{principal.oid} credential_type=#{credential.class.name} credential=#{credential.oid}"
+      end
+      false
+    end
+  end
+  private_class_method :filter_discord_github_policy_credentials
 
   # A secret reachable from both principals collapses to one row taking the
   # strongest priority (matching granted_secrets_by_priority's MAX), and the

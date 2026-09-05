@@ -25,6 +25,7 @@ class Principal < ApplicationRecord
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
   after_create_commit :enqueue_slack_channel_catalog_refresh, if: :slack_channel_catalog_refreshable?
   after_create :assign_default_roles, if: :roles_blank_for_defaulting?
+  before_validation :preserve_discord_actor_policy_marker
   before_validation :apply_sandbox_repo_cache_label
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
@@ -32,9 +33,11 @@ class Principal < ApplicationRecord
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
   SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
   SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
+  DISCORD_ACTOR_FOREIGN_ID_PREFIX = "discord-user-".freeze
+  DISCORD_POLICY_MANAGED_LABEL = "centaur_discord_policy_managed".freeze
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
-    unknown user console_user workflow slack_channel slack_dm discord_channel linear_issue
+    unknown user console_user workflow slack_channel slack_dm discord_channel discord_user linear_issue
     teams_user teams_conversation
   ].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
@@ -54,6 +57,7 @@ class Principal < ApplicationRecord
                             allow_nil: true, if: :will_save_change_to_slack_team_id?
   validates :slack_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
                           allow_nil: true, if: :will_save_change_to_slack_email?
+  validate :discord_actor_kind_is_immutable
 
   # Stand-in for an inline secret value in redacted config: operator inspection
   # reports that a control_plane source carries a value without revealing it.
@@ -148,6 +152,21 @@ class Principal < ApplicationRecord
     end
   end
 
+  # Replace the complete role and sandbox-capability tuple while holding the
+  # principal row lock. Concurrent policy refreshes therefore commit as one
+  # ordered state rather than interleaving into a union of privileged roles.
+  def replace_roles_and_sandbox_policy!(roles:, **capabilities)
+    desired_roles = Array(roles).uniq(&:id)
+    with_lock do
+      update!(capabilities)
+      desired_ids = desired_roles.map(&:id)
+      principal_roles.where.not(role_id: desired_ids).destroy_all
+      desired_roles.each { |role| principal_roles.find_or_create_by!(role:) }
+    end
+    self.roles.reset
+    desired_roles
+  end
+
   # Slackbot only sends a DM partner's email when that user belongs to the
   # bot's home workspace. Treat an explicitly supplied email as a trusted
   # bridge to the corresponding Console account. This is called from the API
@@ -164,6 +183,13 @@ class Principal < ApplicationRecord
     labels.to_h.merge(
       SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache
     )
+  end
+
+  # Actor IDs are created from immutable Discord guild/user IDs by api-rs. Keep
+  # this identity predicate independent of mutable labels so an API label update
+  # cannot turn an admitted actor into an ordinary grantable principal.
+  def discord_actor_principal?
+    foreign_id.to_s.start_with?(DISCORD_ACTOR_FOREIGN_ID_PREFIX)
   end
 
   def effective_slack_channel_permissions_payload
@@ -266,7 +292,11 @@ class Principal < ApplicationRecord
   end
 
   def roles_blank_for_defaulting?
-    association(:roles).target.empty? && !roles.exists?
+    # Actor-scoped Discord principals are always populated by the reviewed
+    # policy replacement path. They must not transiently inherit a default role
+    # before that replacement validates their exact GitHub App scope.
+    !discord_actor_principal? &&
+      association(:roles).target.empty? && !roles.exists?
   end
 
   def assign_default_roles
@@ -284,6 +314,18 @@ class Principal < ApplicationRecord
 
   def apply_sandbox_repo_cache_label
     self[:labels] = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache)
+  end
+
+  def discord_actor_kind_is_immutable
+    return unless discord_actor_principal?
+
+    errors.add(:kind, "must be discord_user for a Discord actor principal") unless kind == "discord_user"
+  end
+
+  def preserve_discord_actor_policy_marker
+    return unless discord_actor_principal?
+
+    self[:labels] = labels.to_h.merge(DISCORD_POLICY_MANAGED_LABEL => "true")
   end
 
   def supplied_key?(attributes, key)
