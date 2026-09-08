@@ -274,7 +274,9 @@ export function assessReviewChange(input: {
 }
 
 function isFormattingOnly(file: ReviewChangeFile): boolean {
-  if (!file.patch) return fileChanges(file) === 0;
+  // GitHub omits patches for binaries and some oversized diffs. Absence of a
+  // textual patch is never evidence that a reported file change was cosmetic.
+  if (!file.patch) return false;
   const blocks: Array<{ added: string[]; removed: string[] }> = [];
   let block = { added: [] as string[], removed: [] as string[] };
   const flush = () => {

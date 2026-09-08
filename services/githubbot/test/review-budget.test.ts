@@ -151,6 +151,22 @@ describe("assessReviewChange", () => {
     ).toMatchObject({ changeClass: "new_risk", kind: "material" });
   });
 
+  test("treats a patchless zero-line runtime file as a semantic change", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            additions: 0,
+            deletions: 0,
+            filename: "src/model.bin",
+            status: "modified",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
   test("keeps a tree-identical rebase in the current epoch", () => {
     expect(
       assessReviewChange({
