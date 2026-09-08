@@ -1683,26 +1683,6 @@ async function admitReviewResponse(
       state,
     };
   }
-  if (findings.length > 0 && mergedFindings.newFindings.length === 0) {
-    traceLog(
-      ctx.options,
-      "githubbot_review_findings_already_known",
-      makeTrace(
-        managementThreadKey(owner, repo, pr.number),
-        `review-findings-${headSha}`,
-      ),
-      { finding_count: findings.length, head_sha: headSha },
-    );
-    const state = {
-      ...(loaded.state as ReviewEpochState),
-      lastReviewedHeadSha: headSha,
-    };
-    await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
-    return {
-      decision: "skip",
-      state,
-    };
-  }
   const approval = await pendingReviewResetApproval(
     ctx,
     owner,
@@ -1731,6 +1711,20 @@ async function admitReviewResponse(
     }
   }
 
+  const findingsAlreadyKnown =
+    findings.length > 0 && mergedFindings.newFindings.length === 0;
+  if (findingsAlreadyKnown) {
+    traceLog(
+      ctx.options,
+      "githubbot_review_findings_already_known",
+      makeTrace(
+        managementThreadKey(owner, repo, pr.number),
+        `review-findings-${headSha}`,
+      ),
+      { finding_count: findings.length, head_sha: headSha },
+    );
+  }
+
   const admission = decideReviewAdmission({
     actor: evidence?.actor ?? "unknown",
     assessment: evidence?.assessment,
@@ -1754,14 +1748,27 @@ async function admitReviewResponse(
           finding.fingerprint,
         ),
     )?.fingerprint,
-    startsRepairTurn: true,
+    startsRepairTurn: !findingsAlreadyKnown,
     state: loaded.state,
   });
-  const state = {
+  let state = {
     ...admission.state,
     findingLedger: mergedFindings.ledger,
     ...(approval ? { consumedResetApprovalId: approval.approvalId } : {}),
   };
+  // A repeated decided finding still has to classify the head transition and
+  // consume an authorized reset, but it must not spend another reviewer or
+  // aggregate repair round. A genuinely new human-risk epoch begins at zero;
+  // its first new-finding review will consume round one.
+  if (findingsAlreadyKnown && admission.decision === "allow" && loaded.state) {
+    state = {
+      ...state,
+      reviewerRoundsUsed: admission.resetEpoch
+        ? {}
+        : loaded.state.reviewerRoundsUsed,
+      roundsUsed: admission.resetEpoch ? 0 : loaded.state.roundsUsed,
+    };
+  }
   await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
   if (admission.decision === "allow" && manualReset) {
     await cleanupReviewResetApproval(ctx, owner, repo, pr, true);
@@ -1789,6 +1796,9 @@ async function admitReviewResponse(
       rounds_used: state.roundsUsed,
     },
   );
+  if (findingsAlreadyKnown && admission.decision === "allow") {
+    return { decision: "skip", state };
+  }
   return { ...admission, newFindings: mergedFindings.newFindings, state };
 }
 

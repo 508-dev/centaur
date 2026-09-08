@@ -729,6 +729,7 @@ describe("bounded review epochs", () => {
       path: "src/policy.ts",
     };
     const ctx = budgetCtx({
+      actor: "human",
       reviewFindings: {
         40: [{ ...sharedFinding, id: 400 }],
         41: [{ ...sharedFinding, id: 410, line: 25 }],
@@ -783,8 +784,9 @@ describe("bounded review epochs", () => {
           dispositionCommentId: 401,
         },
       },
-      reviewerRoundsUsed: { "github-user:101": 1 },
-      roundsUsed: 1,
+      epoch: 2,
+      reviewerRoundsUsed: {},
+      roundsUsed: 0,
       lastReviewedHeadSha: "head-2",
     });
   });
