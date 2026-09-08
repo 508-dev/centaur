@@ -35,6 +35,7 @@ class Grant < ApplicationRecord
 
   validate :exactly_one_grantee
   validate :exactly_one_grantable
+  validate :discord_github_policy_valid
   validates :priority, presence: true, numericality: { only_integer: true }
 
   # The grantee this grant attaches the secret to: a principal or a role.
@@ -75,5 +76,9 @@ class Grant < ApplicationRecord
     set = GRANTABLE_ASSOCIATIONS.count { |assoc| send(assoc).present? }
     return if set == 1
     errors.add(:base, "must reference exactly one of #{GRANTABLE_ASSOCIATIONS.join(", ")}")
+  end
+
+  def discord_github_policy_valid
+    DiscordGithubRolePolicy.validate_grant(self)
   end
 end

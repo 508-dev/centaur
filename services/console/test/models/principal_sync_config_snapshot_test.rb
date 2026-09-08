@@ -750,6 +750,29 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     assert_equal baseline.fetch("postgres"), config.fetch("postgres")
   end
 
+  test "a requester cannot hoist a wrapper outside a managed Discord actor role" do
+    role = Role.create!(
+      foreign_id: "discord-policy-#{SecureRandom.hex(4)}",
+      labels: {
+        "centaur_discord_policy_managed" => "true",
+        "repository_scope" => "508-dev/centaur"
+      },
+      created_by: users(:acme_admin)
+    )
+    actor = Principal.create!(
+      foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
+      kind: "discord_user",
+      labels: { "centaur_discord_policy_managed" => "true" },
+      created_by: users(:acme_admin)
+    )
+    PrincipalRole.create!(principal: actor, role: role)
+    requester = build_requester
+    build_hoistable_wrapper(granted_to: requester, host: "github.com")
+    proxy = Proxy.create!(name: "discord-requester-union", principal: actor, requester_principal: requester)
+
+    assert_empty proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
+  end
+
   test "a wrapper whose oauth app is not always_available does not hoist" do
     requester = build_requester
     build_hoistable_wrapper(granted_to: requester, host: "github.com", always_available: false)

@@ -46,6 +46,34 @@ module CredentialProfiles
       assert secret.valid?, secret.errors.full_messages.inspect
     end
 
+    test "accepts method and path constraints inside canonical GitHub hosts" do
+      secret = StaticSecret.new(kind: "github_token")
+      constrained_rules = [
+        RequestRule.new(
+          host: "api.github.com",
+          http_methods: [ "GET" ],
+          paths: [ "/repos/example/project", "/repos/example/project/*" ],
+          position: 0
+        ),
+        RequestRule.new(
+          host: "api.github.com",
+          http_methods: [ "POST" ],
+          paths: [ "/repos/example/project/pulls" ],
+          position: 1
+        ),
+        RequestRule.new(
+          host: "github.com",
+          http_methods: [ "GET", "POST" ],
+          paths: [ "/example/project.git/*" ],
+          position: 2
+        )
+      ]
+
+      secret.rules = secret.apply_kind_defaults(rules: constrained_rules)
+
+      assert secret.valid?, secret.errors.full_messages.inspect
+    end
+
     test "normalizes an omitted false require flag" do
       secret = StaticSecret.new(
         kind: "github_token",

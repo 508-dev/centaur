@@ -93,6 +93,10 @@ pub struct HttpSecret {
     pub secret_ref: String,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
+    /// Optional iron-proxy request-method allowlist. Empty means any method.
+    pub http_methods: Vec<String>,
+    /// Optional iron-proxy path globs. Empty means any path on an allowed host.
+    pub paths: Vec<String>,
     // replace mode
     pub replacer: String,
     pub match_headers: Vec<String>,
@@ -428,6 +432,8 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             secret_ref: s.to_owned(),
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: vec![],
+            paths: vec![],
             replacer: s.to_owned(),
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -510,6 +516,19 @@ fn parse_http(
              unscoped in iron-proxy"
         ),
     };
+    let http_methods = strict_str_array(table, name, "http_methods")?;
+    if http_methods.iter().any(|method| {
+        !matches!(
+            method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "*"
+        )
+    }) {
+        bail!("HTTP secret {name:?} 'http_methods' contains an unsupported method");
+    }
+    let paths = strict_str_array(table, name, "paths")?;
+    if paths.iter().any(|path| !path.starts_with('/')) {
+        bail!("HTTP secret {name:?} 'paths' entries must start with '/'");
+    }
 
     match mode {
         SecretMode::Replace => {
@@ -538,6 +557,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -574,6 +595,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: vec![],
                 match_path: false,
@@ -1049,6 +1072,30 @@ fn str_array(value: Option<&Value>) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect(),
     )
+}
+
+/// A string array for security-sensitive HTTP request scope fields. Unlike the
+/// legacy permissive parser above, a present malformed value fails closed.
+fn strict_str_array(table: &toml::Table, name: &str, key: &str) -> Result<Vec<String>> {
+    let Some(value) = table.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("HTTP secret {name:?} {key:?} must be an array of non-empty strings");
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
+                })
+        })
+        .collect()
 }
 
 /// A non-empty array of non-empty strings, or `None` if absent/invalid.

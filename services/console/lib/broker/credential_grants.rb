@@ -141,6 +141,7 @@ module Broker
         result = credential.github_app_installation_client.refresh(
           client_id: credential.effective_client_id,
           installation_id: credential.github_installation_id,
+          repositories: credential.github_repositories,
           timeout: credential.refresh_timeout_seconds
         )
         success(result)

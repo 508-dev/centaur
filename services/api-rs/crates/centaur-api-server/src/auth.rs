@@ -24,18 +24,20 @@ pub(crate) enum Capability {
     WorkflowsRead,
     WorkflowsWrite,
     WorkflowsEvents,
+    WorkflowApprovals,
     AdminArchive,
     AdminSync,
 }
 
 impl Capability {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::SessionsRead,
         Self::SessionsWrite,
         Self::SandboxesDrain,
         Self::WorkflowsRead,
         Self::WorkflowsWrite,
         Self::WorkflowsEvents,
+        Self::WorkflowApprovals,
         Self::AdminArchive,
         Self::AdminSync,
     ];
@@ -131,6 +133,9 @@ impl ApiAuthConfig {
             if spec.workflow_events {
                 capabilities.push(Capability::WorkflowsEvents);
             }
+            if spec.workflow_approvals {
+                capabilities.push(Capability::WorkflowApprovals);
+            }
             callers.push(static_caller(
                 spec.identity,
                 CallerClass::Ingress,
@@ -173,6 +178,30 @@ impl ApiAuthConfig {
                 Capability::WorkflowsEvents,
             ],
             Some(&["slack:"]),
+        )];
+        Self {
+            static_callers: Arc::new(callers),
+            jwt_secret: Arc::from(jwt_secret.into()),
+            jwt_audience: Arc::from(DEFAULT_API_JWT_AUDIENCE),
+            jwt_issuer: Arc::from(DEFAULT_API_JWT_ISSUER),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_with_discord_ingress(
+        discord_key: impl Into<String>,
+        jwt_secret: impl Into<String>,
+    ) -> Self {
+        let callers = vec![static_caller(
+            "discordbot",
+            CallerClass::Ingress,
+            discord_key.into(),
+            [
+                Capability::SessionsRead,
+                Capability::SessionsWrite,
+                Capability::WorkflowApprovals,
+            ],
+            Some(&["discord:"]),
         )];
         Self {
             static_callers: Arc::new(callers),
@@ -296,12 +325,14 @@ const INGRESS_SPECS: &[IngressSpec] = &[
         identity: "slackbot",
         platform_prefixes: &["slack:"],
         workflow_events: true,
+        workflow_approvals: false,
     },
     IngressSpec {
         env_var: "DISCORDBOT_API_KEY",
         identity: "discordbot",
         platform_prefixes: &["discord:"],
         workflow_events: false,
+        workflow_approvals: true,
     },
     IngressSpec {
         env_var: "GITHUBBOT_API_KEY",
@@ -313,18 +344,21 @@ const INGRESS_SPECS: &[IngressSpec] = &[
             "github-review:",
         ],
         workflow_events: true,
+        workflow_approvals: false,
     },
     IngressSpec {
         env_var: "LINEARBOT_API_KEY",
         identity: "linearbot",
         platform_prefixes: &["linear:"],
         workflow_events: false,
+        workflow_approvals: false,
     },
     IngressSpec {
         env_var: "TEAMSBOT_API_KEY",
         identity: "teamsbot",
         platform_prefixes: &["teams:"],
         workflow_events: false,
+        workflow_approvals: false,
     },
 ];
 
@@ -334,6 +368,7 @@ struct IngressSpec {
     /// Every session thread-key prefix this ingress mints.
     platform_prefixes: &'static [&'static str],
     workflow_events: bool,
+    workflow_approvals: bool,
 }
 
 fn static_caller(
@@ -442,6 +477,22 @@ mod tests {
         );
         assert_eq!(caller.platform_prefixes(), None);
         assert_eq!(caller.principal_subject(), None);
+    }
+
+    #[test]
+    fn discord_ingress_has_proposal_approval_without_general_workflow_control() {
+        let auth = ApiAuthConfig::testing_with_discord_ingress("discord-key", "jwt-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer discord-key".parse().unwrap());
+
+        let caller = auth.authenticate(&headers).unwrap();
+
+        assert_eq!(caller.class(), CallerClass::Ingress);
+        assert_eq!(caller.identity(), "discordbot");
+        assert!(caller.has_capability(Capability::WorkflowApprovals));
+        assert!(!caller.has_capability(Capability::WorkflowsRead));
+        assert!(!caller.has_capability(Capability::WorkflowsWrite));
+        assert!(!caller.has_capability(Capability::WorkflowsEvents));
     }
 
     #[test]

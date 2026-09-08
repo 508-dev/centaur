@@ -548,6 +548,24 @@ module Api
         assert_not json_body.dig("data", "labels").key?("slack_channel_id")
       end
 
+      test "PUT preserves the Discord actor policy marker when replacing labels" do
+        principal = Principal.create!(
+          foreign_id: "discord-user-1336096360772141148-100000000000000001",
+          kind: "discord_user",
+          labels: { "centaur_discord_policy_managed" => "true" },
+          created_by: users(:acme_admin)
+        )
+
+        put api_v1_principal_url(id: principal.oid),
+            params: { data: { labels: { "operator-note" => "reviewed" } } }.to_json,
+            headers: auth_headers
+
+        assert_response :ok
+        assert_equal "reviewed", principal.reload.labels["operator-note"]
+        assert_equal "true", principal.labels["centaur_discord_policy_managed"]
+        assert_equal "true", json_body.dig("data", "labels", "centaur_discord_policy_managed")
+      end
+
       test "PUT preserves a label named namespace" do
         principal = principals(:acme_channel)
 
