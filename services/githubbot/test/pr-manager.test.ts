@@ -10,6 +10,7 @@ import {
   isOwnedPr,
   type PrManagerContext,
 } from "../src/pr-manager";
+import { fingerprintReviewFinding } from "../src/review-findings";
 import { emitWorkflowEvent } from "../src/session-api";
 import {
   evaluateCi,
@@ -538,6 +539,7 @@ describe("bounded review epochs", () => {
     headSha?: string;
     merges?: { count: number };
     maxRoundsPerEpoch?: number;
+    maxSecurityInterruptsPerPr?: number;
     maxTotalRoundsPerEpoch?: number;
     permission?: string;
     removedLabels?: string[];
@@ -645,6 +647,8 @@ describe("bounded review epochs", () => {
         fetch: () => Promise.resolve(new Response("no", { status: 400 })),
         logger: quietLogger,
         reviewMaxRoundsPerEpoch: input?.maxRoundsPerEpoch,
+        reviewMaxSecurityInterruptsPerPr:
+          input?.maxSecurityInterruptsPerPr,
         reviewMaxTotalRoundsPerEpoch: input?.maxTotalRoundsPerEpoch,
         reviewAuthorAllowlist: input?.reviewAuthorAllowlist,
       },
@@ -924,6 +928,47 @@ describe("bounded review epochs", () => {
     });
   });
 
+  test("keeps a body-only finding pending without exact repaired-path evidence", async () => {
+    const state = makeState();
+    let fingerprint = "";
+    const ctx = budgetCtx({
+      comparisonCommitMessage: () =>
+        `fix review\n\nCentaur-Automation: true\nCentaur-Review-Finding: ${fingerprint}`,
+      reviewFindings: {
+        45: [{ body: "A body-only finding without a file path.", id: 0 }],
+      },
+      state,
+    });
+    await handleReviewEvent(ctx, submittedReview(45, "head-1"));
+    const initial = (await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    )) as { findingLedger: Record<string, { disposition: string }> };
+    fingerprint = Object.keys(initial.findingLedger)[0] ?? "";
+    if (!fingerprint) throw new Error("missing finding fingerprint");
+    setHeadSha(ctx, "head-2");
+
+    await handleReviewFindingDispositionComment(
+      ctx,
+      JSON.stringify({
+        action: "created",
+        comment: {
+          body: `<!-- centaur-review-finding ${fingerprint} review:45 accepted -->`,
+          id: 451,
+          user: { login: "centaur-bot" },
+        },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+      }),
+    );
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      findingLedger: { [fingerprint]: { disposition: "pending" } },
+    });
+  });
+
   test("admits the final review round but pauses merge before its descendant", async () => {
     const comments: string[] = [];
     const merges = { count: 0 };
@@ -960,6 +1005,67 @@ describe("bounded review epochs", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("round_budget_exhausted");
     expect(comments[0]).toContain("centaur-review-reset");
+  });
+
+  test("selects a new severe finding when an earlier interrupt was consumed", async () => {
+    const oldBody =
+      "Centaur-Severity: security\nImpact: old boundary remains exposed\nEvidence: exact old call site is shown";
+    const newBody =
+      "Centaur-Severity: security\nImpact: new boundary permits widening\nEvidence: exact new call site is shown";
+    const oldPath = "src/old-policy.ts";
+    const newPath = "src/new-policy.ts";
+    const oldFingerprint = fingerprintReviewFinding({
+      body: oldBody,
+      path: oldPath,
+    });
+    const newFingerprint = fingerprintReviewFinding({
+      body: newBody,
+      path: newPath,
+    });
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      epoch: 1,
+      findingLedger: {
+        [oldFingerprint]: {
+          commentId: 460,
+          disposition: "pending",
+          firstSeenEpoch: 1,
+          path: oldPath,
+          reviewId: 45,
+          reviewedHeadSha: "head-1",
+          reviewerKey: "github-user:101",
+          severity: "security",
+        },
+      },
+      lastReviewedHeadSha: "head-1",
+      pausedHeadSha: "head-1",
+      pauseReason: "reviewer_round_budget_exhausted",
+      reviewerRoundsUsed: { "github-user:101": 1 },
+      roundsUsed: 1,
+      securityInterruptFingerprints: [oldFingerprint],
+      version: 1,
+    });
+    const ctx = budgetCtx({
+      maxRoundsPerEpoch: 1,
+      maxSecurityInterruptsPerPr: 2,
+      reviewFindings: {
+        46: [
+          { body: oldBody, diff_hunk: "+old();", id: 460, line: 20, path: oldPath },
+          { body: newBody, diff_hunk: "+new();", id: 461, line: 30, path: newPath },
+        ],
+      },
+      state,
+    });
+
+    await handleReviewEvent(ctx, submittedReview(46, "head-1"));
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      roundsUsed: 2,
+      securityInterruptFingerprints: [oldFingerprint, newFingerprint],
+    });
   });
 
   test("stores an active handoff pause without expiration", async () => {
@@ -1660,6 +1766,36 @@ describe("bounded review epochs", () => {
       ),
     ).toBeUndefined();
     expect(removedLabels).toEqual(["centaur-review-reset"]);
+  });
+
+  test("round-trips a capacity pause so an authorized reset can recover it", async () => {
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-4",
+      pausedHeadSha: "head-4",
+      pauseReason: "finding_ledger_capacity_exhausted",
+      roundsUsed: 1,
+      version: 1,
+    });
+    const ctx = budgetCtx({ headSha: "head-4", state });
+
+    await handlePullRequestEvent(
+      ctx,
+      JSON.stringify({
+        action: "labeled",
+        label: { name: "centaur-review-reset" },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+        sender: { login: "alice", type: "User" },
+      }),
+      "capacity-reset",
+    );
+
+    expect(
+      await state.get("centaur-githubbot:review-reset:base/repo#7:head-4"),
+    ).toMatchObject({ approvalId: "capacity-reset" });
   });
 
   test("retries consumed reset-label removal before deleting approval", async () => {

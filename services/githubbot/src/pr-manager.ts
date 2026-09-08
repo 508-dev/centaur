@@ -287,6 +287,7 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
         "change_actor_unknown",
         "change_significance_unknown",
         "epoch_budget_exhausted",
+        "finding_ledger_capacity_exhausted",
         "reviewer_round_budget_exhausted",
         "round_budget_exhausted",
       ].includes(candidate.pauseReason)) &&
@@ -1084,7 +1085,15 @@ async function hasAcceptedFindingRepairEvidence(
   fingerprint: string,
   findingPath?: string,
 ): Promise<boolean> {
-  if (!currentHeadSha || currentHeadSha === reviewedHeadSha) return false;
+  // A body-only finding has no deterministic affected path. A commit trailer
+  // alone cannot prove that the finding was repaired, so keep it pending.
+  if (
+    !findingPath ||
+    !currentHeadSha ||
+    currentHeadSha === reviewedHeadSha
+  ) {
+    return false;
+  }
   try {
     const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
       basehead: `${reviewedHeadSha}...${currentHeadSha}`,
@@ -1101,14 +1110,12 @@ async function hasAcceptedFindingRepairEvidence(
     // The compare API caps this array at 300 files. Exactly 300 is therefore
     // ambiguous and cannot prove an exact path was included.
     if (!files || files.length === 0 || files.length >= 300) return false;
-    const changedFindingPath = findingPath
-      ? files.some(
-          (file) =>
-            file.filename === findingPath ||
-            ("previous_filename" in file &&
-              file.previous_filename === findingPath),
-        )
-      : true;
+    const changedFindingPath = files.some(
+      (file) =>
+        file.filename === findingPath ||
+        ("previous_filename" in file &&
+          file.previous_filename === findingPath),
+    );
     return (
       changedFindingPath &&
       findingFingerprintsFromCommits(commits).has(fingerprint)
@@ -1741,7 +1748,11 @@ async function admitReviewResponse(
       DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
     reviewerKey,
     securityInterruptFingerprint: mergedFindings.newFindings.find(
-      (finding) => finding.severity === "p0" || finding.severity === "security",
+      (finding) =>
+        (finding.severity === "p0" || finding.severity === "security") &&
+        !loaded.state?.securityInterruptFingerprints?.includes(
+          finding.fingerprint,
+        ),
     )?.fingerprint,
     startsRepairTurn: true,
     state: loaded.state,
