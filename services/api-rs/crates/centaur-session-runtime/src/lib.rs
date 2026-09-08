@@ -5940,13 +5940,11 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
                 reason: "turn_interrupted",
             }
         }
-        Some("interrupted" | "cancelled" | "canceled") => {
-            completed_terminal_output_with_fallback(
-                value,
-                "turn_completed",
-                prior_final_answer_text,
-            )
-        }
+        Some("interrupted" | "cancelled" | "canceled") => completed_terminal_output_with_fallback(
+            value,
+            "turn_completed",
+            prior_final_answer_text,
+        ),
         Some(status) => TerminalOutput::Failed {
             // An adapter can emit its API/auth error as a final-answer item
             // before settling the turn. Text is not evidence of success: the
