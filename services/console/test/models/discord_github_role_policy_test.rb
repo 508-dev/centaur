@@ -275,6 +275,31 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     assert_not principal.sandbox_workflows_write_enabled
   end
 
+  test "first registration locks its reviewed role through policy persistence" do
+    _assigned, role, _secret, _credential = build_policy_binding
+    principal = Principal.create!(
+      foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
+      kind: "discord_user",
+      labels: { "centaur_discord_policy_managed" => "true" },
+      created_by: users(:acme_admin)
+    )
+    role_lock_queries = []
+    callback = lambda do |_name, _start, _finish, _id, payload|
+      sql = payload[:sql]
+      role_lock_queries << sql if sql.match?(/FROM [\"]roles[\"].*FOR UPDATE/)
+    end
+
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+      principal.replace_roles_and_sandbox_policy!(
+        roles: [ role ],
+        **DiscordGithubRolePolicy.sandbox_policy_for_role(role)
+      )
+    end
+
+    assert_equal 1, role_lock_queries.length
+    assert_equal [ role.id ], principal.reload.role_ids
+  end
+
   test "deleting a Discord actor role assignment revokes persisted capabilities" do
     principal, role, _secret, _credential = build_policy_binding
     previous_version = principal.sync_config_cache_version

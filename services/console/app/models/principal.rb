@@ -163,11 +163,12 @@ class Principal < ApplicationRecord
       with_lock do
         if discord_actor_principal?
           # A caller may have loaded this role before an operator changed its
-          # policy. Re-read it only after taking the same principal lock used
-          # by role reconciliation, so a stale registration cannot restore an
-          # older, more privileged capability tuple.
+          # policy. Re-read and lock it after taking the same principal lock
+          # used by role reconciliation. The role lock then spans assignment
+          # creation and capability persistence, so a first registration
+          # cannot race a role downgrade that saw no assignment yet.
           desired_ids = desired_roles.map(&:id)
-          desired_roles = Role.where(id: desired_ids).order(:id).to_a
+          desired_roles = Role.where(id: desired_ids).order(:id).lock.to_a
           reviewed_policy = desired_ids.one? && desired_roles.one? &&
             DiscordGithubRolePolicy.sandbox_policy_for_role(desired_roles.first)
           unless reviewed_policy && capabilities == reviewed_policy
