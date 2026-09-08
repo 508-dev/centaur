@@ -1537,9 +1537,10 @@ async function collectReviewFindings(
     }
   }
 
-  // GitHub reviews may carry one body-only finding and no inline comments.
-  // Do not fingerprint a summary body in addition to its inline findings: that
-  // would create a fresh pseudo-finding whenever a reviewer rewrites a summary.
+  // GitHub reviews may carry one body-only finding and no inline comments. A
+  // changes-requested body can also identify a distinct blocking finding, so
+  // retain it alongside inline findings; ordinary review summaries remain
+  // excluded to avoid creating a pseudo-finding when their wording changes.
   if (findings.length === 0 || reviewState === "changes_requested") {
     const body = stringValue(reviewNode.body)?.trim();
     if (body) {
