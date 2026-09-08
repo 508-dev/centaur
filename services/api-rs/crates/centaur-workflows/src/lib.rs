@@ -50,6 +50,7 @@ pub const WORKFLOW_ETL_BACKFILL_QUEUE: &str = "centaur_workflows_etl_backfill";
 pub const WORKFLOW_SCHEDULE_QUEUE: &str = "centaur_workflow_schedules";
 pub const WORKFLOW_TASK: &str = "centaur.workflow";
 pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
+const APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX: &str = "approved-proposal:";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
@@ -844,6 +845,30 @@ impl WorkflowRuntime {
     }
 
     pub async fn create_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        ensure_unreserved_workflow_idempotency_key(request.idempotency_key.as_deref())?;
+        self.spawn_workflow_run(request).await
+    }
+
+    async fn create_approved_action_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        if !request
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX))
+        {
+            return Err(WorkflowRuntimeError::Internal(
+                "approved action run is missing its reserved idempotency key".to_owned(),
+            ));
+        }
+        self.spawn_workflow_run(request).await
+    }
+
+    async fn spawn_workflow_run(
         &self,
         request: CreateWorkflowRunRequest,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
@@ -3544,6 +3569,7 @@ async fn start_python_child_workflow(
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(ToOwned::to_owned);
+    ensure_unreserved_workflow_idempotency_key(idempotency_key.as_deref())?;
     let target_client = match workflow_queue_class(workflow_name) {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
@@ -4552,6 +4578,17 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
     })
 }
 
+fn ensure_unreserved_workflow_idempotency_key(
+    idempotency_key: Option<&str>,
+) -> Result<(), WorkflowRuntimeError> {
+    if idempotency_key.is_some_and(|key| key.starts_with(APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX)) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "workflow idempotency key uses a reserved approval namespace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn absurd_error(error: WorkflowRuntimeError) -> absurd::Error {
     match error {
         WorkflowRuntimeError::Suspend => absurd::Error::Suspend,
@@ -4605,6 +4642,21 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn generic_workflow_runs_cannot_claim_approval_idempotency_keys() {
+        assert!(ensure_unreserved_workflow_idempotency_key(None).is_ok());
+        assert!(ensure_unreserved_workflow_idempotency_key(Some("ordinary-run:1")).is_ok());
+        assert!(
+            ensure_unreserved_workflow_idempotency_key(Some("approved-proposalish:1")).is_ok()
+        );
+        assert!(
+            ensure_unreserved_workflow_idempotency_key(Some("approved-proposal:sha256:abc"))
+                .unwrap_err()
+                .to_string()
+                .contains("reserved approval namespace")
+        );
+    }
 
     #[test]
     fn python_event_names_are_collision_free() {

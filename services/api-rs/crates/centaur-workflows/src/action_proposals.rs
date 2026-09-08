@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use time::OffsetDateTime;
 
-use super::{CreateWorkflowRunRequest, WorkflowRuntime, WorkflowRuntimeError};
+use super::{
+    CreateWorkflowRunRequest, CreateWorkflowRunResponse, WorkflowRun, WorkflowRuntime,
+    WorkflowRuntimeError,
+};
 
 const MIN_PROPOSAL_TTL_SECONDS: i64 = 5 * 60;
 const MAX_PROPOSAL_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -411,30 +414,33 @@ impl WorkflowRuntime {
         // process fails after this point, a repeated authorized approval
         // resumes from this claim and the stable spawn idempotency key.
         tx.commit().await?;
+        let action_input = json!({
+            "approval": {
+                "actor_id": &approval.actor_id,
+                "capability_class": &approval.capability_class,
+                "channel_id": &approval.channel_id,
+                "guild_id": &approval.guild_id,
+                "message_id": &approval.message_id,
+                "policy_fingerprint": &approval.policy_fingerprint,
+                "principal_role": &approval.principal_role,
+                "proposal_fingerprint": &fingerprint,
+                "repository_scope": &approval.repository_scope,
+                "root_message_id": &approval.root_message_id,
+                "thread_id": &approval.thread_id,
+            },
+            "proposal": proposal_value,
+        });
         let run = self
-            .create_run(CreateWorkflowRunRequest {
+            .create_approved_action_run(CreateWorkflowRunRequest {
                 workflow_name: action_workflow.clone(),
-                input: json!({
-                    "approval": {
-                        "actor_id": &approval.actor_id,
-                        "capability_class": &approval.capability_class,
-                        "channel_id": &approval.channel_id,
-                        "guild_id": &approval.guild_id,
-                        "message_id": &approval.message_id,
-                        "policy_fingerprint": &approval.policy_fingerprint,
-                        "principal_role": &approval.principal_role,
-                        "proposal_fingerprint": &fingerprint,
-                        "repository_scope": &approval.repository_scope,
-                        "root_message_id": &approval.root_message_id,
-                        "thread_id": &approval.thread_id,
-                    },
-                    "proposal": proposal_value,
-                }),
+                input: action_input.clone(),
                 idempotency_key: Some(format!("approved-proposal:{fingerprint}")),
                 harness_type: None,
                 max_attempts: Some(3),
             })
             .await?;
+        let stored_run = self.get_run(&run.run_id).await?;
+        ensure_approved_run_identity(&run, &stored_run, &action_workflow, &action_input)?;
         let mut tx = self.inner.client.pool().begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_action_proposals SET consumed_at = NOW(), approved_by_actor_id = $2, \
@@ -492,6 +498,24 @@ impl WorkflowRuntime {
             run.created,
         ))
     }
+}
+
+fn ensure_approved_run_identity(
+    spawned: &CreateWorkflowRunResponse,
+    stored: &WorkflowRun,
+    action_workflow: &str,
+    action_input: &Value,
+) -> Result<(), WorkflowRuntimeError> {
+    if stored.task_id != spawned.task_id
+        || stored.run_id != spawned.run_id
+        || stored.workflow_name != action_workflow
+        || stored.input != *action_input
+    {
+        return Err(WorkflowRuntimeError::Internal(
+            "approved proposal idempotency key resolved to a different workflow run".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn transition_notification_state(
@@ -995,6 +1019,70 @@ mod tests {
                 name: "source_current".to_owned(),
                 status: "passed".to_owned(),
             }],
+        }
+    }
+
+    #[test]
+    fn approval_reuse_requires_the_exact_stored_workflow_identity() {
+        let input = json!({"approval": {"proposal_fingerprint": "sha256:test"}});
+        let spawned = CreateWorkflowRunResponse {
+            ok: true,
+            run_id: "run-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            status: "queued".to_owned(),
+            created: false,
+        };
+        let stored = WorkflowRun {
+            run_id: spawned.run_id.clone(),
+            task_id: spawned.task_id.clone(),
+            workflow_name: "execute_approved_improvement".to_owned(),
+            status: "queued".to_owned(),
+            input: input.clone(),
+            result: None,
+            failure: None,
+            attempts: 0,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        assert!(
+            ensure_approved_run_identity(
+                &spawned,
+                &stored,
+                "execute_approved_improvement",
+                &input,
+            )
+            .is_ok()
+        );
+        for mismatched in [
+            WorkflowRun {
+                workflow_name: "unrelated_privileged_workflow".to_owned(),
+                ..stored.clone()
+            },
+            WorkflowRun {
+                input: json!({"attacker": true}),
+                ..stored.clone()
+            },
+            WorkflowRun {
+                task_id: "attacker-task".to_owned(),
+                ..stored.clone()
+            },
+            WorkflowRun {
+                run_id: "attacker-run".to_owned(),
+                ..stored.clone()
+            },
+        ] {
+            assert!(
+                ensure_approved_run_identity(
+                    &spawned,
+                    &mismatched,
+                    "execute_approved_improvement",
+                    &input,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("different workflow run")
+            );
         }
     }
 
