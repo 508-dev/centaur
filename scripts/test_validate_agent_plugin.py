@@ -53,6 +53,12 @@ class ValidateAgentPluginTest(unittest.TestCase):
                 "versions must match",
             ),
             (
+                "missing version",
+                "plugins/centaur/.claude-plugin/plugin.json",
+                lambda value: value.pop("version"),
+                "version must be a nonempty string",
+            ),
+            (
                 "stdio transport",
                 "plugins/centaur/.claude-plugin/plugin.json",
                 lambda value: value["mcpServers"]["centaur"].update(type="stdio"),

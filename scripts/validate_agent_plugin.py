@@ -74,20 +74,29 @@ def validate(root: Path = ROOT) -> list[str]:
     codex_market = _load_json(root, codex_market_path, errors)
     claude_market = _load_json(root, claude_market_path, errors)
 
-    versions = {
-        value
-        for value in (
-            codex.get("version"),
-            claude.get("version"),
-            claude_market.get("version"),
+    version_entries = (
+        (codex_path, codex.get("version")),
+        (claude_path, claude.get("version")),
+        (claude_market_path, claude_market.get("version")),
+        (
+            claude_market_path,
             (claude_market.get("plugins") or [{}])[0].get("version")
             if isinstance(claude_market.get("plugins"), list)
             and claude_market.get("plugins")
             and isinstance(claude_market["plugins"][0], dict)
             else None,
+        ),
+    )
+    versions = set()
+    for path, version in version_entries:
+        _require(
+            isinstance(version, str) and bool(version.strip()),
+            path,
+            "version must be a nonempty string",
+            errors,
         )
-        if value is not None
-    }
+        if isinstance(version, str) and version.strip():
+            versions.add(version)
     _require(
         len(versions) == 1,
         PLUGIN,

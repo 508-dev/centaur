@@ -1526,9 +1526,8 @@ fn build_iron_proxy_pod(
             // in place (same pod IP, Service keeps routing) instead of leaving
             // the pod Failed and the sandbox with no egress for the rest of
             // the session: nothing repairs a dead proxy until the next
-            // execute. A 512Mi limit + Never turned proxy OOM kills into 40+
-            // mid-turn "stream disconnected" failures (2026-08-27/28,
-            // prd-centaur-na).
+            // execute. A 512Mi limit + Never can turn proxy OOM kills into
+            // repeated mid-turn stream-disconnected failures.
             restart_policy: Some("OnFailure".to_owned()),
             containers: vec![iron_proxy_container(iron_proxy, resolved, sync)],
             volumes: Some(iron_proxy_volumes(iron_proxy)),
