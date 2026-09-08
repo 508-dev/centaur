@@ -328,11 +328,12 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # non-deliverable winner never suppresses a credential that would otherwise
   # serve.
   def self.served_credentials_for(principal, extra_static: [])
-    static = filter_discord_github_policy_credentials(
-      principal,
-      principal.granted_static_secrets.select { |secret| secret.source&.deliverable? }
-    )
+    static = principal.granted_static_secrets.select { |secret| secret.source&.deliverable? }
     static = merge_static_credentials(static, extra_static) if extra_static.any?
+    # Requester-hoisted wrappers are convenience credentials, not an authority
+    # boundary. Apply the managed Discord policy to the complete union so the
+    # requester cannot add a credential outside the verified actor's role.
+    static = filter_discord_github_policy_credentials(principal, static)
     gcp_auth = filter_discord_github_policy_credentials(principal, principal.granted_gcp_auth_secrets.to_a)
     gcp_id_token = filter_discord_github_policy_credentials(principal, principal.granted_gcp_id_token_secrets.to_a)
     aws_auth = filter_discord_github_policy_credentials(principal, principal.granted_aws_auth_secrets.to_a)
