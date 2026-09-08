@@ -5933,12 +5933,14 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
                 prior_final_answer_text,
             )
         }
-        Some("interrupted") if prior_final_answer_text.trim().is_empty() => {
+        Some("interrupted" | "cancelled" | "canceled")
+            if prior_final_answer_text.trim().is_empty() =>
+        {
             TerminalOutput::Cancelled {
                 reason: "turn_interrupted",
             }
         }
-        Some("interrupted") if !prior_final_answer_text.trim().is_empty() => {
+        Some("interrupted" | "cancelled" | "canceled") => {
             completed_terminal_output_with_fallback(
                 value,
                 "turn_completed",
@@ -7576,6 +7578,29 @@ mod tests {
                 result_text: Some("Final answer".to_owned())
             })
         );
+    }
+
+    #[test]
+    fn cancelled_turn_completed_matches_legacy_interrupted_behavior() {
+        for status in ["cancelled", "canceled"] {
+            let event = json!({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": status}},
+            });
+            assert_eq!(
+                terminal_output(&event, ""),
+                Some(TerminalOutput::Cancelled {
+                    reason: "turn_interrupted"
+                })
+            );
+            assert_eq!(
+                terminal_output(&event, "Final answer"),
+                Some(TerminalOutput::Completed {
+                    reason: "turn_completed",
+                    result_text: Some("Final answer".to_owned())
+                })
+            );
+        }
     }
 
     #[test]
