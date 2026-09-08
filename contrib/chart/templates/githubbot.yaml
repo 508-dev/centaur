@@ -124,6 +124,8 @@ spec:
               value: {{ .Values.githubbot.reviewMaxTotalRoundsPerEpoch | quote }}
             - name: GITHUBBOT_REVIEW_MAX_EPOCHS
               value: {{ .Values.githubbot.reviewMaxEpochs | quote }}
+            - name: GITHUBBOT_REVIEW_MAX_SECURITY_INTERRUPTS_PER_PR
+              value: {{ .Values.githubbot.reviewMaxSecurityInterruptsPerPr | quote }}
             - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES
               value: {{ .Values.githubbot.reviewMaterialChangeLines | quote }}
             - name: GITHUBBOT_REVIEW_MATERIAL_CHANGE_FILES

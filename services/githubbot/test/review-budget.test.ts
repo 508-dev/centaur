@@ -24,15 +24,17 @@ const epoch = (overrides: Partial<ReviewEpochState> = {}): ReviewEpochState => {
 };
 
 describe("assessReviewChange", () => {
-  test("keeps a small runtime change in the current epoch", () => {
+  test("treats a small semantic runtime change as new behavior", () => {
     expect(
       assessReviewChange({
         comparisonStatus: "ahead",
         files: [{ changes: 12, filename: "services/githubbot/src/turn.ts" }],
       }),
     ).toMatchObject({
+      changeClass: "new_risk",
       changedLines: 12,
-      kind: "minor",
+      kind: "material",
+      reasons: ["runtime_behavior_changed"],
       runtimeFiles: 1,
     });
   });
@@ -49,10 +51,41 @@ describe("assessReviewChange", () => {
         ],
       }),
     ).toMatchObject({
+      changeClass: "maintenance",
       changedLines: 0,
       kind: "minor",
       runtimeFiles: 0,
     });
+  });
+
+  test("recognizes conventional Go, Python, and Ruby test filenames", () => {
+    for (const filename of [
+      "pkg/client/client_test.go",
+      "services/sandbox/test_system_prompt.py",
+      "spec/models/user_spec.rb",
+    ]) {
+      expect(
+        assessReviewChange({
+          comparisonStatus: "ahead",
+          files: [{ changes: 5, filename }],
+        }),
+      ).toMatchObject({ changeClass: "maintenance", runtimeFiles: 0 });
+    }
+  });
+
+  test("treats vendored source as runtime behavior", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "vendor/example.com/dependency/client.go",
+            patch: "-return insecure()\n+return checked()",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material", runtimeFiles: 1 });
   });
 
   test("treats authorization, migration, dependency, and deployment files as material", () => {
@@ -71,7 +104,7 @@ describe("assessReviewChange", () => {
     }
   });
 
-  test("uses cumulative runtime size thresholds", () => {
+  test("uses runtime size thresholds for the reviewed delta", () => {
     const assessment = assessReviewChange({
       comparisonStatus: "ahead",
       files: [
@@ -84,6 +117,145 @@ describe("assessReviewChange", () => {
     expect(assessment.reasons).toContain("runtime_lines:210>=200");
   });
 
+  test("keeps formatting-only patches in the current epoch", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "src/one.ts",
+            patch: "@@ -1 +1 @@\n-const answer = 42;   \n+const answer = 42;",
+          },
+        ],
+      }),
+    ).toMatchObject({
+      changeClass: "maintenance",
+      kind: "minor",
+      reasons: ["formatting_only"],
+    });
+  });
+
+  test("does not mistake whitespace inside a string for formatting", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "src/one.ts",
+            patch: '-const label = "a b";\n+const label = "ab";',
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
+  test("does not mistake reordered lines for formatting", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 4,
+            filename: "src/one.ts",
+            patch: "@@ -1,2 +1,2 @@\n-first();\n-second();\n+second();\n+first();",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
+  test("does not mistake a line moved across context for formatting", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "src/one.ts",
+            patch: "@@ -1,2 +1,2 @@\n-authorize();\n mutate();\n+authorize();",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
+  test("treats a patchless zero-line runtime file as a semantic change", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            additions: 0,
+            deletions: 0,
+            filename: "src/model.bin",
+            status: "modified",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
+  test("keeps a tree-identical rebase in the current epoch", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "diverged",
+        files: [{ changes: 40, filename: "src/one.ts" }],
+        treeUnchanged: true,
+      }),
+    ).toMatchObject({
+      changeClass: "maintenance",
+      kind: "minor",
+      reasons: ["tree_unchanged"],
+    });
+  });
+
+  test("keeps a bounded accepted-finding repair in the current epoch", () => {
+    expect(
+      assessReviewChange({
+        acceptedFindingPaths: new Set(["src/one.ts"]),
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "src/one.ts",
+            patch: "@@ -1 +1 @@\n-return unsafe;\n+return checked;",
+            status: "modified",
+          },
+        ],
+      }),
+    ).toMatchObject({
+      changeClass: "repair",
+      kind: "minor",
+      reasons: ["accepted_finding_repair"],
+    });
+  });
+
+  test("does not disguise widened or boundary-changing work as a repair", () => {
+    for (const files of [
+      [
+        { changes: 2, filename: "src/one.ts", patch: "-old\n+new" },
+        { changes: 2, filename: "src/two.ts", patch: "-old\n+new" },
+      ],
+      [
+        {
+          changes: 2,
+          filename: "src/auth/policy.ts",
+          patch: "-old\n+new",
+        },
+      ],
+    ]) {
+      expect(
+        assessReviewChange({
+          acceptedFindingPaths: new Set([files[0]!.filename]),
+          comparisonStatus: "ahead",
+          files,
+        }),
+      ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+    }
+  });
+
   test("requires human judgment for a non-linear comparison", () => {
     expect(
       assessReviewChange({
@@ -91,16 +263,33 @@ describe("assessReviewChange", () => {
         files: [{ changes: 1, filename: "src/one.ts" }],
       }),
     ).toMatchObject({
+      changeClass: "unknown",
       kind: "unknown",
       reasons: ["non_linear_comparison:diverged"],
+    });
+  });
+
+  test("fails closed when GitHub's comparison file list is capped", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: Array.from({ length: 300 }, (_, index) => ({
+          changes: 1,
+          filename: `generated/file-${index}.ts`,
+        })),
+      }),
+    ).toMatchObject({
+      changeClass: "unknown",
+      kind: "unknown",
+      reasons: ["github_comparison_file_cap"],
     });
   });
 });
 
 describe("decideReviewAdmission", () => {
-  const minor = assessReviewChange({
+  const maintenance = assessReviewChange({
     comparisonStatus: "ahead",
-    files: [{ changes: 5, filename: "src/one.ts" }],
+    files: [{ changes: 5, filename: "docs/review.md" }],
   });
   const material = assessReviewChange({
     comparisonStatus: "ahead",
@@ -108,7 +297,7 @@ describe("decideReviewAdmission", () => {
   });
   const base = {
     actor: "automation" as const,
-    assessment: minor,
+    assessment: maintenance,
     headSha: "head-2",
     manualReset: false,
     maxEpochs: 3,
@@ -117,6 +306,28 @@ describe("decideReviewAdmission", () => {
     reviewerKey: DEFAULT_REVIEWER_KEY,
     startsRepairTurn: true,
   };
+
+  test("treats a mixed-author bounded repair as new risk", () => {
+    expect(
+      decideReviewAdmission({
+        ...base,
+        actor: "unknown",
+        assessment: {
+          changeClass: "repair",
+          changedFiles: 1,
+          changedLines: 4,
+          kind: "minor",
+          reasons: ["accepted_finding_repair"],
+          runtimeFiles: 1,
+        },
+        state: epoch(),
+      }),
+    ).toMatchObject({
+      decision: "pause",
+      reason: "change_actor_unknown",
+      assessment: { changeClass: "new_risk", kind: "material" },
+    });
+  });
 
   test("starts the first epoch and counts its broad review", () => {
     expect(decideReviewAdmission({ ...base, state: undefined })).toEqual({
@@ -301,6 +512,92 @@ describe("decideReviewAdmission", () => {
     ).toMatchObject({
       decision: "pause",
       reason: "automation_material_change_requires_reset",
+    });
+  });
+
+  test("preserves finding decisions across a new epoch", () => {
+    const fingerprint = `sha256:${"a".repeat(64)}`;
+    const findingLedger = {
+      [fingerprint]: {
+        disposition: "rejected" as const,
+        firstSeenEpoch: 1,
+        reviewId: 31,
+        reviewerKey: DEFAULT_REVIEWER_KEY,
+        reviewedHeadSha: "head-1",
+        severity: "normal" as const,
+      },
+    };
+    expect(
+      decideReviewAdmission({
+        ...base,
+        actor: "human",
+        assessment: material,
+        state: epoch({ findingLedger }),
+      }),
+    ).toMatchObject({
+      decision: "allow",
+      resetEpoch: true,
+      state: { epoch: 2, findingLedger },
+    });
+  });
+
+  test("allows one evidence-fingerprinted security interrupt without resetting", () => {
+    const fingerprint = `sha256:${"b".repeat(64)}`;
+    const interrupted = decideReviewAdmission({
+      ...base,
+      headSha: "head-4",
+      securityInterruptFingerprint: fingerprint,
+      state: epoch({ roundsUsed: 3 }),
+    });
+    expect(interrupted).toMatchObject({
+      decision: "allow",
+      resetEpoch: false,
+      state: {
+        epoch: 1,
+        pausedHeadSha: "head-4",
+        pauseReason: "reviewer_round_budget_exhausted",
+        roundsUsed: 4,
+        securityInterruptFingerprints: [fingerprint],
+      },
+    });
+    expect(
+      decideReviewAdmission({
+        ...base,
+        headSha: "head-5",
+        securityInterruptFingerprint: fingerprint,
+        state: interrupted.state,
+      }),
+    ).toMatchObject({
+      decision: "pause",
+      reason: "reviewer_round_budget_exhausted",
+    });
+  });
+
+  test("allows the bounded security interrupt when change evidence is inconclusive", () => {
+    const fingerprint = `sha256:${"c".repeat(64)}`;
+    expect(
+      decideReviewAdmission({
+        ...base,
+        assessment: {
+          changeClass: "unknown",
+          changedFiles: 0,
+          changedLines: 0,
+          kind: "unknown",
+          reasons: ["comparison_files_unavailable"],
+          runtimeFiles: 0,
+        },
+        securityInterruptFingerprint: fingerprint,
+        state: epoch({ roundsUsed: 2 }),
+      }),
+    ).toMatchObject({
+      decision: "allow",
+      resetEpoch: false,
+      state: {
+        pausedHeadSha: "head-2",
+        pauseReason: "change_significance_unknown",
+        roundsUsed: 3,
+        securityInterruptFingerprints: [fingerprint],
+      },
     });
   });
 
