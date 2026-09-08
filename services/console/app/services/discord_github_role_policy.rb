@@ -250,7 +250,7 @@ class DiscordGithubRolePolicy
     end
 
     def github_host_rule?(rule)
-      host = rule.host.to_s
+      host = rule.host.to_s.strip.downcase.delete_suffix(".")
       CredentialProfiles::GithubToken::ALLOWED_HOSTS.any? do |github_host|
         File.fnmatch?(host, github_host)
       end

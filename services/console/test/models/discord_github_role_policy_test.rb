@@ -114,6 +114,27 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     assert_not DiscordGithubRolePolicy.static_secret_allowed_for_principal?(principal, custom)
   end
 
+  test "rejects custom secrets targeting equivalent GitHub host spellings" do
+    _principal, role, _secret, _credential = build_policy_binding
+
+    [ "API.GITHUB.COM", "api.github.com." ].each do |host|
+      custom = StaticSecret.new(
+        foreign_id: "discord-custom-host-#{SecureRandom.hex(4)}",
+        name: "Unreviewed GitHub PAT",
+        kind: "custom",
+        inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+        created_by: users(:acme_admin)
+      )
+      custom.build_source(source_type: "control_plane", secret: "unreviewed-token")
+      custom.rules.build(host:, position: 0)
+      custom.save!
+
+      grant = Grant.new(role:, static_secret: custom, created_by: users(:acme_admin))
+      assert_not grant.valid?, host
+      assert grant.errors[:base].any? { |message| message.include?("canonical github_token") }, host
+    end
+  end
+
   test "policy-managed Discord actors do not inherit default roles" do
     principal = Principal.create!(
       foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
