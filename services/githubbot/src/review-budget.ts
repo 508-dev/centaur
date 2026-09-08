@@ -88,7 +88,7 @@ const MIGRATION_PATH = /(^|\/)(?:migrations?|schema)(?:[._\/-]|$)/i;
 const AUTH_DATA_API_PATH = /(^|\/)(?:api|auth(?:entication|orization)?|data|permissions?|polic(?:y|ies)|security)(?:[._\/-]|$)/i;
 const DEPLOYMENT_PATH = /(^|\/)(?:\.github\/workflows|charts?|contrib\/chart|deploy|helm|k8s|kubernetes)(?:\/|$)/i;
 const API_CONTRACT_FILE = /(^|\/)(?:openapi|asyncapi|[^/]+\.proto)(?:[._\/-]|$)/i;
-const NON_RUNTIME_PATH = /(^|\/)(?:docs?|examples?|fixtures?|generated|snapshots?|tests?|testdata|vendor)(?:\/|$)|(?:\.md|\.mdx|\.rst|\.snap)$|(?:^|\.)test\.[^/]+$|(?:^|\.)spec\.[^/]+$/i;
+const NON_RUNTIME_PATH = /(^|\/)(?:docs?|examples?|fixtures?|generated|snapshots?|tests?|testdata)(?:\/|$)|(?:\.md|\.mdx|\.rst|\.snap)$|(?:^|\.)test\.[^/]+$|(?:^|\.)spec\.[^/]+$|(?:^|\/)(?:test_[^/]+|[^/]+_(?:test|spec))\.(?:go|py|rb)$/i;
 
 function nonNegative(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0

@@ -58,6 +58,36 @@ describe("assessReviewChange", () => {
     });
   });
 
+  test("recognizes conventional Go, Python, and Ruby test filenames", () => {
+    for (const filename of [
+      "pkg/client/client_test.go",
+      "services/sandbox/test_system_prompt.py",
+      "spec/models/user_spec.rb",
+    ]) {
+      expect(
+        assessReviewChange({
+          comparisonStatus: "ahead",
+          files: [{ changes: 5, filename }],
+        }),
+      ).toMatchObject({ changeClass: "maintenance", runtimeFiles: 0 });
+    }
+  });
+
+  test("treats vendored source as runtime behavior", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 2,
+            filename: "vendor/example.com/dependency/client.go",
+            patch: "-return insecure()\n+return checked()",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material", runtimeFiles: 1 });
+  });
+
   test("treats authorization, migration, dependency, and deployment files as material", () => {
     for (const filename of [
       "services/api/src/authorization.ts",

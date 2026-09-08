@@ -1462,7 +1462,7 @@ describe("bounded review epochs", () => {
     ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
   });
 
-  test("records an approved repair head before later authorship checks", async () => {
+  test("classifies an approved material human head before advancing the boundary", async () => {
     const state = makeState();
     await state.set("centaur-githubbot:review-budget:base/repo#7", {
       anchorHeadSha: "head-1",
@@ -1479,24 +1479,13 @@ describe("bounded review epochs", () => {
       basehead: string;
     }) => {
       compared.push(request.basehead);
-      const latestRange = request.basehead === "head-2...head-3";
       const humanCommit = {
         author: { login: "alice", type: "User" },
         commit: { message: "material human revision" },
       };
       return {
         data: {
-          commits: latestRange
-            ? [humanCommit]
-            : [
-                {
-                  author: { login: "centaur-bot", type: "Bot" },
-                  commit: {
-                    message: "review fix\n\nCentaur-Automation: true",
-                  },
-                },
-                humanCommit,
-              ],
+          commits: [humanCommit],
           files: [
             {
               additions: 5,
@@ -1507,7 +1496,7 @@ describe("bounded review epochs", () => {
             },
           ],
           status: "ahead",
-          total_commits: latestRange ? 1 : 2,
+          total_commits: 1,
         },
       };
     }) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
@@ -1529,16 +1518,22 @@ describe("bounded review epochs", () => {
     );
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
-    ).toMatchObject({ lastReviewedHeadSha: "head-2" });
+    ).toMatchObject({
+      anchorHeadSha: "head-2",
+      epoch: 2,
+      lastReviewedHeadSha: "head-2",
+      reviewerRoundsUsed: {},
+      roundsUsed: 0,
+    });
 
     setHeadSha(ctx, "head-3");
     await handleReviewEvent(ctx, submittedReview(34, "head-3"));
     await drainBackgroundWork(5_000);
 
-    expect(compared).toEqual(["head-2...head-3"]);
+    expect(compared).toEqual(["head-1...head-2", "head-2...head-3"]);
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
-    ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
+    ).toMatchObject({ anchorHeadSha: "head-3", epoch: 3, roundsUsed: 1 });
   });
 
   test("serializes merge evaluation behind an in-flight review admission", async () => {

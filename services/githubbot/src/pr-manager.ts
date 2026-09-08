@@ -1627,10 +1627,47 @@ async function recordApprovedReview(
   );
   if (!approval) {
     if (loaded.state && loaded.state.lastReviewedHeadSha !== headSha) {
-      const state = {
-        ...loaded.state,
-        automationPendingFromHeadSha: undefined,
-        lastReviewedHeadSha: headSha,
+      const evidence = await compareReviewChange(
+        ctx,
+        owner,
+        repo,
+        loaded.state.lastReviewedHeadSha,
+        headSha,
+        loaded.state.findingLedger,
+      );
+      const admission = decideReviewAdmission({
+        actor: evidence.actor,
+        assessment: evidence.assessment,
+        headSha,
+        manualReset: false,
+        maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+        maxRoundsPerEpoch:
+          ctx.options.reviewMaxRoundsPerEpoch ??
+          DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+        maxTotalRoundsPerEpoch:
+          ctx.options.reviewMaxTotalRoundsPerEpoch ??
+          DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+        reviewerKey,
+        startsRepairTurn: false,
+        state: loaded.state,
+      });
+      const state: ReviewEpochState = {
+        ...admission.state,
+        automationPendingFromHeadSha:
+          admission.decision === "allow"
+            ? undefined
+            : loaded.state.automationPendingFromHeadSha,
+        // An approval classifies the new head but does not start a repair turn.
+        // Preserve the current counters, or begin a genuine human-risk epoch at
+        // zero so its first finding receives round one.
+        reviewerRoundsUsed:
+          admission.decision === "allow" && admission.resetEpoch
+            ? {}
+            : loaded.state.reviewerRoundsUsed,
+        roundsUsed:
+          admission.decision === "allow" && admission.resetEpoch
+            ? 0
+            : loaded.state.roundsUsed,
       };
       await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
       traceLog(
@@ -1640,8 +1677,15 @@ async function recordApprovedReview(
           managementThreadKey(owner, repo, pr.number),
           `review-approved-${headSha}`,
         ),
-        { epoch: state.epoch, head_sha: headSha },
+        {
+          assessment: admission.assessment?.kind,
+          change_class: admission.assessment?.changeClass,
+          decision: admission.decision,
+          epoch: state.epoch,
+          head_sha: headSha,
+        },
       );
+      return admission.decision === "allow";
     }
     return true;
   }
