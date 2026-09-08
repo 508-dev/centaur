@@ -3,7 +3,14 @@
 # can change and again when a proxy config is rendered, so a later Console
 # mutation cannot widen credentials already assigned to a Discord actor.
 class DiscordGithubRolePolicy
-  MANAGED_ROLE_LABEL = "centaur_discord_policy_managed".freeze
+    MANAGED_ROLE_LABEL = "centaur_discord_policy_managed".freeze
+    SANDBOX_POLICY_LABELS = {
+      sandbox_repo_cache: "centaur.discord.sandbox_repo_cache",
+      sandbox_observability_enabled: "centaur.discord.sandbox_observability_enabled",
+      sandbox_sessions_read_enabled: "centaur.discord.sandbox_sessions_read_enabled",
+      sandbox_workflows_read_enabled: "centaur.discord.sandbox_workflows_read_enabled",
+      sandbox_workflows_write_enabled: "centaur.discord.sandbox_workflows_write_enabled"
+    }.freeze
   REPOSITORY_SCOPE_LABEL = "repository_scope".freeze
   SECRET_REPOSITORIES_LABEL = "repositories".freeze
   TOKEN_BROKER_SOURCE = "token_broker".freeze
@@ -119,6 +126,26 @@ class DiscordGithubRolePolicy
       return true if roles.empty?
 
       roles.all? { |role| role_allows_credential?(role, credential) }
+    end
+
+    # The reviewed role is authoritative for a managed Discord actor's sandbox
+    # capabilities. Return nil for an incomplete or malformed declaration so
+    # the atomic replacement boundary can fail closed.
+    def sandbox_policy_for_role(role)
+      return nil unless managed_role?(role)
+
+      labels = role.labels.to_h
+      repo_cache = labels[SANDBOX_POLICY_LABELS.fetch(:sandbox_repo_cache)]
+      return nil unless Principal::SANDBOX_REPO_CACHE_VALUES.include?(repo_cache)
+
+      policy = { sandbox_repo_cache: repo_cache }
+      SANDBOX_POLICY_LABELS.except(:sandbox_repo_cache).each do |attribute, label|
+        value = labels[label]
+        return nil unless %w[true false].include?(value)
+
+        policy[attribute] = value == "true"
+      end
+      policy
     end
 
     # Backwards-compatible name for callers that render static secrets.

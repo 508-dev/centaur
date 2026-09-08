@@ -157,6 +157,18 @@ class Principal < ApplicationRecord
   # ordered state rather than interleaving into a union of privileged roles.
   def replace_roles_and_sandbox_policy!(roles:, **capabilities)
     desired_roles = Array(roles).uniq(&:id)
+    if discord_actor_principal?
+      reviewed_policy = desired_roles.one? &&
+        DiscordGithubRolePolicy.sandbox_policy_for_role(desired_roles.first)
+      unless reviewed_policy && capabilities == reviewed_policy
+        errors.add(
+          :base,
+          "Discord actor sandbox policy must exactly match its sole reviewed role"
+        )
+        raise ActiveRecord::RecordInvalid, self
+      end
+      capabilities = reviewed_policy
+    end
     with_lock do
       update!(capabilities)
       desired_ids = desired_roles.map(&:id)

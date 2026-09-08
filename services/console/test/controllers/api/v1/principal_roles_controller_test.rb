@@ -126,6 +126,69 @@ module Api
         assert_not principal.sandbox_workflows_write_enabled
       end
 
+      test "PUT rejects Discord actor capabilities that differ from the reviewed role" do
+        role = Role.create!(
+          foreign_id: "discord-observer-#{SecureRandom.hex(4)}",
+          labels: {
+            "centaur_discord_policy_managed" => "true",
+            "repository_scope" => "508-dev/centaur",
+            "centaur.discord.sandbox_repo_cache" => "public",
+            "centaur.discord.sandbox_observability_enabled" => "true",
+            "centaur.discord.sandbox_sessions_read_enabled" => "false",
+            "centaur.discord.sandbox_workflows_read_enabled" => "true",
+            "centaur.discord.sandbox_workflows_write_enabled" => "false"
+          },
+          created_by: users(:acme_admin)
+        )
+        principal = Principal.create!(
+          foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
+          kind: "discord_user",
+          labels: { "centaur_discord_policy_managed" => "true" },
+          created_by: users(:acme_admin)
+        )
+        original = principal.attributes.slice(
+          "sandbox_repo_cache",
+          "sandbox_observability_enabled",
+          "sandbox_sessions_read_enabled",
+          "sandbox_workflows_read_enabled",
+          "sandbox_workflows_write_enabled"
+        )
+
+        put api_v1_principal_roles_url(principal_id: principal.oid),
+            params: {
+              data: {
+                role_ids: [ role.oid ],
+                sandbox_repo_cache: "public",
+                sandbox_observability_enabled: true,
+                sandbox_sessions_read_enabled: false,
+                sandbox_workflows_read_enabled: true,
+                sandbox_workflows_write_enabled: true
+              }
+            }.to_json,
+            headers: auth_headers
+
+        assert_response :unprocessable_entity
+        assert_empty principal.reload.roles
+        assert_equal original, principal.attributes.slice(*original.keys)
+
+        put api_v1_principal_roles_url(principal_id: principal.oid),
+            params: {
+              data: {
+                role_ids: [ role.oid ],
+                sandbox_repo_cache: "public",
+                sandbox_observability_enabled: true,
+                sandbox_sessions_read_enabled: false,
+                sandbox_workflows_read_enabled: true,
+                sandbox_workflows_write_enabled: false
+              }
+            }.to_json,
+            headers: auth_headers
+
+        assert_response :ok
+        assert_equal [ role.id ], principal.reload.role_ids
+        assert_not principal.sandbox_workflows_write_enabled
+      end
+
       test "PUT rejects partial policy without changing roles" do
         principal = principals(:acme_channel)
         previous_role_ids = principal.role_ids
