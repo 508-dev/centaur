@@ -221,6 +221,7 @@ describe("approveActionProposal", () => {
       channelId: "300000000000000001",
       control: "approve",
       decision: "allow",
+      dispatchStatus: "completed",
       guildId: "200000000000000001",
       messageId: "600000000000000001",
       policy: {

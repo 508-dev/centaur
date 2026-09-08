@@ -13,6 +13,7 @@ import { discordMentionRoutingDecision } from "./discord-mention-routing";
 import type { DiscordbotOptions } from "./types";
 
 const DEFAULT_DELIVERY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_DISPATCH_CLAIM_TTL_MS = 30 * 1000;
 const DEFAULT_CONTINUATION_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_EVENT_AGE_MS = 5 * 60 * 1000;
 const MAX_CLOCK_SKEW_MS = 60 * 1000;
@@ -68,6 +69,7 @@ export type DiscordAcceptedAdmission = {
   channelId: string;
   control?: "approve" | "stop";
   decision: "allow";
+  dispatchStatus: "completed" | "pending";
   guildId: string;
   messageId: string;
   policy: DiscordPermissionBundle;
@@ -134,7 +136,7 @@ export async function admitDiscordGatewayMessage(
     claimed = await state.setIfNotExists(
       deliveryKey(event.messageId),
       pending,
-      options.ingressDeliveryTtlMs ?? DEFAULT_DELIVERY_TTL_MS,
+      options.ingressDispatchClaimTtlMs ?? DEFAULT_DISPATCH_CLAIM_TTL_MS,
     );
   } catch {
     audit(logger, pending);
@@ -157,7 +159,9 @@ export async function admitDiscordGatewayMessage(
     await state.set(
       deliveryKey(event.messageId),
       record,
-      options.ingressDeliveryTtlMs ?? DEFAULT_DELIVERY_TTL_MS,
+      record.decision === "allow"
+        ? options.ingressDispatchClaimTtlMs ?? DEFAULT_DISPATCH_CLAIM_TTL_MS
+        : options.ingressDeliveryTtlMs ?? DEFAULT_DELIVERY_TTL_MS,
     );
   } catch {
     const persisted = await recoverPersistedAdmissionOrReleaseClaim(
@@ -174,10 +178,16 @@ export async function admitDiscordGatewayMessage(
   return record.decision === "allow" ? record : null;
 }
 
-/** Load the immutable accepted admission that the Gateway persisted. */
+/**
+ * Load the accepted admission and durably finalize its delivery claim. This is
+ * called only after the adapter has created any required thread and dispatched
+ * into a Chat handler, so earlier adapter failures leave a short-lived claim
+ * that a reconnect can safely retry instead of a seven-day false duplicate.
+ */
 export async function acceptedDiscordAdmissionForMessage(
   message: Message,
   state: StateAdapter,
+  deliveryTtlMs = DEFAULT_DELIVERY_TTL_MS,
 ): Promise<DiscordAcceptedAdmission | null> {
   const record = await state.get<unknown>(deliveryKey(message.id));
   if (!isAcceptedAdmission(record)) return null;
@@ -189,6 +199,18 @@ export async function acceptedDiscordAdmissionForMessage(
     record.threadId !== parsed.threadId
   ) {
     return null;
+  }
+  if (record.dispatchStatus === "pending") {
+    const completed: DiscordAcceptedAdmission = {
+      ...record,
+      dispatchStatus: "completed",
+    };
+    try {
+      await state.set(deliveryKey(message.id), completed, deliveryTtlMs);
+    } catch {
+      return null;
+    }
+    return completed;
   }
   return record;
 }
@@ -396,6 +418,7 @@ function accepted(
     channelId: event.channelId,
     ...(control ? { control: control.type } : {}),
     decision: "allow",
+    dispatchStatus: "pending",
     guildId: event.guildId,
     messageId: event.messageId,
     policy,
@@ -505,6 +528,7 @@ function sameAdmissionRecord(
   const acceptedRecord = record as Partial<DiscordAcceptedAdmission>;
   return (
     acceptedRecord.control === expected.control &&
+    acceptedRecord.dispatchStatus === expected.dispatchStatus &&
     acceptedRecord.proposalFingerprint === expected.proposalFingerprint &&
     acceptedRecord.rootMessageId === expected.rootMessageId &&
     acceptedRecord.policy?.fingerprint === expected.policy.fingerprint
@@ -543,6 +567,8 @@ function isAcceptedAdmission(value: unknown): value is DiscordAcceptedAdmission 
   return (
     record.version === 1 &&
     record.decision === "allow" &&
+    (record.dispatchStatus === "pending" ||
+      record.dispatchStatus === "completed") &&
     record.reason === "accepted" &&
     typeof record.actorId === "string" &&
     typeof record.channelId === "string" &&

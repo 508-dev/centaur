@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import type { Logger, StateAdapter } from "chat";
+import type { Logger, Message, StateAdapter } from "chat";
 import {
+  acceptedDiscordAdmissionForMessage,
   admitDiscordGatewayMessage,
   type DiscordGatewayMessageEvent,
 } from "../src/discord-ingress";
@@ -144,6 +145,64 @@ describe("Discord Gateway admission", () => {
       "accepted",
       "duplicate_delivery",
     ]);
+  });
+
+  it("keeps acceptance provisional until Chat dispatch and then retains it", async () => {
+    const { logger, state } = await harness();
+    const message = event("600000000000000004");
+    const configured = options({
+      ingressDeliveryTtlMs: 10_000,
+      ingressDispatchClaimTtlMs: 1,
+    });
+    const admitted = await admitDiscordGatewayMessage(
+      message,
+      configured,
+      state,
+      logger,
+      NOW,
+    );
+    expect(admitted?.dispatchStatus).toBe("pending");
+
+    const dispatched = await acceptedDiscordAdmissionForMessage(
+      {
+        attachments: [],
+        author: {
+          fullName: "Test User",
+          isBot: false,
+          isMe: false,
+          userId: USER,
+          userName: "tester",
+        },
+        id: message.messageId,
+        isMention: true,
+        raw: {},
+        text: message.content,
+        threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
+        metadata: { dateSent: new Date(NOW), edited: false },
+      } as unknown as Message,
+      state,
+      configured.ingressDeliveryTtlMs,
+    );
+    expect(dispatched?.dispatchStatus).toBe("completed");
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      await admitDiscordGatewayMessage(message, configured, state, logger, NOW),
+    ).toBeNull();
+  });
+
+  it("allows a reconnect retry after an undispatched provisional claim expires", async () => {
+    const { logger, state } = await harness();
+    const message = event("600000000000000005");
+    const configured = options({ ingressDispatchClaimTtlMs: 1 });
+    expect(
+      await admitDiscordGatewayMessage(message, configured, state, logger, NOW),
+    ).toEqual(expect.objectContaining({ dispatchStatus: "pending" }));
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      await admitDiscordGatewayMessage(message, configured, state, logger, NOW),
+    ).toEqual(expect.objectContaining({ dispatchStatus: "pending" }));
   });
 
   it("releases only its provisional delivery claim after transient state failures", async () => {

@@ -60,6 +60,9 @@ const options: DiscordbotOptions = {
   discordApiUrl: optionalEnv("DISCORD_API_URL"),
   guildAllowlist,
   ingressDeliveryTtlMs: optionalNumberEnv("DISCORDBOT_INGRESS_DELIVERY_TTL_MS"),
+  ingressDispatchClaimTtlMs: optionalNumberEnv(
+    "DISCORDBOT_INGRESS_DISPATCH_CLAIM_TTL_MS",
+  ),
   ingressMaxEventAgeMs: optionalNumberEnv("DISCORDBOT_INGRESS_MAX_EVENT_AGE_MS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   isGatewayActive: () => gateway.isActive(),

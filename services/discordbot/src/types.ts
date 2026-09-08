@@ -125,6 +125,8 @@ export type DiscordbotOptions = {
   ingressMaxEventAgeMs?: number;
   /** Durable inbound-delivery dedup/audit retention. Default 7 days. */
   ingressDeliveryTtlMs?: number;
+  /** Pre-dispatch claim lifetime. Default 30 seconds. */
+  ingressDispatchClaimTtlMs?: number;
   /** Authorized root-to-follow-up lifetime. Default 24 hours. */
   continuationTtlMs?: number;
   guildAllowlist?: readonly string[];

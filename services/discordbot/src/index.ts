@@ -413,7 +413,11 @@ async function discordAdmissionForHandler(
   state: StateAdapter,
   logger: Logger,
 ): Promise<DiscordAcceptedAdmission | null> {
-  const accepted = await acceptedDiscordAdmissionForMessage(message, state);
+  const accepted = await acceptedDiscordAdmissionForMessage(
+    message,
+    state,
+    options.ingressDeliveryTtlMs,
+  );
   if (accepted) return accepted;
   // Production events must already have been admitted by the authenticated
   // Discord Gateway callback before the adapter creates a thread. The Chat SDK
