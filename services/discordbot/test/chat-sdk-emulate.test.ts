@@ -642,12 +642,18 @@ describe("discordbot", () => {
 
     await waitFor(() => codexApi.executes.length === 1);
     await waitFor(() => hasReaction(threadId, mentionId, "PUT", "👀"));
+    expect(
+      await botState.get(`discordbot:ingress:delivery:${mentionId}`),
+    ).toEqual(expect.objectContaining({ dispatchStatus: "pending" }));
     // The event stream must not open while execute is still in flight.
     expect(codexApi.eventRequests).toHaveLength(0);
     expect(hasReaction(threadId, mentionId, "PUT", "✅")).toBe(false);
 
     releaseExecute();
     await waitForSettle(threadId, mentionId);
+    expect(
+      await botState.get(`discordbot:ingress:delivery:${mentionId}`),
+    ).toEqual(expect.objectContaining({ dispatchStatus: "completed" }));
     expect(answerPostsIn(threadId).join("\n")).toContain("Executed request 1.");
   });
 

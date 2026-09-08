@@ -607,14 +607,25 @@ async function syncThreadMessageToSession(
   const state = (await thread.state) ?? {};
   const messageIds = new Set(state.forwardedMessageIds ?? []);
   const executedMessageIds = new Set(state.executedMessageIds ?? []);
+  // A process may die after durably appending the message but before the
+  // idempotent execute call returns and stores its render obligation. Once the
+  // provisional ingress claim expires, let that exact message resume instead
+  // of treating the pre-execute active flag as another live execution.
+  const resumesUncommittedExecution =
+    input.mode === "execute" &&
+    input.admission.dispatchStatus === "pending" &&
+    messageIds.has(message.id) &&
+    !executedMessageIds.has(message.id) &&
+    !state.renderObligation;
   // Discord delta: `state.activeExecution !== true` upstream — a stale flag
   // (crash before the render finally cleared it) must not wedge the thread.
   let shouldStartExecution =
     input.mode === "execute" &&
-    !hasLiveActiveExecution(
-      state,
-      input.options.activeExecutionTtlMs ?? ACTIVE_EXECUTION_TTL_MS,
-    ) &&
+    (resumesUncommittedExecution ||
+      !hasLiveActiveExecution(
+        state,
+        input.options.activeExecutionTtlMs ?? ACTIVE_EXECUTION_TTL_MS,
+      )) &&
     !executedMessageIds.has(message.id);
   // Discord delta (no slackbotv2 analog): per-guild in-flight execution cap.
   // On exceed the message is demoted to append-only context and gets a 🚦.
@@ -797,7 +808,9 @@ async function syncThreadMessageToSession(
       historyForwarded: latest.historyForwarded || shouldIncludeContext,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
     });
-    await completeAdmission();
+    // Append-only delivery is now durable. Execute delivery remains
+    // provisional until its execution and render obligation are both durable.
+    if (!shouldStartExecution) await completeAdmission();
     traceLog(input.options, "discordbot_forward_messages_committed", trace, {
       appended_message_count: messagesToAppend.length,
       forwarded_message_count: Math.min(latestMessageIds.size, 1000),
@@ -838,6 +851,7 @@ async function syncThreadMessageToSession(
       threadId: thread.id,
       trace,
     });
+    await completeAdmission();
     traceLog(input.options, "discordbot_forward_execution_committed", trace, {
       execution_id: execution.execution_id,
       executed_message_count: Math.min(latestExecutedMessageIds.size, 1000),

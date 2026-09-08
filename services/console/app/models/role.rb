@@ -1,6 +1,7 @@
 class Role < ApplicationRecord
   oid_prefix "role"
 
+  include SyncConfigCacheInvalidation
   include ForeignIdCollisionGuard
   attr_readonly :foreign_id
 
@@ -47,6 +48,10 @@ class Role < ApplicationRecord
   end
 
   private
+
+  def sync_config_affected_principals
+    Principal.where(id: principal_ids)
+  end
 
   def labels_is_a_hash
     errors.add(:labels, "must be a hash") unless labels.is_a?(Hash)

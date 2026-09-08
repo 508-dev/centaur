@@ -83,6 +83,21 @@ class RoleTest < ActiveSupport::TestCase
     assert_raises(ActiveRecord::ReadonlyAttributeError) { role.update!(foreign_id: "other") }
   end
 
+  test "policy changes invalidate assigned principals' sync config snapshots" do
+    role = roles(:acme_infra)
+    assigned = role.principals.to_a
+    unaffected = Principal.where.not(id: assigned.map(&:id)).first!
+    assigned_versions = assigned.to_h { |principal| [ principal.id, principal.sync_config_cache_version ] }
+    unaffected_version = unaffected.sync_config_cache_version
+
+    role.update!(labels: role.labels.merge("operator-note" => "changed"))
+
+    assigned.each do |principal|
+      assert_equal assigned_versions.fetch(principal.id) + 1, principal.reload.sync_config_cache_version
+    end
+    assert_equal unaffected_version, unaffected.reload.sync_config_cache_version
+  end
+
   test "destroys its grants when destroyed" do
     role = roles(:acme_infra)
     grant_ids = role.grants.pluck(:id)
