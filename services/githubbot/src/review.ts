@@ -3,7 +3,7 @@ import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
 import { reactWorkingOnSubject, settleSubjectReaction } from "./reactions";
 import { DEFAULT_REVIEW_PROMPT } from "./review-prompt";
-import { runTurnStream } from "./turn";
+import { runTurnStream, turnOutputChars } from "./turn";
 import type {
   ForwardSessionInput,
   GithubbotApiMessage,
@@ -188,6 +188,7 @@ export function handleReviewRequest(
       runTurnStream(options, forwardInput)
         .then(async (result) => {
           traceLog(options, "githubbot_review_turn_complete", trace, {
+            chars: turnOutputChars(result),
             failed: result.failed,
           });
           await settleSubjectReaction(

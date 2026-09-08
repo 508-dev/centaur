@@ -38,7 +38,7 @@ class Principal < ApplicationRecord
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
     unknown user console_user workflow slack_channel slack_dm discord_channel discord_user linear_issue
-    teams_user teams_conversation
+    github_user teams_user teams_conversation
   ].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
