@@ -790,12 +790,14 @@ describe("bounded review epochs", () => {
           {
             body: "The first repository boundary is unchecked.",
             diff_hunk: "+first();",
+            id: 0,
             line: 20,
             path: "src/first.ts",
           },
           {
             body: "The second repository boundary is unchecked.",
             diff_hunk: "+second();",
+            id: 0,
             line: 30,
             path: "src/second.ts",
           },

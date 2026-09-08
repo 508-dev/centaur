@@ -214,7 +214,11 @@ export function parseReviewFindingDispositionMarkers(
       continue;
     }
     const key = `${fingerprint}:${reviewId}`;
-    const marker = { fingerprint, reviewId, disposition };
+    const marker: ReviewFindingDispositionMarker = {
+      disposition,
+      fingerprint,
+      reviewId,
+    };
     const existing = byFinding.get(key);
     if (existing === "conflict") continue;
     if (existing && existing.disposition !== disposition) {
