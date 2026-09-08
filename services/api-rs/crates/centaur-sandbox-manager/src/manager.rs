@@ -172,6 +172,13 @@ where
         self.backend.list_observed().await
     }
 
+    pub async fn reap_orphan_iron_proxy_resources(
+        &self,
+        grace: Duration,
+    ) -> SandboxResult<BTreeMap<String, u32>> {
+        self.backend.reap_orphan_iron_proxy_resources(grace).await
+    }
+
     /// Do not change desired state: a terminal workload's evidence and
     /// workspace remain available to the session's recovery/retention owner.
     pub async fn cleanup_terminal_auxiliaries(&self, id: &SandboxId) -> SandboxResult<usize> {

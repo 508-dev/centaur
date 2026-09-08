@@ -31,7 +31,7 @@ import {
   type ReviewFindingDispositionMarker,
   type ReviewFindingLedger,
 } from "./review-findings";
-import { runTurnStream } from "./turn";
+import { runTurnStream, turnOutputChars } from "./turn";
 import {
   fetchCiEvaluation,
   maybeEmitReviewSubmitted,
@@ -2440,6 +2440,7 @@ function fireManagementTurn(
     runTurnStream(ctx.options, forwardInput)
       .then(async (result) => {
         traceLog(ctx.options, "githubbot_management_turn_complete", trace, {
+          chars: turnOutputChars(result),
           failed: result.failed,
           work: message.label,
         });

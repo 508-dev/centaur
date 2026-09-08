@@ -44,6 +44,7 @@ mod tests {
             manager.clone(),
             super::SandboxReaperConfig {
                 interval: std::time::Duration::from_secs(60),
+                orphan_sweep_grace: std::time::Duration::from_secs(600),
                 max_lifetime: None,
             },
         );

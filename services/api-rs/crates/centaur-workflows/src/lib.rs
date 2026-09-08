@@ -64,6 +64,7 @@ const MAX_AGENT_BATCH_SIZE: usize = 32;
 const MAX_AGENT_BATCH_NAME_BYTES: usize = 128;
 const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const WORKFLOW_HOST_ERROR_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
@@ -1112,6 +1113,8 @@ fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
         | "google_drive_sync"
         | "linear_sync"
         | "company_context_documents"
+        | "company_context_embeddings"
+        | "memory_generation"
         | "slack_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
@@ -1885,16 +1888,12 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
                 return Ok(metadata);
             }
             Some("host.error") | Some("workflow.error") => {
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(WorkflowRuntimeError::Internal(format!(
-                    "Python workflow discovery error: {}{}{}",
-                    message
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error"),
-                    if stderr.is_empty() { "" } else { "\nstderr:\n" },
-                    stderr,
-                )));
+                return Err(python_workflow_host_structured_error(
+                    "Python workflow discovery error",
+                    &message,
+                    stderr_task,
+                )
+                .await);
             }
             other => {
                 return Err(WorkflowRuntimeError::Internal(format!(
@@ -3016,16 +3015,12 @@ async fn run_python_workflow_host_local(
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
             Some("workflow.error") | Some("host.error") => {
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(WorkflowRuntimeError::Internal(format!(
-                    "Python workflow host error: {}{}{}",
-                    message
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error"),
-                    if stderr.is_empty() { "" } else { "\nstderr:\n" },
-                    stderr,
-                )));
+                return Err(python_workflow_host_structured_error(
+                    "Python workflow host error",
+                    &message,
+                    stderr_task,
+                )
+                .await);
             }
             Some("ctx.log") => {
                 let workflow_log = message
@@ -3166,16 +3161,12 @@ where
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
             Some("workflow.error") | Some("host.error") => {
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(WorkflowRuntimeError::Internal(format!(
-                    "Python workflow host error: {}{}{}",
-                    message
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error"),
-                    if stderr.is_empty() { "" } else { "\nstderr:\n" },
-                    stderr,
-                )));
+                return Err(python_workflow_host_structured_error(
+                    "Python workflow host error",
+                    &message,
+                    stderr_task,
+                )
+                .await);
             }
             Some("ctx.log") => {
                 let workflow_log = message
@@ -3216,6 +3207,48 @@ where
     Err(WorkflowRuntimeError::Internal(format!(
         "Python workflow host exited before workflow.result: stderr={stderr}"
     )))
+}
+
+async fn python_workflow_host_structured_error(
+    prefix: &str,
+    message: &Value,
+    mut stderr_task: JoinHandle<String>,
+) -> WorkflowRuntimeError {
+    let stderr = match tokio::time::timeout(
+        WORKFLOW_HOST_ERROR_STDERR_DRAIN_TIMEOUT,
+        &mut stderr_task,
+    )
+    .await
+    {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(_)) => String::new(),
+        Err(_) => {
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            String::new()
+        }
+    };
+
+    let mut detail = format!(
+        "{prefix}: {}",
+        message
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+    );
+    if let Some(traceback) = message
+        .get("traceback")
+        .and_then(Value::as_str)
+        .filter(|traceback| !traceback.is_empty())
+    {
+        detail.push_str("\ntraceback:\n");
+        detail.push_str(traceback);
+    }
+    if !stderr.is_empty() {
+        detail.push_str("\nstderr:\n");
+        detail.push_str(&stderr);
+    }
+    WorkflowRuntimeError::Internal(detail)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3727,9 +3760,6 @@ async fn run_python_agent_turn(
     if let Some(delivery) = args.get("delivery") {
         object_insert(&mut execution_metadata, "delivery", delivery.clone());
     }
-    if let Some(persona) = args.get("persona").and_then(Value::as_str) {
-        object_insert(&mut execution_metadata, "persona", json!(persona));
-    }
     if let Some(engine) = args.get("engine").and_then(Value::as_str) {
         object_insert(&mut execution_metadata, "engine", json!(engine));
     }
@@ -4061,6 +4091,20 @@ fn agent_metadata(
 fn object_insert(value: &mut Value, key: &str, item: Value) {
     if let Value::Object(object) = value {
         object.insert(key.to_owned(), item);
+    }
+}
+
+fn set_execution_persona_metadata(metadata: &mut Value, persona_id: Option<&str>) {
+    let Value::Object(object) = metadata else {
+        return;
+    };
+    match persona_id {
+        Some(persona_id) => {
+            object.insert("persona".to_owned(), json!(persona_id));
+        }
+        None => {
+            object.remove("persona");
+        }
     }
 }
 
@@ -4399,7 +4443,7 @@ async fn run_agent_session_turn(
         client_message_id,
         session_metadata,
         message_metadata,
-        execution_metadata,
+        mut execution_metadata,
         execution_idempotency_key,
         workflow_owned_thread,
         idle_timeout_ms,
@@ -4413,7 +4457,7 @@ async fn run_agent_session_turn(
     if workflow_owned_thread {
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
-    session_runtime
+    let session = session_runtime
         .create_or_get_session_with_principal(
             &thread_key,
             &harness_type,
@@ -4422,7 +4466,9 @@ async fn run_agent_session_turn(
             HarnessConflictPolicy::Reject,
             principal_foreign_id.as_deref(),
         )
-        .await?;
+        .await?
+        .session;
+    set_execution_persona_metadata(&mut execution_metadata, session.persona_id.as_deref());
     session_runtime
         .append_messages(
             &thread_key,
@@ -4642,6 +4688,45 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    async fn assert_structured_host_error_is_bounded(message_type: &str) {
+        let stderr_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            String::new()
+        });
+        let started_at = tokio::time::Instant::now();
+
+        let error = python_workflow_host_structured_error(
+            "Python workflow host error",
+            &json!({
+                "type": message_type,
+                "message": "structured failure",
+                "traceback": "Traceback (most recent call last):\n  exact-line\n",
+            }),
+            stderr_task,
+        )
+        .await;
+
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "structured host error exceeded its bounded stderr drain"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Python workflow host error: structured failure\ntraceback:\n\
+             Traceback (most recent call last):\n  exact-line\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_error_does_not_wait_for_never_closing_stderr() {
+        assert_structured_host_error_is_bounded("workflow.error").await;
+    }
+
+    #[tokio::test]
+    async fn host_error_does_not_wait_for_never_closing_stderr() {
+        assert_structured_host_error_is_bounded("host.error").await;
+    }
 
     #[test]
     fn generic_workflow_runs_cannot_claim_approval_idempotency_keys() {
@@ -5073,6 +5158,8 @@ mod tests {
             "google_drive_sync",
             "linear_sync",
             "company_context_documents",
+            "company_context_embeddings",
+            "memory_generation",
             "slack_retention",
             "chief_of_staff_daily",
         ] {
@@ -5701,5 +5788,16 @@ mod tests {
             select_stale_cancellations(&active, &BTreeSet::new(), &mut counts, 1),
             vec!["task-1".to_owned()]
         );
+    }
+
+    #[test]
+    fn execution_persona_metadata_tracks_effective_session_persona() {
+        let mut metadata = json!({"persona": "requested"});
+
+        set_execution_persona_metadata(&mut metadata, Some("stored"));
+        assert_eq!(metadata["persona"], json!("stored"));
+
+        set_execution_persona_metadata(&mut metadata, None);
+        assert!(metadata.get("persona").is_none());
     }
 }
