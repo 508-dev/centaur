@@ -1422,12 +1422,9 @@ impl SessionRuntime {
         }
     }
 
-    /// Spawn the background reaper that stops sandboxes whose total lifetime
-    /// expired. No-op when max-lifetime reaping is disabled.
+    /// Spawn the background reaper that releases stale terminal auxiliaries
+    /// and, when configured, stops sandboxes whose total lifetime expired.
     pub fn with_sandbox_reaper(self, config: SandboxReaperConfig) -> Self {
-        if !config.is_enabled() {
-            return self;
-        }
         SandboxReaper::new(self.sandbox_runtime.manager.clone(), config).spawn();
         self
     }

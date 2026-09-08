@@ -29,12 +29,6 @@ pub struct SandboxReaperConfig {
     pub max_lifetime: Option<Duration>,
 }
 
-impl SandboxReaperConfig {
-    pub fn is_enabled(&self) -> bool {
-        self.max_lifetime.is_some()
-    }
-}
-
 pub struct SandboxReaper {
     manager: Arc<SandboxManager>,
     config: SandboxReaperConfig,
@@ -61,9 +55,6 @@ impl SandboxReaper {
     /// Sweep once and return how many sandboxes were stopped. A failed stop is
     /// logged and skipped so one wedged sandbox cannot stall the sweep.
     pub async fn reap_once(&self) -> SandboxResult<usize> {
-        if !self.config.is_enabled() {
-            return Ok(0);
-        }
         let now = SystemTime::now();
         let mut reaped = 0;
         for observed in self.manager.list_observed().await? {
@@ -192,14 +183,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_config_reaps_nothing() {
+    fn absent_max_lifetime_disables_only_expiry_reaping() {
         let now = SystemTime::now();
         let sandbox = observed(centaur_sandbox_core::SandboxStatus::Suspended)
             .with_created_at(Some(now - Duration::from_secs(100_000)))
             .with_suspended_since(Some(now - Duration::from_secs(100_000)));
         let config = config(None);
 
-        assert!(!config.is_enabled());
         assert_eq!(reap_reason(&sandbox, now, &config), None);
     }
 }

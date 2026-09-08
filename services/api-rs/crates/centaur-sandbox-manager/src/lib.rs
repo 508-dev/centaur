@@ -44,7 +44,7 @@ mod tests {
             manager.clone(),
             super::SandboxReaperConfig {
                 interval: std::time::Duration::from_secs(60),
-                max_lifetime: Some(std::time::Duration::from_secs(100)),
+                max_lifetime: None,
             },
         );
         assert_eq!(reaper.reap_once().await.unwrap(), 0);
