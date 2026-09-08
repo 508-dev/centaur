@@ -24,16 +24,16 @@ function finding(overrides: Partial<Parameters<typeof makeReviewFinding>[0]> = {
 }
 
 describe("review finding fingerprints", () => {
-  test("are stable across reviewers, moved lines, mutable hunks, and URLs", () => {
+  test("are stable across reviewers, moved hunk coordinates, and URLs", () => {
     const first = fingerprintReviewFinding({
       body: "Check  https://example.test/one  before use",
-      diffHunk: "+first implementation",
+      diffHunk: "@@ -1 +1 @@\n-old\n+same implementation",
       line: 10,
       path: "./src/policy.ts",
     });
     const second = fingerprintReviewFinding({
       body: "check https://elsewhere.test/two before use",
-      diffHunk: "+replacement implementation",
+      diffHunk: "@@ -90 +99 @@\n-old\n+same implementation",
       line: 99,
       path: "src/policy.ts",
     });
@@ -42,6 +42,13 @@ describe("review finding fingerprints", () => {
       fingerprintReviewFinding({
         body: "check https://elsewhere.test/two before use",
         path: "src/other.ts",
+      }),
+    ).not.toBe(first);
+    expect(
+      fingerprintReviewFinding({
+        body: "check https://elsewhere.test/two before use",
+        diffHunk: "@@ -90 +99 @@\n-old\n+different implementation",
+        path: "src/policy.ts",
       }),
     ).not.toBe(first);
   });
@@ -111,6 +118,19 @@ describe("review finding ledger", () => {
     expect(mergeReviewFindings(decided.ledger, [repeated], 2).newFindings).toEqual(
       [],
     );
+  });
+
+  test("preserves the highest severity when a pending finding is rediscovered", () => {
+    const severe = finding({
+      body:
+        "Centaur-Severity: security\nImpact: repository scope can widen\nEvidence: exact unchecked call is shown",
+    });
+    const initial = mergeReviewFindings(undefined, [severe], 1);
+    expect(initial.ledger[severe.fingerprint]?.severity).toBe("security");
+
+    const downgraded = { ...severe, severity: "normal" as const, reviewId: 32 };
+    const merged = mergeReviewFindings(initial.ledger, [downgraded], 1);
+    expect(merged.ledger[severe.fingerprint]?.severity).toBe("security");
   });
 
   test("rejects a disposition detached from the original review thread", () => {

@@ -468,6 +468,23 @@ function exhaustedAdmission(
 export function decideReviewAdmission(
   input: ReviewAdmissionInput,
 ): ReviewAdmission {
+  if (
+    input.assessment?.changeClass === "repair" &&
+    input.actor !== "automation"
+  ) {
+    input = {
+      ...input,
+      assessment: {
+        ...input.assessment,
+        changeClass: "new_risk",
+        kind: "material",
+        reasons: [
+          ...input.assessment.reasons,
+          `repair_actor_not_automation:${input.actor}`,
+        ],
+      },
+    };
+  }
   const existing = input.state;
   if (!existing) {
     const state = firstEpoch(input.headSha, input.reviewerKey);

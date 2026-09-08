@@ -853,6 +853,7 @@ export async function handleReviewEvent(
         reviewNode,
         reviewerKey,
         effectiveHeadSha,
+        reviewState,
       );
     } catch (error) {
       logger(ctx).warn("githubbot_review_findings_load_failed", {
@@ -1116,10 +1117,16 @@ async function hasAcceptedFindingRepairEvidence(
         ("previous_filename" in file &&
           file.previous_filename === findingPath),
     );
-    return (
-      changedFindingPath &&
-      findingFingerprintsFromCommits(commits).has(fingerprint)
-    );
+    if (!changedFindingPath) return false;
+    for (const commit of commits) {
+      if (!commitCarriesFindingFingerprint(commit, fingerprint)) continue;
+      if (
+        await commitChangesFindingPath(ctx, owner, repo, commit, findingPath)
+      ) {
+        return true;
+      }
+    }
+    return false;
   } catch (error) {
     logger(ctx).warn("githubbot_review_disposition_evidence_failed", {
       error: errorMessage(error),
@@ -1128,6 +1135,45 @@ async function hasAcceptedFindingRepairEvidence(
     });
     return false;
   }
+}
+
+async function commitChangesFindingPath(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  commit: unknown,
+  findingPath: string,
+): Promise<boolean> {
+  if (!isRecord(commit)) return false;
+  const ref = stringValue(commit.sha);
+  if (!ref) return false;
+  const changedFiles: JsonRecord[] = [];
+  for (let page = 1; page <= 3; page += 1) {
+    const response = await ctx.octokit.rest.repos.getCommit({
+      owner,
+      page,
+      per_page: 100,
+      ref,
+      repo,
+    });
+    const files = Array.isArray(response.data.files)
+      ? response.data.files.filter(isRecord)
+      : [];
+    changedFiles.push(...files);
+    if (files.length < 100) break;
+    if (page === 3) return false;
+  }
+  return changedFiles.some(
+    (file) =>
+      file.filename === findingPath || file.previous_filename === findingPath,
+  );
+}
+
+function commitCarriesFindingFingerprint(
+  commit: unknown,
+  fingerprint: string,
+): boolean {
+  return findingFingerprintsFromCommits([commit]).has(fingerprint);
 }
 
 async function maybeRecordReviewResetApproval(
@@ -1416,6 +1462,7 @@ async function collectReviewFindings(
   reviewNode: JsonRecord,
   reviewerKey: string,
   reviewedHeadSha: string,
+  reviewState: string | undefined,
 ): Promise<ReviewFinding[]> {
   const findings: ReviewFinding[] = [];
   for (let page = 1; page <= MAX_REVIEW_COMMENT_PAGES; page += 1) {
@@ -1455,7 +1502,7 @@ async function collectReviewFindings(
   // GitHub reviews may carry one body-only finding and no inline comments.
   // Do not fingerprint a summary body in addition to its inline findings: that
   // would create a fresh pseudo-finding whenever a reviewer rewrites a summary.
-  if (findings.length === 0) {
+  if (findings.length === 0 || reviewState === "changes_requested") {
     const body = stringValue(reviewNode.body)?.trim();
     if (body) {
       findings.push(
@@ -1799,7 +1846,26 @@ async function admitReviewResponse(
   if (findingsAlreadyKnown && admission.decision === "allow") {
     return { decision: "skip", state };
   }
-  return { ...admission, newFindings: mergedFindings.newFindings, state };
+  const admittedFindings = findingsForReviewTurn(
+    mergedFindings.newFindings,
+    loaded.state?.securityInterruptFingerprints,
+    admission.state.securityInterruptFingerprints,
+  );
+  return { ...admission, newFindings: admittedFindings, state };
+}
+
+export function findingsForReviewTurn(
+  findings: readonly ReviewFinding[],
+  priorInterrupts: readonly string[] | undefined,
+  currentInterrupts: readonly string[] | undefined,
+): ReviewFinding[] {
+  const prior = new Set(priorInterrupts ?? []);
+  const consumed = currentInterrupts?.find(
+    (fingerprint) => !prior.has(fingerprint),
+  );
+  return consumed
+    ? findings.filter((finding) => finding.fingerprint === consumed)
+    : [...findings];
 }
 
 async function escalateReviewBudget(

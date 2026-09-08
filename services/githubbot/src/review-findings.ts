@@ -48,9 +48,10 @@ const EXPLICIT_EVIDENCE = /^\s*evidence\s*:\s*\S.+$/im;
 
 /**
  * Build a reviewer-independent semantic fingerprint. Exact reviewer identity,
- * line number, and mutable diff context are intentionally excluded so a bot
- * cannot reopen the same normalized finding merely by changing accounts or
- * pointing at a nearby line after a repair.
+ * line number and hunk coordinates are intentionally excluded so a bot cannot
+ * reopen the same normalized finding merely by changing accounts or pointing
+ * at a moved line. The coordinate-free hunk body remains part of the identity
+ * so identical prose at two distinct code sites cannot collapse into one row.
  */
 export function fingerprintReviewFinding(input: {
   body: string;
@@ -60,6 +61,7 @@ export function fingerprintReviewFinding(input: {
 }): string {
   const canonical = JSON.stringify({
     body: normalizeFindingText(input.body),
+    context: normalizeDiffContext(input.diffHunk),
     path: normalizePath(input.path),
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
@@ -151,7 +153,7 @@ export function mergeReviewFindings(
         reviewId: finding.reviewId,
         reviewerKey: finding.reviewerKey,
         reviewedHeadSha: finding.reviewedHeadSha,
-        severity: finding.severity,
+        severity: highestSeverity(existing.severity, finding.severity),
       };
       continue;
     }
@@ -211,6 +213,22 @@ export function mergeReviewFindings(
     ledger: retainedLedger,
     newFindings: retainedNewFindings,
   };
+}
+
+function normalizeDiffContext(value: string | undefined): string {
+  return (value ?? "")
+    .split(/\r?\n/)
+    .filter((line) => !/^@@(?:\s|$)/.test(line))
+    .join("\n")
+    .trim();
+}
+
+function highestSeverity(
+  left: ReviewFinding["severity"],
+  right: ReviewFinding["severity"],
+): ReviewFinding["severity"] {
+  const rank = { normal: 0, security: 1, p0: 2 } as const;
+  return rank[left] >= rank[right] ? left : right;
 }
 
 export function parseReviewFindingDispositionMarkers(

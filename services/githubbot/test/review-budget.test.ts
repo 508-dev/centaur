@@ -277,6 +277,28 @@ describe("decideReviewAdmission", () => {
     startsRepairTurn: true,
   };
 
+  test("treats a mixed-author bounded repair as new risk", () => {
+    expect(
+      decideReviewAdmission({
+        ...base,
+        actor: "unknown",
+        assessment: {
+          changeClass: "repair",
+          changedFiles: 1,
+          changedLines: 4,
+          kind: "minor",
+          reasons: ["accepted_finding_repair"],
+          runtimeFiles: 1,
+        },
+        state: epoch(),
+      }),
+    ).toMatchObject({
+      decision: "pause",
+      reason: "change_actor_unknown",
+      assessment: { changeClass: "new_risk", kind: "material" },
+    });
+  });
+
   test("starts the first epoch and counts its broad review", () => {
     expect(decideReviewAdmission({ ...base, state: undefined })).toEqual({
       decision: "allow",
