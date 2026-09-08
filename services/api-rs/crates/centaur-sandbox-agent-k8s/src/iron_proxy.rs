@@ -18,7 +18,7 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Resource};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
@@ -693,6 +693,73 @@ impl AgentSandboxBackend {
         }
         reaped.insert("network_policy".to_owned(), count);
         Ok(reaped)
+    }
+
+    pub(crate) async fn cleanup_terminal_proxy_pods(&self, id: &SandboxId) -> SandboxResult<usize> {
+        let Some(sandbox) = self.get_sandbox(id).await? else {
+            return Ok(0);
+        };
+        if sandbox
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+            .map(String::as_str)
+            != Some(MANAGED_BY_VALUE)
+        {
+            return Ok(0);
+        }
+        let Some(sandbox_uid) = sandbox.metadata.uid.as_deref() else {
+            return Ok(0);
+        };
+        let Some(agent) = self.get_pod(id).await? else {
+            return Ok(0);
+        };
+        if !pod_stopped(&agent) || agent.metadata.uid.is_none() {
+            return Ok(0);
+        }
+        let params = ListParams::default().labels(&format!(
+            "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
+            id.as_str()
+        ));
+        let proxies = self
+            .pods()
+            .list(&params)
+            .await
+            .map_err(|error| map_kube_error("list terminal sandbox proxies", error))?;
+        let mut removed = 0;
+        for proxy in proxies.items {
+            if !terminal_proxy_cleanup_candidate(&proxy, &agent, id, sandbox_uid) {
+                continue;
+            }
+            let fresh_agent = self.get_pod(id).await?;
+            if !fresh_agent.as_ref().is_some_and(|fresh| {
+                fresh.metadata.uid == agent.metadata.uid
+                    && fresh.metadata.deletion_timestamp.is_none()
+                    && pod_stopped(fresh)
+            }) {
+                break;
+            }
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: proxy.metadata.uid.clone(),
+                    resource_version: proxy.metadata.resource_version.clone(),
+                }),
+                ..DeleteParams::default()
+            };
+            // Never call stop/pause or delete shared service/policy names:
+            // those could belong to a concurrent resume. Keep the agent Pod,
+            // logs, Sandbox CR, and PVC for diagnosis and explicit retention.
+            let Some(name) = proxy.metadata.name.as_deref() else {
+                continue;
+            };
+            match self.pods().delete(name, &params).await {
+                Ok(_) => removed += 1,
+                Err(kube::Error::Api(error)) if matches!(error.code, 404 | 409) => {}
+                Err(error) => return Err(map_kube_error("delete terminal sandbox proxy", error)),
+            }
+        }
+        Ok(removed)
     }
 
     pub(crate) async fn assign_proxy_principal(
@@ -2139,6 +2206,71 @@ fn is_orphan_proxy_resource(
         .is_ok_and(|age| age >= grace)
 }
 
+fn terminal_proxy_cleanup_candidate(
+    proxy: &Pod,
+    agent: &Pod,
+    id: &SandboxId,
+    sandbox_uid: &str,
+) -> bool {
+    if !pod_stopped(agent)
+        || agent.metadata.uid.is_none()
+        || agent.metadata.deletion_timestamp.is_some()
+        || proxy.metadata.uid.is_none()
+        || proxy.metadata.resource_version.is_none()
+        || proxy.metadata.deletion_timestamp.is_some()
+    {
+        return false;
+    }
+    let Some(labels) = proxy.metadata.labels.as_ref() else {
+        return false;
+    };
+    if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANAGED_BY_VALUE)
+        || labels.get(IRON_PROXY_LABEL).map(String::as_str) != Some("true")
+        || labels.get(SANDBOX_ID_LABEL).map(String::as_str) != Some(id.as_str())
+    {
+        return false;
+    }
+    let owned = |pod: &Pod| {
+        pod.metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.uid == sandbox_uid
+                        && owner.name == id.as_str()
+                        && owner.kind == "Sandbox"
+                        && owner.api_version == crate::crd::Sandbox::api_version(&())
+                })
+            })
+    };
+    // A proxy repaired during the failed turn is also obsolete. A proxy made
+    // at/after termination may belong to a resume, so retain it. Fall back to
+    // Pod creation when the kubelet has not recorded a termination timestamp.
+    let terminal_cutoff = agent
+        .status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|container| {
+            container
+                .state
+                .as_ref()?
+                .terminated
+                .as_ref()?
+                .finished_at
+                .as_ref()
+        })
+        .max_by_key(|time| time.0)
+        .or(agent.metadata.creation_timestamp.as_ref());
+    owned(proxy)
+        && owned(agent)
+        && matches!(
+            (&proxy.metadata.creation_timestamp, terminal_cutoff),
+        (Some(proxy_created), Some(cutoff)) if proxy_created.0 < cutoff.0
+        )
+}
+
 fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
     let name = sandbox.metadata.name.as_ref()?;
     let uid = sandbox.metadata.uid.as_ref()?;
@@ -2339,6 +2471,70 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_cleanup_requires_owned_old_proxy_and_terminal_agent_identity() {
+        let agent: Pod = serde_json::from_value(json!({
+            "metadata": {"name":"sandbox-test", "uid":"agent-uid", "creationTimestamp":"2026-01-02T00:00:00Z",
+                "ownerReferences": [{"apiVersion":"agents.x-k8s.io/v1alpha1", "kind":"Sandbox", "name":"sandbox-test", "uid":"sandbox-uid"}]},
+            "status": {"phase":"Failed", "containerStatuses":[{
+                "name":"agent", "image":"fixture", "imageID":"fixture", "ready":false,
+                "restartCount":0, "state":{"terminated":{"exitCode":137, "finishedAt":"2026-01-04T00:00:00Z"}}
+            }]}
+        })).unwrap();
+        let proxy: Pod = serde_json::from_value(json!({
+            "metadata": {
+                "name":"sandbox-test-proxy-old", "uid":"proxy-uid", "resourceVersion":"fixture-version", "creationTimestamp":"2026-01-01T00:00:00Z",
+                "labels": {"centaur.ai/managed-by":"api-rs", "centaur.ai/iron-proxy":"true", "centaur.ai/sandbox-id":"sandbox-test"},
+                "ownerReferences": [{"apiVersion":"agents.x-k8s.io/v1alpha1", "kind":"Sandbox", "name":"sandbox-test", "uid":"sandbox-uid"}]
+            }
+        })).unwrap();
+        let id = SandboxId::new("sandbox-test");
+        let eligible = |proxy: &Pod, agent: &Pod| {
+            terminal_proxy_cleanup_candidate(proxy, agent, &id, "sandbox-uid")
+        };
+        assert!(eligible(&proxy, &agent));
+        let mut newer = proxy.clone();
+        newer.metadata.creation_timestamp =
+            Some(serde_json::from_value(json!("2026-01-03T00:00:00Z")).unwrap());
+        assert!(
+            eligible(&newer, &agent),
+            "a proxy repaired before failure can be released"
+        );
+        let mut no_finish = agent.clone();
+        no_finish.status.as_mut().unwrap().container_statuses = None;
+        assert!(!eligible(&newer, &no_finish));
+        newer.metadata.creation_timestamp =
+            Some(serde_json::from_value(json!("2026-01-04T00:00:00Z")).unwrap());
+        assert!(!eligible(&newer, &agent));
+        newer.metadata.creation_timestamp =
+            Some(serde_json::from_value(json!("2026-01-05T00:00:00Z")).unwrap());
+        assert!(!eligible(&newer, &agent));
+        let mut foreign = proxy.clone();
+        foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "another-owner".to_owned();
+        assert!(!eligible(&foreign, &agent));
+        let mut foreign_agent = agent.clone();
+        foreign_agent.metadata.owner_references = None;
+        assert!(!eligible(&proxy, &foreign_agent));
+        let mut no_version = proxy.clone();
+        no_version.metadata.resource_version = None;
+        assert!(!eligible(&no_version, &agent));
+        let mut unlabeled = proxy.clone();
+        unlabeled.metadata.labels = None;
+        assert!(!eligible(&unlabeled, &agent));
+        let mut no_uid = proxy.clone();
+        no_uid.metadata.uid = None;
+        assert!(!eligible(&no_uid, &agent));
+        let mut no_time = proxy.clone();
+        no_time.metadata.creation_timestamp = None;
+        assert!(!eligible(&no_time, &agent));
+        let mut active = agent.clone();
+        active.status.as_mut().unwrap().phase = Some("Running".to_owned());
+        assert!(!eligible(&proxy, &active));
+        let mut vanished = agent.clone();
+        vanished.metadata.uid = None;
+        assert!(!eligible(&proxy, &vanished));
+    }
 
     fn no_scheduling() -> ProxyPodScheduling<'static> {
         static EMPTY_SELECTOR: BTreeMap<String, String> = BTreeMap::new();

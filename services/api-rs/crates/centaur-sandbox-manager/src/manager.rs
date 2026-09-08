@@ -179,6 +179,12 @@ where
         self.backend.reap_orphan_iron_proxy_resources(grace).await
     }
 
+    /// Do not change desired state: a terminal workload's evidence and
+    /// workspace remain available to the session's recovery/retention owner.
+    pub async fn cleanup_terminal_auxiliaries(&self, id: &SandboxId) -> SandboxResult<usize> {
+        self.backend.cleanup_terminal_auxiliaries(id).await
+    }
+
     pub async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         let backend = self.backend.name();
         match self.backend.pause(id).await {

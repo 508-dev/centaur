@@ -54,6 +54,14 @@ pub trait SandboxBackend: Send + Sync {
     /// Stop the sandbox and clean up backend-owned runtime resources.
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()>;
 
+    /// Release ephemeral companions of a terminal workload without deleting
+    /// the workload, recorded output, or persistent workspace. Implementations
+    /// must revalidate terminal ownership and tolerate concurrent replacement.
+    /// Returns the number of ephemeral resources removed, not stopped sandboxes.
+    async fn cleanup_terminal_auxiliaries(&self, _id: &SandboxId) -> SandboxResult<usize> {
+        Ok(0)
+    }
+
     /// Rebind a running sandbox's managed iron-proxy to a different
     /// iron-control principal, together with the requesting user's principal
     /// for the current turn (`None` clears a previous requester binding).
