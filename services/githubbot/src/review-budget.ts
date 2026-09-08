@@ -274,14 +274,19 @@ export function assessReviewChange(input: {
 
 function isFormattingOnly(file: ReviewChangeFile): boolean {
   if (!file.patch) return fileChanges(file) === 0;
-  const added = new Map<string, number>();
-  const removed = new Map<string, number>();
+  const hunks: Array<{ added: string[]; removed: string[] }> = [];
+  let hunk = { added: [] as string[], removed: [] as string[] };
   for (const line of file.patch.split("\n")) {
     if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
+    if (line.startsWith("@@")) {
+      if (hunk.added.length > 0 || hunk.removed.length > 0) hunks.push(hunk);
+      hunk = { added: [], removed: [] };
+      continue;
+    }
     const target = line.startsWith("+")
-      ? added
+      ? hunk.added
       : line.startsWith("-")
-        ? removed
+        ? hunk.removed
         : undefined;
     if (!target) continue;
     // Only ignore blank lines and trailing whitespace. Leading indentation and
@@ -289,18 +294,13 @@ function isFormattingOnly(file: ReviewChangeFile): boolean {
     // as cosmetic would allow real changes to masquerade as formatting.
     const normalized = line.slice(1).trimEnd();
     if (!normalized) continue;
-    target.set(normalized, (target.get(normalized) ?? 0) + 1);
+    target.push(normalized);
   }
-  for (const [line, additions] of added) {
-    const cancellations = Math.min(additions, removed.get(line) ?? 0);
-    if (cancellations > 0) {
-      added.set(line, additions - cancellations);
-      removed.set(line, (removed.get(line) ?? 0) - cancellations);
-    }
-  }
-  return (
-    Array.from(added.values()).every((count) => count === 0) &&
-    Array.from(removed.values()).every((count) => count === 0)
+  if (hunk.added.length > 0 || hunk.removed.length > 0) hunks.push(hunk);
+  return hunks.every(
+    ({ added, removed }) =>
+      added.length === removed.length &&
+      added.every((line, index) => line === removed[index]),
   );
 }
 

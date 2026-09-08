@@ -121,6 +121,21 @@ describe("assessReviewChange", () => {
     ).toMatchObject({ changeClass: "new_risk", kind: "material" });
   });
 
+  test("does not mistake reordered lines for formatting", () => {
+    expect(
+      assessReviewChange({
+        comparisonStatus: "ahead",
+        files: [
+          {
+            changes: 4,
+            filename: "src/one.ts",
+            patch: "@@ -1,2 +1,2 @@\n-first();\n-second();\n+second();\n+first();",
+          },
+        ],
+      }),
+    ).toMatchObject({ changeClass: "new_risk", kind: "material" });
+  });
+
   test("keeps a tree-identical rebase in the current epoch", () => {
     expect(
       assessReviewChange({

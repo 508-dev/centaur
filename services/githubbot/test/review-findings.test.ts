@@ -86,9 +86,14 @@ describe("review finding ledger", () => {
       reviewId: 32,
       reviewerKey: "github-user:202",
     });
-    expect(mergeReviewFindings(initial.ledger, [repeated], 1).newFindings).toHaveLength(
-      1,
-    );
+    const repeatedMerge = mergeReviewFindings(initial.ledger, [repeated], 1);
+    expect(repeatedMerge.newFindings).toHaveLength(1);
+    expect(repeatedMerge.ledger[first.fingerprint]).toMatchObject({
+      commentId: 88,
+      firstSeenEpoch: 1,
+      reviewId: 32,
+      reviewerKey: "github-user:202",
+    });
 
     const marker = parseReviewFindingDispositionMarkers(
       `<!-- centaur-review-finding ${first.fingerprint} review:31 accepted -->`,
@@ -126,5 +131,15 @@ describe("review finding ledger", () => {
         replyToCommentId: 999,
       }).changed,
     ).toBe(false);
+  });
+
+  test("discards contradictory dispositions for the same finding and review", () => {
+    const first = finding();
+    expect(
+      parseReviewFindingDispositionMarkers(
+        `<!-- centaur-review-finding ${first.fingerprint} review:31 accepted -->\n` +
+          `<!-- centaur-review-finding ${first.fingerprint} review:31 rejected -->`,
+      ),
+    ).toEqual([]);
   });
 });

@@ -1014,7 +1014,15 @@ export async function handleReviewFindingDispositionComment(
 }
 
 const REJECTED_FINDING_EVIDENCE =
-  /^Centaur-Finding-Evidence:\s*(\S.{19,})$/im;
+  /^Centaur-Finding-Evidence:\s*(sha256:[0-9a-f]{64})\s+(\S.{19,})$/gim;
+
+function rejectedFindingEvidenceFingerprints(body: string): Set<string> {
+  return new Set(
+    Array.from(body.matchAll(REJECTED_FINDING_EVIDENCE), (match) =>
+      (match[1] ?? "").toLowerCase(),
+    ).filter(Boolean),
+  );
+}
 
 /**
  * A model-authored marker is only a proposal until deterministic evidence
@@ -1032,7 +1040,7 @@ async function verifyReviewFindingDispositionMarkers(
   markers: readonly ReviewFindingDispositionMarker[],
 ): Promise<ReviewFindingDispositionMarker[]> {
   const verified: ReviewFindingDispositionMarker[] = [];
-  const rejectedHasEvidence = REJECTED_FINDING_EVIDENCE.test(commentBody);
+  const rejectedEvidence = rejectedFindingEvidenceFingerprints(commentBody);
   let currentHeadSha: string | undefined;
   const acceptedEvidence = new Map<string, boolean>();
 
@@ -1040,7 +1048,7 @@ async function verifyReviewFindingDispositionMarkers(
     const finding = ledger?.[marker.fingerprint];
     if (!finding || finding.reviewId !== marker.reviewId) continue;
     if (marker.disposition === "rejected") {
-      if (rejectedHasEvidence) verified.push(marker);
+      if (rejectedEvidence.has(marker.fingerprint)) verified.push(marker);
       continue;
     }
 
@@ -2132,7 +2140,7 @@ function fireAddressReviewTurn(
     `the commit trailer \`Centaur-Automation: true\`, then push.\n` +
     `- Reply to every thread with the evidence and what changed. Where a finding ` +
     `is invalid, explain the enforcing contract briefly and include an exact ` +
-    `\`Centaur-Finding-Evidence: <at least 20 characters of concrete evidence>\` ` +
+    `\`Centaur-Finding-Evidence: <fingerprint> <at least 20 characters of concrete evidence>\` ` +
     `line. Resolve addressed or ` +
     `evidence-rejected threads when authorized. For each finding below, include ` +
     `exactly one machine-readable disposition marker in your reply to that ` +

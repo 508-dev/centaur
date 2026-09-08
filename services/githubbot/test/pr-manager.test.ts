@@ -747,7 +747,7 @@ describe("bounded review epochs", () => {
           action: "created",
           comment: {
             body:
-              "Centaur-Finding-Evidence: repository-token broker middleware rejects every unlisted repository ID.\n\n" +
+              `Centaur-Finding-Evidence: ${fingerprint} repository-token broker middleware rejects every unlisted repository ID.\n\n` +
               `<!-- centaur-review-finding ${fingerprint} review:40 rejected -->`,
             id: 401,
             in_reply_to_id: 400,
@@ -779,6 +779,63 @@ describe("bounded review epochs", () => {
       },
       reviewerRoundsUsed: { "github-user:101": 1 },
       roundsUsed: 1,
+    });
+  });
+
+  test("requires rejection evidence for each exact finding fingerprint", async () => {
+    const state = makeState();
+    const ctx = budgetCtx({
+      reviewFindings: {
+        44: [
+          {
+            body: "The first repository boundary is unchecked.",
+            diff_hunk: "+first();",
+            line: 20,
+            path: "src/first.ts",
+          },
+          {
+            body: "The second repository boundary is unchecked.",
+            diff_hunk: "+second();",
+            line: 30,
+            path: "src/second.ts",
+          },
+        ],
+      },
+      state,
+    });
+    await handleReviewEvent(ctx, submittedReview(44, "head-1"));
+    const initial = (await state.get(
+      "centaur-githubbot:review-budget:base/repo#7",
+    )) as { findingLedger: Record<string, { disposition: string }> };
+    const fingerprints = Object.keys(initial.findingLedger);
+    expect(fingerprints).toHaveLength(2);
+    const [evidenced, unsupported] = fingerprints;
+    if (!evidenced || !unsupported) throw new Error("missing finding fingerprints");
+
+    await handleReviewFindingDispositionComment(
+      ctx,
+      JSON.stringify({
+        action: "created",
+        comment: {
+          body:
+            `Centaur-Finding-Evidence: ${evidenced} deterministic policy rejects this exact path before token minting.\n\n` +
+            `<!-- centaur-review-finding ${evidenced} review:44 rejected -->\n` +
+            `<!-- centaur-review-finding ${unsupported} review:44 rejected -->`,
+          id: 442,
+          user: { login: "centaur-bot" },
+        },
+        pull_request: { number: 7 },
+        repository: { full_name: "base/repo" },
+      }),
+    );
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      findingLedger: {
+        [evidenced]: { disposition: "rejected" },
+        [unsupported]: { disposition: "pending" },
+      },
     });
   });
 

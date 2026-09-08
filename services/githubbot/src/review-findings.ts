@@ -142,7 +142,18 @@ export function mergeReviewFindings(
     // A repeated pending finding remains actionable. Only an evidence-backed
     // accepted/rejected decision suppresses rediscovery.
     actionableFindings.push(finding);
-    if (existing) continue;
+    if (existing) {
+      next[finding.fingerprint] = {
+        ...existing,
+        commentId: finding.commentId,
+        path: finding.path,
+        reviewId: finding.reviewId,
+        reviewerKey: finding.reviewerKey,
+        reviewedHeadSha: finding.reviewedHeadSha,
+        severity: finding.severity,
+      };
+      continue;
+    }
     next[finding.fingerprint] = {
       commentId: finding.commentId,
       disposition: "pending",
@@ -186,7 +197,10 @@ export function parseReviewFindingDispositionMarkers(
   body: string,
 ): ReviewFindingDispositionMarker[] {
   const markers: ReviewFindingDispositionMarker[] = [];
-  const seen = new Set<string>();
+  const byFinding = new Map<
+    string,
+    ReviewFindingDispositionMarker | "conflict"
+  >();
   for (const match of body.matchAll(new RegExp(DISPOSITION_MARKER_SOURCE, "gi"))) {
     const fingerprint = match[1]?.toLowerCase();
     const reviewId = Number.parseInt(match[2] ?? "", 10);
@@ -199,10 +213,18 @@ export function parseReviewFindingDispositionMarkers(
     ) {
       continue;
     }
-    const key = `${fingerprint}:${reviewId}:${disposition}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    markers.push({ fingerprint, reviewId, disposition });
+    const key = `${fingerprint}:${reviewId}`;
+    const marker = { fingerprint, reviewId, disposition };
+    const existing = byFinding.get(key);
+    if (existing === "conflict") continue;
+    if (existing && existing.disposition !== disposition) {
+      byFinding.set(key, "conflict");
+      continue;
+    }
+    if (!existing) byFinding.set(key, marker);
+  }
+  for (const marker of byFinding.values()) {
+    if (marker !== "conflict") markers.push(marker);
   }
   return markers;
 }
