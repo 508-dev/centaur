@@ -126,6 +126,7 @@ export function mergeReviewFindings(
   findings: readonly ReviewFinding[],
   epoch: number,
 ): {
+  droppedFindings: number;
   ledger: ReviewFindingLedger;
   newFindings: ReviewFinding[];
 } {
@@ -168,28 +169,47 @@ export function mergeReviewFindings(
 
   const entries = Object.entries(next);
   if (entries.length <= MAX_REVIEW_FINDINGS) {
-    return { ledger: next, newFindings: actionableFindings };
+    return { droppedFindings: 0, ledger: next, newFindings: actionableFindings };
   }
-  // Retain all decided findings first, then the newest pending findings. This
-  // bounds durable state without letting noisy pending reviews evict decisions.
+  // Current actionable findings must not disappear behind a full historical
+  // ledger. Retain them first, then older pending work, then the newest decided
+  // fingerprints. Old decisions are the safest entries to evict: rediscovery
+  // spends bounded budget, while dropping a current finding silently skips it.
+  const actionableFingerprints = [
+    ...new Set(actionableFindings.map((finding) => finding.fingerprint)),
+  ];
+  const actionableFingerprintSet = new Set(actionableFingerprints);
+  const actionable: Array<[string, ReviewFindingRecord]> =
+    actionableFingerprints.flatMap((fingerprint) => {
+    const record = next[fingerprint];
+      return record ? [[fingerprint, record]] : [];
+    });
   const decided = entries.filter(
-    ([, finding]) => finding.disposition !== "pending",
+    ([fingerprint, finding]) =>
+      finding.disposition !== "pending" &&
+      !actionableFingerprintSet.has(fingerprint),
   );
   const pending = entries.filter(
-    ([, finding]) => finding.disposition === "pending",
+    ([fingerprint, finding]) =>
+      finding.disposition === "pending" &&
+      !actionableFingerprintSet.has(fingerprint),
   );
-  const retainedDecided = decided.slice(-MAX_REVIEW_FINDINGS);
-  const remaining = MAX_REVIEW_FINDINGS - retainedDecided.length;
-  const retained = [
-    ...retainedDecided,
-    ...(remaining > 0 ? pending.slice(-remaining) : []),
-  ];
+  const retained = actionable.slice(0, MAX_REVIEW_FINDINGS);
+  let remaining = MAX_REVIEW_FINDINGS - retained.length;
+  if (remaining > 0) {
+    const retainedPending = pending.slice(-remaining);
+    retained.push(...retainedPending);
+    remaining -= retainedPending.length;
+  }
+  if (remaining > 0) retained.push(...decided.slice(-remaining));
   const retainedLedger = Object.fromEntries(retained);
+  const retainedNewFindings = actionableFindings.filter(
+    (finding) => retainedLedger[finding.fingerprint] !== undefined,
+  );
   return {
+    droppedFindings: actionableFindings.length - retainedNewFindings.length,
     ledger: retainedLedger,
-    newFindings: actionableFindings.filter(
-      (finding) => retainedLedger[finding.fingerprint] !== undefined,
-    ),
+    newFindings: retainedNewFindings,
   };
 }
 

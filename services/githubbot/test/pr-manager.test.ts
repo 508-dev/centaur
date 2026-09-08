@@ -758,10 +758,12 @@ describe("bounded review epochs", () => {
         }),
       ),
     ).toBe(true);
+    await drainBackgroundWork(5_000);
+    setHeadSha(ctx, "head-2");
 
     await handleReviewEvent(
       ctx,
-      submittedReview(41, "head-1", {
+      submittedReview(41, "head-2", {
         id: 202,
         login: "second-reviewer",
       }),
@@ -779,6 +781,7 @@ describe("bounded review epochs", () => {
       },
       reviewerRoundsUsed: { "github-user:101": 1 },
       roundsUsed: 1,
+      lastReviewedHeadSha: "head-2",
     });
   });
 
@@ -830,6 +833,7 @@ describe("bounded review epochs", () => {
         repository: { full_name: "base/repo" },
       }),
     );
+    await drainBackgroundWork(5_000);
 
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
@@ -867,6 +871,7 @@ describe("bounded review epochs", () => {
         }),
       ),
     ).toBe(true);
+    await drainBackgroundWork(5_000);
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),
     ).toMatchObject({
@@ -905,6 +910,7 @@ describe("bounded review epochs", () => {
         repository: { full_name: "base/repo" },
       }),
     );
+    await drainBackgroundWork(5_000);
 
     expect(
       await state.get("centaur-githubbot:review-budget:base/repo#7"),

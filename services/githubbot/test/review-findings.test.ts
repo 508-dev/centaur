@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  MAX_REVIEW_FINDINGS,
   applyReviewFindingDispositionMarkers,
   findingSeverity,
   fingerprintReviewFinding,
@@ -141,5 +142,30 @@ describe("review finding ledger", () => {
           `<!-- centaur-review-finding ${first.fingerprint} review:31 rejected -->`,
       ),
     ).toEqual([]);
+  });
+
+  test("evicts old decisions before dropping a current finding", () => {
+    const ledger = Object.fromEntries(
+      Array.from({ length: MAX_REVIEW_FINDINGS }, (_, index) => {
+        const item = finding({ body: `Historical finding ${index}` });
+        return [
+          item.fingerprint,
+          {
+            disposition: "rejected" as const,
+            firstSeenEpoch: 1,
+            reviewId: item.reviewId,
+            reviewedHeadSha: item.reviewedHeadSha,
+            reviewerKey: item.reviewerKey,
+            severity: item.severity,
+          },
+        ];
+      }),
+    );
+    const current = finding({ body: "A current actionable finding" });
+    const merged = mergeReviewFindings(ledger, [current], 2);
+    expect(Object.keys(merged.ledger)).toHaveLength(MAX_REVIEW_FINDINGS);
+    expect(merged.ledger[current.fingerprint]?.disposition).toBe("pending");
+    expect(merged.newFindings).toEqual([current]);
+    expect(merged.droppedFindings).toBe(0);
   });
 });

@@ -49,6 +49,7 @@ export type ReviewPauseReason =
   | "change_actor_unknown"
   | "change_significance_unknown"
   | "epoch_budget_exhausted"
+  | "finding_ledger_capacity_exhausted"
   | "aggregate_round_budget_exhausted"
   | "reviewer_round_budget_exhausted"
   | "round_budget_exhausted";
@@ -274,21 +275,27 @@ export function assessReviewChange(input: {
 
 function isFormattingOnly(file: ReviewChangeFile): boolean {
   if (!file.patch) return fileChanges(file) === 0;
-  const hunks: Array<{ added: string[]; removed: string[] }> = [];
-  let hunk = { added: [] as string[], removed: [] as string[] };
+  const blocks: Array<{ added: string[]; removed: string[] }> = [];
+  let block = { added: [] as string[], removed: [] as string[] };
+  const flush = () => {
+    if (block.added.length > 0 || block.removed.length > 0) blocks.push(block);
+    block = { added: [], removed: [] };
+  };
   for (const line of file.patch.split("\n")) {
     if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
     if (line.startsWith("@@")) {
-      if (hunk.added.length > 0 || hunk.removed.length > 0) hunks.push(hunk);
-      hunk = { added: [], removed: [] };
+      flush();
       continue;
     }
     const target = line.startsWith("+")
-      ? hunk.added
+      ? block.added
       : line.startsWith("-")
-        ? hunk.removed
+        ? block.removed
         : undefined;
-    if (!target) continue;
+    if (!target) {
+      flush();
+      continue;
+    }
     // Only ignore blank lines and trailing whitespace. Leading indentation and
     // whitespace inside strings can be behavioral, so treating all whitespace
     // as cosmetic would allow real changes to masquerade as formatting.
@@ -296,8 +303,8 @@ function isFormattingOnly(file: ReviewChangeFile): boolean {
     if (!normalized) continue;
     target.push(normalized);
   }
-  if (hunk.added.length > 0 || hunk.removed.length > 0) hunks.push(hunk);
-  return hunks.every(
+  flush();
+  return blocks.every(
     ({ added, removed }) =>
       added.length === removed.length &&
       added.every((line, index) => line === removed[index]),

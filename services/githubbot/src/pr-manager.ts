@@ -968,8 +968,8 @@ export async function handleReviewFindingDispositionComment(
       : undefined);
   if (number === undefined) return false;
 
-  let changed = false;
-  await runExclusive(reviewBudgetLockKey(repo.owner, repo.repo, number), async () => {
+  backgroundWaitUntil(runExclusive(reviewBudgetLockKey(repo.owner, repo.repo, number), async () => {
+    let changed = false;
     const loaded = await retryingReviewBudgetLoad(
       ctx,
       repo.owner,
@@ -1000,16 +1000,16 @@ export async function handleReviewFindingDispositionComment(
       ...loaded.state,
       findingLedger: applied.ledger,
     });
-  });
-  traceLog(
-    ctx.options,
-    "githubbot_review_finding_dispositions_recorded",
-    makeTrace(
-      managementThreadKey(repo.owner, repo.repo, number),
-      `review-disposition-${stringValue(comment.id) ?? "comment"}`,
-    ),
-    { changed, marker_count: markers.length },
-  );
+    traceLog(
+      ctx.options,
+      "githubbot_review_finding_dispositions_recorded",
+      makeTrace(
+        managementThreadKey(repo.owner, repo.repo, number),
+        `review-disposition-${stringValue(comment.id) ?? "comment"}`,
+      ),
+      { changed, marker_count: markers.length },
+    );
+  }));
   return true;
 }
 
@@ -1645,6 +1645,37 @@ async function admitReviewResponse(
     findings,
     loaded.state?.epoch ?? 1,
   );
+  if (mergedFindings.droppedFindings > 0) {
+    const initialized = decideReviewAdmission({
+      actor: "unknown",
+      headSha,
+      manualReset: false,
+      maxEpochs: ctx.options.reviewMaxEpochs ?? DEFAULT_REVIEW_MAX_EPOCHS,
+      maxRoundsPerEpoch:
+        ctx.options.reviewMaxRoundsPerEpoch ??
+        DEFAULT_REVIEW_MAX_ROUNDS_PER_EPOCH,
+      maxTotalRoundsPerEpoch:
+        ctx.options.reviewMaxTotalRoundsPerEpoch ??
+        DEFAULT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH,
+      reviewerKey,
+      startsRepairTurn: false,
+      state: loaded.state,
+    });
+    const state: ReviewEpochState = {
+      ...initialized.state,
+      findingLedger: mergedFindings.ledger,
+      lastReviewedHeadSha: headSha,
+      pausedHeadSha: headSha,
+      pauseReason: "finding_ledger_capacity_exhausted",
+    };
+    await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
+    return {
+      decision: "pause",
+      newFindings: mergedFindings.newFindings,
+      reason: "finding_ledger_capacity_exhausted",
+      state,
+    };
+  }
   if (findings.length > 0 && mergedFindings.newFindings.length === 0) {
     traceLog(
       ctx.options,
@@ -1655,9 +1686,14 @@ async function admitReviewResponse(
       ),
       { finding_count: findings.length, head_sha: headSha },
     );
+    const state = {
+      ...(loaded.state as ReviewEpochState),
+      lastReviewedHeadSha: headSha,
+    };
+    await retryingReviewBudgetSave(ctx, owner, repo, pr.number, state);
     return {
       decision: "skip",
-      state: loaded.state as ReviewEpochState,
+      state,
     };
   }
   const approval = await pendingReviewResetApproval(
