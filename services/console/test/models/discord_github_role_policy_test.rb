@@ -408,22 +408,28 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
 
   test "rejects a non-static credential that sources a GitHub App installation token" do
     principal, role, _secret, credential = build_policy_binding
-    oauth_credential = oauth_token_secrets(:acme_gmail_oauth)
-    point_oauth_refresh_source_at(credential)
-    grant = Grant.new(role:, oauth_token_secret: oauth_credential, created_by: users(:acme_admin))
+    source = point_oauth_refresh_source_at(credential)
+    grant = Grant.new(
+      role:,
+      oauth_token_secret_id: source.oauth_token_secret_id,
+      created_by: users(:acme_admin)
+    )
 
     assert_not grant.valid?
     assert grant.errors[:base].any? { |message| message.include?("source credentials from GitHub") }
 
     grant.save!(validate: false)
-    assert_not DiscordGithubRolePolicy.credential_allowed_for_principal?(principal, oauth_credential)
+    assert_not DiscordGithubRolePolicy.credential_allowed_for_principal?(principal, source.oauth_token_secret)
   end
 
   test "rejects repointing a granted non-static credential source at a GitHub App broker" do
     _principal, role, _secret, github_credential = build_policy_binding
-    oauth_credential = oauth_token_secrets(:acme_gmail_oauth)
     source = point_oauth_refresh_source_at(build_generic_broker)
-    Grant.create!(role:, oauth_token_secret: oauth_credential, created_by: users(:acme_admin))
+    Grant.create!(
+      role:,
+      oauth_token_secret_id: source.oauth_token_secret_id,
+      created_by: users(:acme_admin)
+    )
 
     source.config = { "credential_id" => github_credential.foreign_id }
 
@@ -433,10 +439,13 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
 
   test "rejects changing a broker referenced by a granted non-static credential into a GitHub App broker" do
     _principal, role, _secret, _github_credential = build_policy_binding
-    oauth_credential = oauth_token_secrets(:acme_gmail_oauth)
     broker = build_generic_broker
-    point_oauth_refresh_source_at(broker)
-    Grant.create!(role:, oauth_token_secret: oauth_credential, created_by: users(:acme_admin))
+    source = point_oauth_refresh_source_at(broker)
+    Grant.create!(
+      role:,
+      oauth_token_secret_id: source.oauth_token_secret_id,
+      created_by: users(:acme_admin)
+    )
 
     broker.assign_attributes(
       grant: "github_app_installation",
