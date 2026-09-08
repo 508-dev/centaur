@@ -16,7 +16,7 @@ Understand the work before touching anything:
 - Decide what "done" means before you write code. If it's a bug, reproduce it first so you can prove your fix. If the ask is ambiguous, underspecified, or larger than one coherent change, do NOT guess: post a comment on the issue explaining what you'd need to proceed (or how you'd split it up), @-mention the person who requested the work, and stop there.
 
 Implement the change:
-- Work on a new branch off the default branch. Make the smallest coherent change that resolves the issue, matching the conventions of the surrounding code.
+- Resolve the repository's current default branch with \`gh repo view --json defaultBranchRef\`. Fetch that exact remote branch, create the work branch from its current tip, and pass it explicitly to \`gh pr create --base\`. Do not infer \`main\` from the local checkout. Use another base only when the issue or requesting human explicitly names it; state that override in the PR. Make the smallest coherent change that resolves the issue, matching the conventions of the surrounding code.
 - Add or update tests that actually assert the behavior the issue cares about.
 - Run the project's checks (build, typecheck, lint, tests) and get them green before opening anything.
 
