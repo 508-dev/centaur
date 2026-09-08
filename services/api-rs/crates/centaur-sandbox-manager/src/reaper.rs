@@ -5,14 +5,16 @@
 //! backstop. The reaper sweeps the backend's observed sandboxes and stops any
 //! that exceed the configured max lifetime, releasing the sandbox, its proxy
 //! resources, and its node pod slots.
+//! Already-terminal sandboxes only release backend-verified stale auxiliary
+//! pods; their failed workload, logs, and workspace remain inspectable.
 
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use centaur_sandbox_core::ObservedSandbox;
 use centaur_sandbox_core::SandboxResult;
+use centaur_sandbox_core::{ObservedSandbox, SandboxStatus};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
@@ -25,12 +27,6 @@ pub struct SandboxReaperConfig {
     /// Stop any sandbox older than this regardless of status. `None` disables
     /// the max-lifetime sweep.
     pub max_lifetime: Option<Duration>,
-}
-
-impl SandboxReaperConfig {
-    pub fn is_enabled(&self) -> bool {
-        self.max_lifetime.is_some()
-    }
 }
 
 pub struct SandboxReaper {
@@ -62,6 +58,26 @@ impl SandboxReaper {
         let now = SystemTime::now();
         let mut reaped = 0;
         for observed in self.manager.list_observed().await? {
+            if observed.status == SandboxStatus::Stopped {
+                // A failed/OOM workload is terminal, but its companion proxy
+                // may still consume a pod slot. Full stop would delete its
+                // workspace and evidence, so use the retention-safe operation.
+                match self
+                    .manager
+                    .cleanup_terminal_auxiliaries(&observed.id)
+                    .await
+                {
+                    Ok(count) if count > 0 => info!(
+                        sandbox_id = %observed.id.as_str(),
+                        resource_count = count,
+                        "released terminal sandbox auxiliaries; workspace retained"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warn!(sandbox_id = %observed.id.as_str(), %error,
+                        "terminal auxiliary cleanup failed; will retry next sweep"),
+                }
+                continue;
+            }
             let Some(reason) = reap_reason(&observed, now, &self.config) else {
                 continue;
             };
@@ -167,14 +183,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_config_reaps_nothing() {
+    fn absent_max_lifetime_disables_only_expiry_reaping() {
         let now = SystemTime::now();
         let sandbox = observed(centaur_sandbox_core::SandboxStatus::Suspended)
             .with_created_at(Some(now - Duration::from_secs(100_000)))
             .with_suspended_since(Some(now - Duration::from_secs(100_000)));
         let config = config(None);
 
-        assert!(!config.is_enabled());
         assert_eq!(reap_reason(&sandbox, now, &config), None);
     }
 }
