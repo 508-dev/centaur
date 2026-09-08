@@ -1634,7 +1634,6 @@ mod tests {
     /// A stub iron-control API. `requests` records `METHOD path` per call;
     /// `bodies` additionally records the JSON body for calls that carry one,
     /// so upserting tests can assert what was written, not just where.
-
     fn discord_policy_metadata() -> Value {
         json!({
             "discord_actor_user_id": "100000000000000001",
