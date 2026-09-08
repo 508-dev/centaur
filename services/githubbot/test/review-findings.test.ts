@@ -53,6 +53,33 @@ describe("review finding fingerprints", () => {
     ).not.toBe(first);
   });
 
+  test("distinguishes old and new sides while keeping moved side coordinates stable", () => {
+    const right = fingerprintReviewFinding({
+      body: "The replacement remains unsafe.",
+      diffHunk: "@@ -14 +14 @@\n-old\n+new",
+      line: 14,
+      path: "src/policy.ts",
+      side: "RIGHT",
+    });
+    const left = fingerprintReviewFinding({
+      body: "The replacement remains unsafe.",
+      diffHunk: "@@ -14 +14 @@\n-old\n+new",
+      line: 14,
+      path: "src/policy.ts",
+      side: "LEFT",
+    });
+    const movedLeft = fingerprintReviewFinding({
+      body: "The replacement remains unsafe.",
+      diffHunk: "@@ -90 +99 @@\n-old\n+new",
+      line: 90,
+      path: "src/policy.ts",
+      side: "LEFT",
+    });
+
+    expect(left).not.toBe(right);
+    expect(movedLeft).toBe(left);
+  });
+
   test("requires structured impact and inline evidence for a budget interrupt", () => {
     const evidence = {
       diffHunk: "+untrusted(input)",

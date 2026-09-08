@@ -58,12 +58,17 @@ export function fingerprintReviewFinding(input: {
   diffHunk?: string;
   line?: number;
   path?: string;
+  side?: string;
 }): string {
+  const side = normalizeDiffSide(input.side);
   const canonical = JSON.stringify({
     body: normalizeFindingText(input.body),
     context: normalizeDiffContext(input.diffHunk),
     path: normalizePath(input.path),
-    site: relativeDiffLine(input.diffHunk, input.line),
+    site: relativeDiffLine(input.diffHunk, input.line, side),
+    // Preserve existing right-side fingerprints while distinguishing a
+    // finding attached to the removed side of the same replacement hunk.
+    ...(side === "left" ? { side } : {}),
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -77,6 +82,7 @@ export function makeReviewFinding(input: {
   reviewId: number;
   reviewerKey: string;
   reviewedHeadSha: string;
+  side?: string;
   url?: string;
 }): ReviewFinding {
   const body = input.body.trim().slice(0, 16_000);
@@ -87,7 +93,13 @@ export function makeReviewFinding(input: {
     body,
     commentId: positiveInteger(input.commentId),
     diffHunk,
-    fingerprint: fingerprintReviewFinding({ body, diffHunk, line, path }),
+    fingerprint: fingerprintReviewFinding({
+      body,
+      diffHunk,
+      line,
+      path,
+      side: input.side,
+    }),
     line,
     path,
     reviewId: input.reviewId,
@@ -227,13 +239,22 @@ function normalizeDiffContext(value: string | undefined): string {
 function relativeDiffLine(
   diffHunk: string | undefined,
   line: number | undefined,
+  side: "left" | "right" | undefined,
 ): number | undefined {
   const normalizedLine = positiveInteger(line);
   if (normalizedLine === undefined) return undefined;
   const header = diffHunk?.split(/\r?\n/, 1)[0];
-  const rightStart = header?.match(/^@@\s+-\d+(?:,\d+)?\s+\+(\d+)/)?.[1];
-  if (!rightStart) return normalizedLine;
-  return normalizedLine - Number.parseInt(rightStart, 10);
+  const starts = header?.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)/);
+  const start = side === "left" ? starts?.[1] : starts?.[2];
+  if (!start) return normalizedLine;
+  return normalizedLine - Number.parseInt(start, 10);
+}
+
+function normalizeDiffSide(
+  value: string | undefined,
+): "left" | "right" | undefined {
+  const side = value?.trim().toLowerCase();
+  return side === "left" || side === "right" ? side : undefined;
 }
 
 function highestSeverity(

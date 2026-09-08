@@ -1516,17 +1516,21 @@ async function collectReviewFindings(
     for (const comment of comments) {
       const body = stringValue(comment.body)?.trim();
       if (!body) continue;
+      const currentLine = numberValue(comment.line);
+      const originalLine = numberValue(comment.original_line);
       findings.push(
         makeReviewFinding({
           body,
           commentId: numberValue(comment.id),
           diffHunk: stringValue(comment.diff_hunk),
-          line:
-            numberValue(comment.line) ?? numberValue(comment.original_line),
+          line: currentLine ?? originalLine,
           path: stringValue(comment.path),
           reviewId,
           reviewerKey,
           reviewedHeadSha,
+          // GitHub retains `side` when a current line has become outdated;
+          // there is no `original_side` field in the REST response schema.
+          side: stringValue(comment.side),
           url: stringValue(comment.html_url),
         }),
       );
@@ -1832,13 +1836,6 @@ async function admitReviewResponse(
       headSha,
       mergedFindings.ledger,
     );
-    if (
-      evidence.actor === "unknown" &&
-      loaded.state.automationPendingFromHeadSha ===
-        loaded.state.lastReviewedHeadSha
-    ) {
-      evidence = { ...evidence, actor: "automation" };
-    }
   }
 
   const findingsAlreadyKnown =

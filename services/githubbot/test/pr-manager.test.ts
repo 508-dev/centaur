@@ -1485,6 +1485,57 @@ describe("bounded review epochs", () => {
     ).toMatchObject({ anchorHeadSha: "head-3", epoch: 2, roundsUsed: 1 });
   });
 
+  test("does not treat mixed commits as automation because a repair was pending", async () => {
+    const state = makeState();
+    await state.set("centaur-githubbot:review-budget:base/repo#7", {
+      anchorHeadSha: "head-1",
+      automationPendingFromHeadSha: "head-1",
+      epoch: 1,
+      lastReviewedHeadSha: "head-1",
+      reviewerRoundsUsed: { "github-user:101": 1 },
+      roundsUsed: 1,
+      version: 1,
+    });
+    const comments: string[] = [];
+    const ctx = budgetCtx({ headSha: "head-2", comments, state });
+    ctx.octokit.rest.repos.compareCommitsWithBasehead = (async () => ({
+      data: {
+        commits: [
+          {
+            author: { login: "centaur-bot", type: "Bot" },
+            commit: { message: "accepted repair\n\nCentaur-Automation: true" },
+          },
+          {
+            author: { login: "alice", type: "User" },
+            commit: { message: "additional human change" },
+          },
+        ],
+        files: [
+          {
+            additions: 4,
+            changes: 4,
+            deletions: 0,
+            filename: "src/implementation.ts",
+            status: "modified",
+          },
+        ],
+        status: "ahead",
+        total_commits: 2,
+      },
+    })) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
+
+    await handleReviewEvent(ctx, submittedReview(81, "head-2"));
+    await drainBackgroundWork(5_000);
+
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({
+      pausedHeadSha: "head-2",
+      pauseReason: "change_actor_unknown",
+    });
+    expect(comments.at(-1)).toContain("change_actor_unknown");
+  });
+
   test("classifies an approved material human head before advancing the boundary", async () => {
     const state = makeState();
     await state.set("centaur-githubbot:review-budget:base/repo#7", {
