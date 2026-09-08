@@ -1,6 +1,49 @@
 require "test_helper"
 
 class PrincipalTest < ActiveSupport::TestCase
+  test "discord user is a supported actor-scoped principal kind" do
+    principal = Principal.new(default_attrs(
+      foreign_id: "discord-user-1336096360772141148-100000000000000001",
+      name: "Discord user",
+      kind: "discord_user",
+      labels: {}
+    ))
+
+    assert principal.valid?, principal.errors.full_messages.join(", ")
+  end
+
+  test "managed Discord actors cannot widen sandbox capabilities through ordinary updates" do
+    role = Role.create!(
+      foreign_id: "discord-observer-#{SecureRandom.hex(4)}",
+      name: "Discord observer",
+      labels: {
+        "centaur_discord_policy_managed" => "true",
+        "repository_scope" => "508-dev/centaur",
+        "centaur.discord.sandbox_repo_cache" => "public",
+        "centaur.discord.sandbox_observability_enabled" => "true",
+        "centaur.discord.sandbox_sessions_read_enabled" => "false",
+        "centaur.discord.sandbox_workflows_read_enabled" => "true",
+        "centaur.discord.sandbox_workflows_write_enabled" => "false"
+      },
+      created_by: users(:acme_admin)
+    )
+    principal = Principal.create!(default_attrs(
+      foreign_id: "discord-user-1336096360772141148-#{SecureRandom.random_number(10**18)}",
+      kind: "discord_user",
+      labels: { "centaur_discord_policy_managed" => "true" }
+    ))
+    principal.replace_roles_and_sandbox_policy!(
+      roles: [ role ],
+      **DiscordGithubRolePolicy.sandbox_policy_for_role(role)
+    )
+
+    assert_raises(ActiveRecord::RecordInvalid) do
+      principal.update!(sandbox_workflows_write_enabled: true)
+    end
+    assert_not principal.reload.sandbox_workflows_write_enabled
+    assert_equal [ role.id ], principal.role_ids
+  end
+
   def default_attrs(overrides = {})
     { created_by: users(:acme_admin) }.merge(overrides)
   end

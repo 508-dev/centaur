@@ -36,6 +36,13 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+mod action_proposals;
+pub use action_proposals::{
+    ActionProposal, ActionProposalState, ApproveActionProposalRequest,
+    ApproveActionProposalResponse, NotificationTransitionRequest, NotificationTransitionResponse,
+    ProposalEvidence, ProposalValidation, PutActionProposalRequest, normalize_exact_repository,
+};
+
 pub const WORKFLOW_QUEUE: &str = "centaur_workflows";
 pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
 pub const WORKFLOW_ETL_QUEUE: &str = "centaur_workflows_etl";
@@ -43,9 +50,12 @@ pub const WORKFLOW_ETL_BACKFILL_QUEUE: &str = "centaur_workflows_etl_backfill";
 pub const WORKFLOW_SCHEDULE_QUEUE: &str = "centaur_workflow_schedules";
 pub const WORKFLOW_TASK: &str = "centaur.workflow";
 pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
+const APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX: &str = "approved-proposal:";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const DISCORDBOT_INTERNAL_URL_ENV: &str = "DISCORDBOT_INTERNAL_URL";
+const DISCORDBOT_API_KEY_ENV: &str = "DISCORDBOT_API_KEY";
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
@@ -321,6 +331,11 @@ impl WorkflowPrincipalRegistrar {
                             slack_channel_id: None,
                             slack_team_id: None,
                             slack_email: None,
+                            sandbox_repo_cache: None,
+                            sandbox_observability_enabled: None,
+                            sandbox_sessions_read_enabled: None,
+                            sandbox_workflows_read_enabled: None,
+                            sandbox_workflows_write_enabled: None,
                         })
                         .await?
                 }
@@ -830,6 +845,30 @@ impl WorkflowRuntime {
     }
 
     pub async fn create_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        ensure_unreserved_workflow_idempotency_key(request.idempotency_key.as_deref())?;
+        self.spawn_workflow_run(request).await
+    }
+
+    async fn create_approved_action_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        if !request
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX))
+        {
+            return Err(WorkflowRuntimeError::Internal(
+                "approved action run is missing its reserved idempotency key".to_owned(),
+            ));
+        }
+        self.spawn_workflow_run(request).await
+    }
+
+    async fn spawn_workflow_run(
         &self,
         request: CreateWorkflowRunRequest,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
@@ -3420,6 +3459,56 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.proposal.put") => {
+            let request = message
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "ctx.proposal.put requires request".to_owned())
+                .and_then(|value| {
+                    serde_json::from_value::<PutActionProposalRequest>(value)
+                        .map_err(|error| error.to_string())
+                });
+            match request {
+                Ok(request) => match action_proposals::put_action_proposal(
+                    &workflow_clients.standard,
+                    request,
+                    &input.workflow_name,
+                    ctx.task_id(),
+                    ctx.run_id(),
+                )
+                .await
+                {
+                    Ok(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        Some("ctx.notification.transition") => {
+            let request = message
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "ctx.notification.transition requires request".to_owned())
+                .and_then(|value| {
+                    serde_json::from_value::<NotificationTransitionRequest>(value)
+                        .map_err(|error| error.to_string())
+                });
+            match request {
+                Ok(request) => {
+                    match action_proposals::transition_notification_state(
+                        &workflow_clients.standard,
+                        request,
+                        ctx.run_id(),
+                    )
+                    .await
+                    {
+                        Ok(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -3430,6 +3519,10 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.post_to_discord") => match post_python_discord_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         other => Err(format!("unsupported context request type {other:?}")),
     };
     Ok(match result {
@@ -3476,6 +3569,7 @@ async fn start_python_child_workflow(
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(ToOwned::to_owned);
+    ensure_unreserved_workflow_idempotency_key(idempotency_key.as_deref())?;
     let target_client = match workflow_queue_class(workflow_name) {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
@@ -4124,6 +4218,43 @@ async fn post_python_slack_message(
         .map_err(WorkflowRuntimeError::from)
 }
 
+async fn post_python_discord_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let channel_id = required_python_string(message, "channel_id", "ctx.post_to_discord")?;
+    let delivery_id = required_python_string(message, "delivery_id", "ctx.post_to_discord")?;
+    let text = required_python_string(message, "text", "ctx.post_to_discord")?;
+    let base_url = env::var(DISCORDBOT_INTERNAL_URL_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{DISCORDBOT_INTERNAL_URL_ENV} must be set for ctx.post_to_discord"
+        ))
+    })?;
+    let api_key = env::var(DISCORDBOT_API_KEY_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{DISCORDBOT_API_KEY_ENV} must be set for ctx.post_to_discord"
+        ))
+    })?;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/internal/deliveries",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "channel_id": channel_id,
+            "delivery_id": delivery_id,
+            "text": text,
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "ctx.post_to_discord failed with status {status}"
+        )));
+    }
+    Ok(body)
+}
+
 fn python_slack_message_payload(
     channel: &str,
     text: &str,
@@ -4447,6 +4578,17 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
     })
 }
 
+fn ensure_unreserved_workflow_idempotency_key(
+    idempotency_key: Option<&str>,
+) -> Result<(), WorkflowRuntimeError> {
+    if idempotency_key.is_some_and(|key| key.starts_with(APPROVED_PROPOSAL_IDEMPOTENCY_PREFIX)) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "workflow idempotency key uses a reserved approval namespace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn absurd_error(error: WorkflowRuntimeError) -> absurd::Error {
     match error {
         WorkflowRuntimeError::Suspend => absurd::Error::Suspend,
@@ -4500,6 +4642,19 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn generic_workflow_runs_cannot_claim_approval_idempotency_keys() {
+        assert!(ensure_unreserved_workflow_idempotency_key(None).is_ok());
+        assert!(ensure_unreserved_workflow_idempotency_key(Some("ordinary-run:1")).is_ok());
+        assert!(ensure_unreserved_workflow_idempotency_key(Some("approved-proposalish:1")).is_ok());
+        assert!(
+            ensure_unreserved_workflow_idempotency_key(Some("approved-proposal:sha256:abc"))
+                .unwrap_err()
+                .to_string()
+                .contains("reserved approval namespace")
+        );
+    }
 
     #[test]
     fn python_event_names_are_collision_free() {

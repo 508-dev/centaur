@@ -2,8 +2,9 @@
 
 Discord chat ingress for the Centaur agent. Mirrors `slackbotv2` (streamed, session-backed
 replies to `@`-mentions) using Vercel's Chat SDK Discord adapter. The session logic is a
-deliberate clone of `services/slackbotv2` kept in sync manually (there is no shared package);
-the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow through identically).
+deliberate clone of `services/slackbotv2` kept in sync manually (there is no shared package).
+Authenticated actor policy is carried through `api-rs` and reconciled onto a user-scoped
+iron-control principal; it is never attached to the channel principal.
 
 ## Behavior
 
@@ -11,7 +12,14 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
   bot streams the answer inside it, and the thread is renamed to the message text. The session is
   keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
-- **Follow-ups inside an active thread** append to the same session without a re-mention.
+- **Follow-ups inside an authorized thread** append to the same session without a re-mention
+  only for the original actor, while the root TTL and their current role policy remain valid. An
+  unmentioned reply with a canonical `<@user-id>` / `<@!user-id>` mention of another member is
+  ignored instead of steering Centaur; a direct Centaur mention keeps its normal behavior even if
+  another member is also named.
+- **`@centaur stop`** interrupts only the active execution attached to that authorized thread.
+- **`@centaur approve sha256:…`** atomically consumes one exact, unexpired workflow proposal
+  when the actor's reviewed role is permitted to approve it. It does not create a coding session.
 - **Safe public output**: a run instantly reacts 👀 on the triggering message. The **final
   answer** streams into a separate message created when its first text arrives, so it lands at the
   bottom of the thread even when users chime in mid-run. On settle the 👀 flips to ✅ (or ❌).
@@ -23,7 +31,10 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
 Discord delivers normal messages over a **Gateway WebSocket** (outbound), not HTTP webhooks. The
 bot opens a single long-lived Gateway connection in "direct mode" (`startGatewayListener` with a
 large duration; discord.js maintains the session with native RESUME). There is **no public
-ingress** — only a `GET /health` endpoint that reflects the Gateway connection state.
+event ingress** — only `GET /health` plus an authenticated internal workflow-delivery endpoint.
+The ready Gateway identity must exactly match `DISCORD_APPLICATION_ID`; forwarded JSON from the
+Chat SDK's in-process emulator is not accepted in production. Each message ID is durably claimed
+and audited before thread, session, workflow, or sandbox side effects.
 
 > ⚠️ **Run exactly one replica.** Two pods on the same bot token open two Gateway sessions and
 > every message is handled twice. Deploy with `replicas: 1` + `strategy: Recreate`, never autoscale.
@@ -36,16 +47,18 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | Var | Required | Notes |
 |-----|----------|-------|
 | `DISCORD_BOT_TOKEN` | ✅ | Bot token (account-level credential — keep secret). |
-| `DISCORD_PUBLIC_KEY` | ✅ | Ed25519 public key (used by the adapter for any HTTP interactions). |
+| `DISCORD_PUBLIC_KEY` | ✅ | Ed25519 public key required by the adapter constructor. Centaur does not expose Discord HTTP interactions. |
 | `DISCORD_APPLICATION_ID` | ✅ | Doubles as the bot user id for mention detection. |
 | `DISCORDBOT_GUILD_ALLOWLIST` | ✅ to do anything | Comma/space-separated guild IDs. **Fail-closed when empty.** |
 | `DISCORDBOT_CHANNEL_ALLOWLIST` | ✅ to do anything | Comma/space-separated parent channel IDs. Messages in other channels and their threads are ignored before a thread/session is created. |
-| `DISCORDBOT_TRIGGER_ROLE_ALLOWLIST` | ✅ to do anything | Comma/space-separated immutable Discord role IDs. A human must currently hold at least one on every message; role names are never authorization inputs. |
-| `DISCORDBOT_API_KEY` | – | Bearer to api-rs. Use a dedicated key, not the Slack one. |
+| `DISCORDBOT_ROLE_BINDINGS_JSON` | ✅ to do anything | Non-empty reviewed JSON array mapping immutable numeric role IDs to one capability class, policy-managed principal role, exact repository/project scopes, explicit priority, and optional `can_approve`. Unknown or ambiguous combinations fail closed. |
+| `DISCORDBOT_API_KEY` | ✅ | Dedicated bearer used for Discordbot → api-rs and api-rs → Discordbot internal calls. Do not reuse another ingress key. |
 | `CENTAUR_API_URL` | – | api-rs base URL (default `http://127.0.0.1:8080`). |
 | `DISCORDBOT_DATABASE_URL` / `DATABASE_URL` / `POSTGRES_URL` | ✅ | Thread-state store. The bot refuses to boot without one (no silent localhost fallback). |
-| `DISCORDBOT_TRIGGER_BOT_ALLOWLIST` | – | Comma/space-separated bot/webhook author IDs whose messages may enter sessions (e.g. a Sentry webhook). Empty (default) ⇒ all bot messages are ignored. Use the ID the message is authored as: the bot's user id, or the webhook id for webhook integrations. |
 | `DISCORDBOT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD` | – | In-flight execution cap per guild (default 3). Over the cap, the triggering message gets a 🚦 reaction and is kept as context only. |
+| `DISCORDBOT_CONTINUATION_TTL_MS` | – | Maximum lifetime of an authorized root interaction (default 24h). A new authorized mention is required after expiry. |
+| `DISCORDBOT_INGRESS_MAX_EVENT_AGE_MS` | – | Maximum accepted Gateway event age (default 5m). Future/stale events fail closed. |
+| `DISCORDBOT_INGRESS_DELIVERY_TTL_MS` | – | Durable inbound delivery/audit dedupe retention (default 7d). |
 | `DISCORDBOT_ACTIVE_EXECUTION_TTL_MS` | – | Staleness TTL for the per-thread active-execution flag (default 30 min) — unwedges threads after a crash mid-handoff. |
 | `DISCORDBOT_ANSWER_EDIT_INTERVAL_MS` | – | Edit cadence for the streamed answer message (default 1500 ms, clamped to ≥1500 to respect Discord rate limits). |
 | `DISCORD_MENTION_ROLE_IDS` | – | Role mentions that also trigger the bot. |
@@ -56,11 +69,32 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `PORT` | – | Health server port (default 3001). |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | – | Forwarded to api-rs execute. |
 
-DMs are denied by the guild allowlist: the adapter does request the DirectMessages intent, but a
-DM has no guild, so the fail-closed allowlist check rejects it. Guild, parent channel, and role
-checks happen before a channel mention creates a public thread and again before every follow-up is
-forwarded. Removing a role therefore blocks the member's next message, including replies inside an
-already-active thread.
+DM, private-message, bot, self, and webhook-authored events are denied. The adapter requests only
+Guilds, GuildMessages, and Message Content intents. Guild, parent channel, current role policy,
+actor, thread, and TTL checks happen before a channel mention creates a public thread and again
+before every follow-up. Removing a role therefore blocks the member's next message, including
+replies inside an already-active thread. Every allow/deny decision is logged with a stable reason
+code and immutable IDs, never message content.
+
+Example role policy:
+
+```json
+[
+  {
+    "role_id": "100000000000000001",
+    "capability_class": "github:observe",
+    "principal_role": "discord-observer",
+    "can_approve": false,
+    "priority": 10,
+    "repository_scope": ["example-org/example-repo"],
+    "project_scope": []
+  }
+]
+```
+
+Multiple held roles do not form an implicit union: the highest explicit priority wins, while
+equal-priority non-identical bundles are denied. Repository wildcards and mutable role names are
+invalid configuration.
 
 ## Discord application setup
 
@@ -74,9 +108,9 @@ already-active thread.
    _View Channels_, _Send Messages_, _Send Messages in Threads_, **Create Public Threads**,
    _Embed Links_, _Read Message History_, _Add Reactions_ (the 👀/✅ run-status indicator).
 5. Set `DISCORDBOT_GUILD_ALLOWLIST`, `DISCORDBOT_CHANNEL_ALLOWLIST`, and
-   `DISCORDBOT_TRIGGER_ROLE_ALLOWLIST` to numeric IDs. The bot is **inert** for human messages until
+   `DISCORDBOT_ROLE_BINDINGS_JSON` with numeric IDs. The bot is **inert** for human messages until
    all three are set. Use Discord's role API or Developer Mode during deployment to translate role
-   names to IDs; pin the resulting IDs rather than checking mutable names at runtime.
+   names to IDs; review and pin the resulting IDs rather than checking mutable names at runtime.
 
 ## Runtime assumptions (validated 2026-06-02)
 
@@ -105,6 +139,6 @@ bun run dev           # run the server locally (needs env above)
   bot created from a channel mention (`isThreadCreatedForMessage`); a mention inside a
   user-created thread never renames it (set `DISCORDBOT_NAME_THREADS=false` to disable renaming
   entirely).
-- A Gateway RESUME that replays a channel mention before state commits could, in rare cases, let
-  the adapter create a second thread (the dedup guards execution, but thread creation happens
-  inside the adapter). See the plan's invariant #2.
+- Exact actor binding intentionally prevents a different participant from continuing an
+  authorized shared thread. A future collaborative mode needs an explicit reviewed delegation
+  policy; it must not infer authority from thread membership.

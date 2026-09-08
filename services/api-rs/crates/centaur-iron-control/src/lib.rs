@@ -21,9 +21,9 @@ pub use models::{
     EffectivePgDsn, EffectiveReplace, EffectiveSecret, GCP_ID_TOKEN_ALLOWED_HEADERS,
     GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee, HmacSecretHeader,
     HmacSecretInput, IdentityInput, InjectConfig, OAuthTokenSecretInput, PgDsnSecretInput,
-    PgDsnSettingInput, PgDsnSettingValueFromInput, Principal, PrincipalInput, Proxy, ProxyInput,
-    ReplaceConfig, RequestRule, Role, SECRET_TYPES, SecretRecord, SecretSource, StaticSecretInput,
-    normalize_gcp_id_token_header,
+    PgDsnSettingInput, PgDsnSettingValueFromInput, Principal, PrincipalInput, PrincipalPolicyInput,
+    Proxy, ProxyInput, ReplaceConfig, RequestRule, Role, SECRET_TYPES, SecretRecord, SecretSource,
+    StaticSecretInput, normalize_gcp_id_token_header,
 };
 pub use principal::{
     PrincipalDerivationError, PrincipalRef, derive_principal, derive_slack_requester_principal,

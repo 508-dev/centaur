@@ -1,5 +1,9 @@
 import type { Logger, Message } from "chat";
 import type { DiscordbotOptions } from "./types";
+import {
+  configuredDiscordRoleIds,
+  configuredDiscordTriggerBotIds,
+} from "./discord-policy";
 
 export type DiscordIngressContext = {
   authorIsBot: boolean;
@@ -35,8 +39,7 @@ export function parseDiscordThreadKey(threadKey: string): {
  * Authorization gate for inbound Discord messages.
  *
  * Unlike the Slack allowlist (which is fail-open), this is intentionally **fail-closed**:
- * the api-rs control plane has no ingress auth, so this guard is the primary authorization
- * boundary. Direct messages are denied outright, and all three human ingress
+ * Direct messages are denied outright, and all three human ingress
  * allowlists (guild, parent channel, and trigger role) must be configured.
  */
 export function isAllowedDiscordMessage(
@@ -47,12 +50,9 @@ export function isAllowedDiscordMessage(
   if (message.author.isMe === true) {
     return false;
   }
-  // Discord delta (mirrors slackbotv2's trigger-bot allowlist semantics):
-  // bot-authored messages are rejected unless the bot is explicitly
-  // allowlisted. The gateway only forwards bot messages that pass the
-  // adapter's `shouldForwardBotMessage` hook (wired at the adapter
-  // construction site); this gate re-checks with the full payload, where
-  // application_id/webhook_id matching is possible.
+  // Bot-authored messages are denied unless a reviewed identity binding maps
+  // the exact author/application/webhook ID to a static policy bundle. The
+  // adapter and durable ingress both evaluate the same identifiers.
   if (message.author.isBot === true) {
     if (
       !isAllowedTriggerBotMessage(message, resolveTriggerBotAllowlist(options))
@@ -92,8 +92,8 @@ export function isAllowedDiscordMessage(
 /**
  * Return the deterministic denial reason for a Discord ingress context.
  * Bot-authored messages still require guild + channel admission, but their
- * identity is controlled by the separate trigger-bot allowlist rather than a
- * human member role.
+ * identity is controlled by a separate reviewed bot binding rather than human
+ * member roles.
  */
 export function discordIngressDenialReason(
   context: DiscordIngressContext,
@@ -154,21 +154,38 @@ export function isAllowedTriggerBotMessage(
   message: Pick<Message, "author" | "raw">,
   allowlist: readonly string[] | undefined,
 ): boolean {
-  if (!allowlist?.length) return false;
   const raw =
     message.raw && typeof message.raw === "object"
       ? (message.raw as { application_id?: unknown; webhook_id?: unknown })
       : {};
-  const identifiers = new Set(
-    [
-      message.author.userId,
-      typeof raw.application_id === "string" ? raw.application_id : undefined,
-      typeof raw.webhook_id === "string" ? raw.webhook_id : undefined,
-    ]
+  return isAllowedTriggerBotIdentifiers(
+    {
+      applicationId:
+        typeof raw.application_id === "string" ? raw.application_id : undefined,
+      authorId: message.author.userId,
+      webhookId:
+        typeof raw.webhook_id === "string" ? raw.webhook_id : undefined,
+    },
+    allowlist,
+  );
+}
+
+/** Apply the same immutable multi-ID bot policy at pre- and post-admission gates. */
+export function isAllowedTriggerBotIdentifiers(
+  identifiers: {
+    applicationId?: string;
+    authorId: string;
+    webhookId?: string;
+  },
+  allowlist: readonly string[] | undefined,
+): boolean {
+  if (!allowlist?.length) return false;
+  const reviewedIdentifiers = new Set(
+    [identifiers.authorId, identifiers.applicationId, identifiers.webhookId]
       .map((value) => value?.trim())
       .filter((value): value is string => Boolean(value)),
   );
-  return allowlist.some((entry) => identifiers.has(entry.trim()));
+  return allowlist.some((entry) => reviewedIdentifiers.has(entry.trim()));
 }
 
 /**
@@ -204,20 +221,26 @@ export function resolveGuildAllowlist(options: DiscordbotOptions): string[] {
   ];
 }
 
-/** Resolved trigger-bot allowlist (options first, env fallback). */
+/**
+ * Resolved bot transport identities. A legacy bare allowlist deliberately does
+ * not reach this gate: every non-human sender must also select a reviewed,
+ * non-approver policy bundle through `triggerBotBindings`.
+ */
 export function resolveTriggerBotAllowlist(
   options: DiscordbotOptions,
 ): string[] {
-  return [
-    ...(options.triggerBotAllowlist ??
-      splitEnvList(process.env.DISCORDBOT_TRIGGER_BOT_ALLOWLIST)),
-  ];
+  return configuredDiscordTriggerBotIds(options);
 }
 
 /** Resolved human trigger-role allowlist (options first, env fallback). */
 export function resolveTriggerRoleAllowlist(
   options: DiscordbotOptions,
 ): string[] {
+  const policyRoleIds = configuredDiscordRoleIds(options);
+  // An explicitly configured policy list, including [], opts into the actor-
+  // scoped policy contract. Never let the legacy role allowlist reactivate an
+  // intentionally empty reviewed policy.
+  if (options.roleBindings !== undefined) return policyRoleIds;
   return [
     ...(options.triggerRoleAllowlist ??
       splitEnvList(process.env.DISCORDBOT_TRIGGER_ROLE_ALLOWLIST)),
@@ -236,7 +259,7 @@ export function isDiscordIngressAllowlistEmpty(
   return (
     resolveGuildAllowlist(options).length === 0 ||
     resolveChannelAllowlist(options).length === 0 ||
-    resolveTriggerRoleAllowlist(options).length === 0
+    configuredDiscordRoleIds(options).length === 0
   );
 }
 
