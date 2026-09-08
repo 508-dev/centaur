@@ -208,6 +208,16 @@ export async function acceptedDiscordAdmissionForMessage(
     try {
       await state.set(deliveryKey(message.id), completed, deliveryTtlMs);
     } catch {
+      try {
+        const current = await state.get<unknown>(deliveryKey(message.id));
+        if (sameAdmissionRecord(current, completed)) return completed;
+        if (sameAdmissionRecord(current, record)) {
+          await state.delete(deliveryKey(message.id));
+        }
+      } catch {
+        // The short provisional TTL remains the recovery boundary when the
+        // final write outcome cannot be read or released safely.
+      }
       return null;
     }
     return completed;

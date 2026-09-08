@@ -205,6 +205,47 @@ describe("Discord Gateway admission", () => {
     ).toEqual(expect.objectContaining({ dispatchStatus: "pending" }));
   });
 
+  it("releases a provisional claim when dispatch finalization fails before commit", async () => {
+    const { logger, state } = await harness();
+    let rejectCompletedWrite = true;
+    const flaky = new Proxy(state, {
+      get(target, property) {
+        if (property === "set") {
+          return async (key: string, value: unknown, ttlMs?: number) => {
+            if (
+              rejectCompletedWrite &&
+              key.startsWith("discordbot:ingress:delivery:") &&
+              (value as { dispatchStatus?: string }).dispatchStatus === "completed"
+            ) {
+              rejectCompletedWrite = false;
+              throw new Error("write rejected before commit");
+            }
+            return target.set(key, value, ttlMs);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as StateAdapter;
+    const message = event("600000000000000006");
+    expect(
+      await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
+    ).not.toBeNull();
+    expect(
+      await acceptedDiscordAdmissionForMessage(
+        {
+          author: { userId: USER },
+          id: message.messageId,
+          threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
+        } as unknown as Message,
+        flaky,
+      ),
+    ).toBeNull();
+    expect(
+      await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
+    ).not.toBeNull();
+  });
+
   it("releases only its provisional delivery claim after transient state failures", async () => {
     for (const failure of ["evaluation", "final_write"] as const) {
       const { audits, logger, state } = await harness();
