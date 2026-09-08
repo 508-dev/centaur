@@ -58,6 +58,7 @@ class Principal < ApplicationRecord
   validates :slack_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
                           allow_nil: true, if: :will_save_change_to_slack_email?
   validate :discord_actor_kind_is_immutable
+  validate :discord_actor_sandbox_policy_matches_reviewed_role, on: :update
 
   # Stand-in for an inline secret value in redacted config: operator inspection
   # reports that a control_plane source carries a value without revealing it.
@@ -169,11 +170,17 @@ class Principal < ApplicationRecord
       end
       capabilities = reviewed_policy
     end
-    with_lock do
-      update!(capabilities)
-      desired_ids = desired_roles.map(&:id)
-      principal_roles.where.not(role_id: desired_ids).destroy_all
-      desired_roles.each { |role| principal_roles.find_or_create_by!(role:) }
+    @discord_actor_reviewed_sandbox_policy = reviewed_policy if discord_actor_principal?
+    begin
+      with_lock do
+        update!(capabilities)
+        desired_ids = desired_roles.map(&:id)
+        principal_roles.where.not(role_id: desired_ids).destroy_all
+        desired_roles.each { |role| principal_roles.find_or_create_by!(role:) }
+      end
+    ensure
+      remove_instance_variable(:@discord_actor_reviewed_sandbox_policy) if
+        instance_variable_defined?(:@discord_actor_reviewed_sandbox_policy)
     end
     self.roles.reset
     desired_roles
@@ -332,6 +339,30 @@ class Principal < ApplicationRecord
     return unless discord_actor_principal?
 
     errors.add(:kind, "must be discord_user for a Discord actor principal") unless kind == "discord_user"
+  end
+
+  def discord_actor_sandbox_policy_matches_reviewed_role
+    return unless discord_actor_principal?
+
+    reviewed_policy = @discord_actor_reviewed_sandbox_policy
+    unless reviewed_policy
+      assigned_roles = roles.to_a
+      reviewed_policy = assigned_roles.one? &&
+        DiscordGithubRolePolicy.sandbox_policy_for_role(assigned_roles.first)
+    end
+    actual_policy = {
+      sandbox_repo_cache: sandbox_repo_cache,
+      sandbox_observability_enabled: sandbox_observability_enabled,
+      sandbox_sessions_read_enabled: sandbox_sessions_read_enabled,
+      sandbox_workflows_read_enabled: sandbox_workflows_read_enabled,
+      sandbox_workflows_write_enabled: sandbox_workflows_write_enabled
+    }
+    return if reviewed_policy && actual_policy == reviewed_policy
+
+    errors.add(
+      :base,
+      "Discord actor sandbox policy must exactly match its sole reviewed role"
+    )
   end
 
   def preserve_discord_actor_policy_marker
