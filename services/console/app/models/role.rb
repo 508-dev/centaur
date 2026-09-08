@@ -96,6 +96,11 @@ class Role < ApplicationRecord
 
   def apply_discord_actor_sandbox_policy(ids, policy)
     Principal.where(id: ids).order(:id).lock.each do |principal|
+      # The assignment may have been deleted while this callback waited for
+      # the principal lock. Never restore this role's policy to an actor that
+      # no longer holds the role.
+      next unless PrincipalRole.exists?(principal_id: principal.id, role_id: id)
+
       principal.update_columns(
         **policy,
         labels: principal.labels.to_h.merge(

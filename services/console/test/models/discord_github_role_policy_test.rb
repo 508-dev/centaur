@@ -249,6 +249,49 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     assert_operator principal.sync_config_cache_version, :>, previous_version
   end
 
+  test "stale registration cannot restore a role policy changed while it waited" do
+    principal, role, _secret, _credential = build_policy_binding
+    stale_role = Role.find(role.id)
+    stale_policy = DiscordGithubRolePolicy.sandbox_policy_for_role(stale_role)
+
+    role.update!(
+      labels: role.labels.merge(
+        "centaur.discord.sandbox_repo_cache" => "none",
+        "centaur.discord.sandbox_observability_enabled" => "false",
+        "centaur.discord.sandbox_sessions_read_enabled" => "false",
+        "centaur.discord.sandbox_workflows_read_enabled" => "false",
+        "centaur.discord.sandbox_workflows_write_enabled" => "false"
+      )
+    )
+
+    assert_raises ActiveRecord::RecordInvalid do
+      principal.replace_roles_and_sandbox_policy!(roles: [ stale_role ], **stale_policy)
+    end
+    principal.reload
+    assert_equal "none", principal.sandbox_repo_cache
+    assert_not principal.sandbox_observability_enabled
+    assert_not principal.sandbox_sessions_read_enabled
+    assert_not principal.sandbox_workflows_read_enabled
+    assert_not principal.sandbox_workflows_write_enabled
+  end
+
+  test "deleting a Discord actor role assignment revokes persisted capabilities" do
+    principal, role, _secret, _credential = build_policy_binding
+    previous_version = principal.sync_config_cache_version
+
+    principal.principal_roles.find_by!(role:).destroy!
+
+    principal.reload
+    assert_empty principal.roles
+    assert_equal "none", principal.sandbox_repo_cache
+    assert_not principal.sandbox_observability_enabled
+    assert_not principal.sandbox_sessions_read_enabled
+    assert_not principal.sandbox_workflows_read_enabled
+    assert_not principal.sandbox_workflows_write_enabled
+    assert_equal "none", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+    assert_operator principal.sync_config_cache_version, :>, previous_version
+  end
+
   test "destroying an assigned Discord role revokes persisted actor capabilities" do
     principal, role, _secret, _credential = build_policy_binding
     previous_version = principal.sync_config_cache_version

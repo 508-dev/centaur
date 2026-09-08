@@ -159,25 +159,32 @@ class Principal < ApplicationRecord
   # ordered state rather than interleaving into a union of privileged roles.
   def replace_roles_and_sandbox_policy!(roles:, **capabilities)
     desired_roles = Array(roles).uniq(&:id)
-    if discord_actor_principal?
-      reviewed_policy = desired_roles.one? &&
-        DiscordGithubRolePolicy.sandbox_policy_for_role(desired_roles.first)
-      unless reviewed_policy && capabilities == reviewed_policy
-        errors.add(
-          :base,
-          "Discord actor sandbox policy must exactly match its sole reviewed role"
-        )
-        raise ActiveRecord::RecordInvalid, self
-      end
-      capabilities = reviewed_policy
-    end
-    @discord_actor_reviewed_sandbox_policy = reviewed_policy if discord_actor_principal?
     begin
       with_lock do
-        update!(capabilities)
+        if discord_actor_principal?
+          # A caller may have loaded this role before an operator changed its
+          # policy. Re-read it only after taking the same principal lock used
+          # by role reconciliation, so a stale registration cannot restore an
+          # older, more privileged capability tuple.
+          desired_ids = desired_roles.map(&:id)
+          desired_roles = Role.where(id: desired_ids).order(:id).to_a
+          reviewed_policy = desired_ids.one? && desired_roles.one? &&
+            DiscordGithubRolePolicy.sandbox_policy_for_role(desired_roles.first)
+          unless reviewed_policy && capabilities == reviewed_policy
+            errors.add(
+              :base,
+              "Discord actor sandbox policy must exactly match its sole reviewed role"
+            )
+            raise ActiveRecord::RecordInvalid, self
+          end
+          capabilities = reviewed_policy
+          @discord_actor_reviewed_sandbox_policy = reviewed_policy
+        end
+
         desired_ids = desired_roles.map(&:id)
         principal_roles.where.not(role_id: desired_ids).destroy_all
         desired_roles.each { |role| principal_roles.find_or_create_by!(role:) }
+        update!(capabilities)
       end
     ensure
       remove_instance_variable(:@discord_actor_reviewed_sandbox_policy) if
