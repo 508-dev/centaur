@@ -4647,9 +4647,7 @@ mod tests {
     fn generic_workflow_runs_cannot_claim_approval_idempotency_keys() {
         assert!(ensure_unreserved_workflow_idempotency_key(None).is_ok());
         assert!(ensure_unreserved_workflow_idempotency_key(Some("ordinary-run:1")).is_ok());
-        assert!(
-            ensure_unreserved_workflow_idempotency_key(Some("approved-proposalish:1")).is_ok()
-        );
+        assert!(ensure_unreserved_workflow_idempotency_key(Some("approved-proposalish:1")).is_ok());
         assert!(
             ensure_unreserved_workflow_idempotency_key(Some("approved-proposal:sha256:abc"))
                 .unwrap_err()
