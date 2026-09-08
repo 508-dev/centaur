@@ -179,15 +179,13 @@ export async function admitDiscordGatewayMessage(
 }
 
 /**
- * Load the accepted admission and durably finalize its delivery claim. This is
- * called only after the adapter has created any required thread and dispatched
- * into a Chat handler, so earlier adapter failures leave a short-lived claim
- * that a reconnect can safely retry instead of a seven-day false duplicate.
+ * Load the accepted admission after the adapter has dispatched into Chat. The
+ * claim remains provisional until the handler proves a durable session handoff
+ * (or an intentionally terminal control/skip) and finalizes it below.
  */
 export async function acceptedDiscordAdmissionForMessage(
   message: Message,
   state: StateAdapter,
-  deliveryTtlMs = DEFAULT_DELIVERY_TTL_MS,
 ): Promise<DiscordAcceptedAdmission | null> {
   const record = await state.get<unknown>(deliveryKey(message.id));
   if (!isAcceptedAdmission(record)) return null;
@@ -200,29 +198,39 @@ export async function acceptedDiscordAdmissionForMessage(
   ) {
     return null;
   }
-  if (record.dispatchStatus === "pending") {
-    const completed: DiscordAcceptedAdmission = {
-      ...record,
-      dispatchStatus: "completed",
-    };
-    try {
-      await state.set(deliveryKey(message.id), completed, deliveryTtlMs);
-    } catch {
-      try {
-        const current = await state.get<unknown>(deliveryKey(message.id));
-        if (sameAdmissionRecord(current, completed)) return completed;
-        if (sameAdmissionRecord(current, record)) {
-          await state.delete(deliveryKey(message.id));
-        }
-      } catch {
-        // The short provisional TTL remains the recovery boundary when the
-        // final write outcome cannot be read or released safely.
-      }
-      return null;
-    }
-    return completed;
-  }
   return record;
+}
+
+/** Promote this exact provisional claim only after a durable handler outcome. */
+export async function completeDiscordAdmissionForMessage(
+  message: Message,
+  admission: DiscordAcceptedAdmission,
+  state: StateAdapter,
+  deliveryTtlMs = DEFAULT_DELIVERY_TTL_MS,
+): Promise<boolean> {
+  const completed: DiscordAcceptedAdmission = {
+    ...admission,
+    dispatchStatus: "completed",
+  };
+  try {
+    const current = await state.get<unknown>(deliveryKey(message.id));
+    if (sameAdmissionRecord(current, completed)) return true;
+    if (!sameAdmissionRecord(current, admission)) return false;
+    await state.set(deliveryKey(message.id), completed, deliveryTtlMs);
+    return true;
+  } catch {
+    try {
+      const current = await state.get<unknown>(deliveryKey(message.id));
+      if (sameAdmissionRecord(current, completed)) return true;
+      if (sameAdmissionRecord(current, admission)) {
+        await state.delete(deliveryKey(message.id));
+      }
+    } catch {
+      // The short provisional TTL remains the recovery boundary when the
+      // final write outcome cannot be read or released safely.
+    }
+    return false;
+  }
 }
 
 /** Build the same authenticated event shape for tests/direct Chat dispatch. */

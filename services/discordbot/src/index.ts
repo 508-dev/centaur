@@ -31,6 +31,7 @@ import {
 import {
   acceptedDiscordAdmissionForMessage,
   admitDiscordGatewayMessage,
+  completeDiscordAdmissionForMessage,
   discordGatewayEventFromMessage,
   type DiscordAcceptedAdmission,
 } from "./discord-ingress";
@@ -322,11 +323,25 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     );
     if (!admission) return;
     if (admission.control === "stop") {
-      await stopDiscordExecution(thread, message, admission, options, logger);
+      if (await stopDiscordExecution(thread, message, admission, options, logger)) {
+        await completeDiscordAdmissionForMessage(
+          message,
+          admission,
+          state,
+          options.ingressDeliveryTtlMs,
+        );
+      }
       return;
     }
     if (admission.control === "approve") {
-      await approveDiscordProposal(thread, message, admission, options, logger);
+      if (await approveDiscordProposal(thread, message, admission, options, logger)) {
+        await completeDiscordAdmissionForMessage(
+          message,
+          admission,
+          state,
+          options.ingressDeliveryTtlMs,
+        );
+      }
       return;
     }
     await thread.subscribe();
@@ -349,11 +364,25 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     );
     if (!admission) return;
     if (admission.control === "stop") {
-      await stopDiscordExecution(thread, message, admission, options, logger);
+      if (await stopDiscordExecution(thread, message, admission, options, logger)) {
+        await completeDiscordAdmissionForMessage(
+          message,
+          admission,
+          state,
+          options.ingressDeliveryTtlMs,
+        );
+      }
       return;
     }
     if (admission.control === "approve") {
-      await approveDiscordProposal(thread, message, admission, options, logger);
+      if (await approveDiscordProposal(thread, message, admission, options, logger)) {
+        await completeDiscordAdmissionForMessage(
+          message,
+          admission,
+          state,
+          options.ingressDeliveryTtlMs,
+        );
+      }
       return;
     }
     await syncThreadMessageToSession(thread, message, {
@@ -413,11 +442,7 @@ async function discordAdmissionForHandler(
   state: StateAdapter,
   logger: Logger,
 ): Promise<DiscordAcceptedAdmission | null> {
-  const accepted = await acceptedDiscordAdmissionForMessage(
-    message,
-    state,
-    options.ingressDeliveryTtlMs,
-  );
+  const accepted = await acceptedDiscordAdmissionForMessage(message, state);
   if (accepted) return accepted;
   // Production events must already have been admitted by the authenticated
   // Discord Gateway callback before the adapter creates a thread. The Chat SDK
@@ -441,7 +466,7 @@ async function stopDiscordExecution(
   admission: DiscordAcceptedAdmission,
   options: DiscordbotOptions,
   logger: Logger,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const outcome = await interruptSessionExecution(
       options,
@@ -458,6 +483,7 @@ async function stopDiscordExecution(
       { emoji: "⏹️", messageId: message.id, threadKey: thread.id },
       logger,
     );
+    return true;
   } catch (error) {
     traceLog(options, "discordbot_stop_failed", undefined, {
       actor_id: admission.actorId,
@@ -466,6 +492,7 @@ async function stopDiscordExecution(
       thread_id: thread.id,
     });
     await thread.post("I couldn't stop that run. Check Console and try again.");
+    return false;
   }
 }
 
@@ -475,7 +502,7 @@ async function approveDiscordProposal(
   admission: DiscordAcceptedAdmission,
   options: DiscordbotOptions,
   logger: Logger,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const outcome = await approveActionProposal(options, admission);
     const state = outcome.created ? "Queued" : "Already queued";
@@ -488,6 +515,7 @@ async function approveDiscordProposal(
       { emoji: "✅", messageId: message.id, threadKey: thread.id },
       logger,
     );
+    return true;
   } catch (error) {
     traceLog(options, "discordbot_proposal_approval_failed", undefined, {
       actor_id: admission.actorId,
@@ -499,6 +527,7 @@ async function approveDiscordProposal(
     await thread.post(
       "I couldn't approve that proposal. It may be expired or changed; run a fresh observation and check Console.",
     );
+    return false;
   }
 }
 
@@ -624,7 +653,15 @@ async function syncThreadMessageToSession(
     startedAtMs: traceStartedAtMs,
     threadId: thread.id,
   };
+  const completeAdmission = () =>
+    completeDiscordAdmissionForMessage(
+      message,
+      input.admission,
+      input.state,
+      input.options.ingressDeliveryTtlMs,
+    );
   if (isDuplicateIncrementalMessage) {
+    await completeAdmission();
     traceLog(input.options, "discordbot_forward_duplicate_skipped", trace);
     return;
   }
@@ -651,6 +688,7 @@ async function syncThreadMessageToSession(
       { emoji: "❓", messageId: message.id, threadKey: thread.id },
       logger,
     );
+    await completeAdmission();
     return;
   }
 
@@ -686,6 +724,7 @@ async function syncThreadMessageToSession(
         { emoji: "❌", messageId: message.id, threadKey: thread.id },
         logger,
       );
+      await completeAdmission();
       return;
     }
     // Discord delta: a thread created from a message keeps that starter message
@@ -758,6 +797,7 @@ async function syncThreadMessageToSession(
       historyForwarded: latest.historyForwarded || shouldIncludeContext,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
     });
+    await completeAdmission();
     traceLog(input.options, "discordbot_forward_messages_committed", trace, {
       appended_message_count: messagesToAppend.length,
       forwarded_message_count: Math.min(latestMessageIds.size, 1000),
@@ -810,6 +850,7 @@ async function syncThreadMessageToSession(
         onMessagesAppended: commitMessagesAppended,
       });
     }
+    if (messagesToAppend.length === 0) await completeAdmission();
     traceLog(input.options, "discordbot_forward_complete", trace);
     return;
   }

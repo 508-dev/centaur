@@ -4,6 +4,7 @@ import type { Logger, Message, StateAdapter } from "chat";
 import {
   acceptedDiscordAdmissionForMessage,
   admitDiscordGatewayMessage,
+  completeDiscordAdmissionForMessage,
   type DiscordGatewayMessageEvent,
 } from "../src/discord-ingress";
 import type {
@@ -163,27 +164,40 @@ describe("Discord Gateway admission", () => {
     );
     expect(admitted?.dispatchStatus).toBe("pending");
 
+    const chatMessage = {
+      attachments: [],
+      author: {
+        fullName: "Test User",
+        isBot: false,
+        isMe: false,
+        userId: USER,
+        userName: "tester",
+      },
+      id: message.messageId,
+      isMention: true,
+      raw: {},
+      text: message.content,
+      threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
+      metadata: { dateSent: new Date(NOW), edited: false },
+    } as unknown as Message;
     const dispatched = await acceptedDiscordAdmissionForMessage(
-      {
-        attachments: [],
-        author: {
-          fullName: "Test User",
-          isBot: false,
-          isMe: false,
-          userId: USER,
-          userName: "tester",
-        },
-        id: message.messageId,
-        isMention: true,
-        raw: {},
-        text: message.content,
-        threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
-        metadata: { dateSent: new Date(NOW), edited: false },
-      } as unknown as Message,
+      chatMessage,
       state,
-      configured.ingressDeliveryTtlMs,
     );
-    expect(dispatched?.dispatchStatus).toBe("completed");
+    expect(dispatched?.dispatchStatus).toBe("pending");
+    expect(
+      await completeDiscordAdmissionForMessage(
+        chatMessage,
+        dispatched!,
+        state,
+        configured.ingressDeliveryTtlMs,
+      ),
+    ).toBe(true);
+    const completed = await acceptedDiscordAdmissionForMessage(
+      chatMessage,
+      state,
+    );
+    expect(completed?.dispatchStatus).toBe("completed");
 
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(
@@ -232,15 +246,23 @@ describe("Discord Gateway admission", () => {
       await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
     ).not.toBeNull();
     expect(
-      await acceptedDiscordAdmissionForMessage(
+      await completeDiscordAdmissionForMessage(
         {
           author: { userId: USER },
           id: message.messageId,
           threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
         } as unknown as Message,
+        (await acceptedDiscordAdmissionForMessage(
+          {
+            author: { userId: USER },
+            id: message.messageId,
+            threadId: `discord:${GUILD}:${CHANNEL}:${message.messageId}`,
+          } as unknown as Message,
+          flaky,
+        ))!,
         flaky,
       ),
-    ).toBeNull();
+    ).toBe(false);
     expect(
       await admitDiscordGatewayMessage(message, options(), flaky, logger, NOW),
     ).not.toBeNull();
