@@ -42,7 +42,12 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       name: "Discord policy",
       labels: {
         "centaur_discord_policy_managed" => "true",
-        "repository_scope" => SCOPE.join(",")
+        "repository_scope" => SCOPE.join(","),
+        "centaur.discord.sandbox_repo_cache" => "public",
+        "centaur.discord.sandbox_observability_enabled" => "true",
+        "centaur.discord.sandbox_sessions_read_enabled" => "false",
+        "centaur.discord.sandbox_workflows_read_enabled" => "true",
+        "centaur.discord.sandbox_workflows_write_enabled" => "false"
       },
       created_by: admin
     )
@@ -54,7 +59,10 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       labels: { "centaur_discord_policy_managed" => "true" },
       created_by: admin
     )
-    PrincipalRole.create!(principal: principal, role: role)
+    principal.replace_roles_and_sandbox_policy!(
+      roles: [ role ],
+      **DiscordGithubRolePolicy.sandbox_policy_for_role(role)
+    )
 
     [ principal.reload, role, github_token_wrapper, credential ]
   end
@@ -215,6 +223,57 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
 
     assert_not role.valid?
     assert role.errors[:base].any? { |message| message.include?("scope differs") }
+  end
+
+  test "role capability changes reconcile every assigned Discord actor" do
+    principal, role, _secret, _credential = build_policy_binding
+    previous_version = principal.sync_config_cache_version
+
+    role.update!(
+      labels: role.labels.merge(
+        "centaur.discord.sandbox_repo_cache" => "all",
+        "centaur.discord.sandbox_observability_enabled" => "false",
+        "centaur.discord.sandbox_sessions_read_enabled" => "true",
+        "centaur.discord.sandbox_workflows_read_enabled" => "false",
+        "centaur.discord.sandbox_workflows_write_enabled" => "true"
+      )
+    )
+
+    principal.reload
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_not principal.sandbox_observability_enabled
+    assert principal.sandbox_sessions_read_enabled
+    assert_not principal.sandbox_workflows_read_enabled
+    assert principal.sandbox_workflows_write_enabled
+    assert_equal "all", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+    assert_operator principal.sync_config_cache_version, :>, previous_version
+  end
+
+  test "destroying an assigned Discord role revokes persisted actor capabilities" do
+    principal, role, _secret, _credential = build_policy_binding
+    previous_version = principal.sync_config_cache_version
+
+    role.destroy!
+
+    principal.reload
+    assert_empty principal.roles
+    assert_equal "none", principal.sandbox_repo_cache
+    assert_not principal.sandbox_observability_enabled
+    assert_not principal.sandbox_sessions_read_enabled
+    assert_not principal.sandbox_workflows_read_enabled
+    assert_not principal.sandbox_workflows_write_enabled
+    assert_equal "none", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+    assert_operator principal.sync_config_cache_version, :>, previous_version
+  end
+
+  test "rejects an incomplete sandbox declaration on an assigned Discord role" do
+    _principal, role, _secret, _credential = build_policy_binding
+
+    role.labels = role.labels.except("centaur.discord.sandbox_workflows_write_enabled")
+
+    assert_not role.valid?
+    assert_includes role.errors[:base],
+                    "Assigned Discord policy roles require a complete sandbox capability declaration"
   end
 
   test "proxy rendering excludes legacy widened Discord GitHub credentials" do

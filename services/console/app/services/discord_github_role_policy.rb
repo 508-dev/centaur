@@ -21,6 +21,14 @@ class DiscordGithubRolePolicy
   class << self
     def validate_role(role)
       add_errors(role, policy_errors(role))
+      if managed_role?(role) &&
+         assigned_discord_principal?(role) &&
+         sandbox_policy_for_role(role).nil?
+        role.errors.add(
+          :base,
+          "Assigned Discord policy roles require a complete sandbox capability declaration"
+        )
+      end
     end
 
     def validate_grant(grant)
@@ -154,6 +162,16 @@ class DiscordGithubRolePolicy
     end
 
     private
+
+    def assigned_discord_principal?(role)
+      return false unless role.persisted?
+
+      Principal
+        .joins(:principal_roles)
+        .where(principal_roles: { role_id: role.id })
+        .where("principals.foreign_id LIKE ?", "#{Principal::DISCORD_ACTOR_FOREIGN_ID_PREFIX}%")
+        .exists?
+    end
 
     def add_errors(record, messages)
       messages.uniq.each { |message| record.errors.add(:base, message) }
