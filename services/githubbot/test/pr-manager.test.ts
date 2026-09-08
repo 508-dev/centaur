@@ -733,6 +733,15 @@ describe("bounded review epochs", () => {
       reviewFindings: {
         40: [{ ...sharedFinding, id: 400 }],
         41: [{ ...sharedFinding, id: 410, line: 25 }],
+        42: [
+          {
+            body: "A new finding after the zero-round epoch was restored.",
+            diff_hunk: "+newRisk();",
+            id: 420,
+            line: 30,
+            path: "src/new-risk.ts",
+          },
+        ],
       },
       state,
     });
@@ -789,6 +798,12 @@ describe("bounded review epochs", () => {
       roundsUsed: 0,
       lastReviewedHeadSha: "head-2",
     });
+
+    await handleReviewEvent(ctx, submittedReview(42, "head-2"));
+    await drainBackgroundWork(5_000);
+    expect(
+      await state.get("centaur-githubbot:review-budget:base/repo#7"),
+    ).toMatchObject({ epoch: 2, roundsUsed: 1 });
   });
 
   test("requires rejection evidence for each exact finding fingerprint", async () => {

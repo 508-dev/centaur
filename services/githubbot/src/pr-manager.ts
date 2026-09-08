@@ -272,7 +272,7 @@ function isReviewEpochState(value: unknown): value is ReviewEpochState {
     candidate.epoch > 0 &&
     typeof candidate.roundsUsed === "number" &&
     Number.isInteger(candidate.roundsUsed) &&
-    candidate.roundsUsed > 0 &&
+    candidate.roundsUsed >= 0 &&
     (candidate.automationPendingFromHeadSha === undefined ||
       typeof candidate.automationPendingFromHeadSha === "string") &&
     (candidate.consumedResetApprovalId === undefined ||
