@@ -153,7 +153,9 @@ describe("Discord Gateway admission", () => {
     const message = event("600000000000000004");
     const configured = options({
       ingressDeliveryTtlMs: 10_000,
-      ingressDispatchClaimTtlMs: 1,
+      // Leave enough time for the provisional read/promote sequence under a
+      // loaded CI runner, then prove the completed record outlives that TTL.
+      ingressDispatchClaimTtlMs: 500,
     });
     const admitted = await admitDiscordGatewayMessage(
       message,
@@ -199,7 +201,7 @@ describe("Discord Gateway admission", () => {
     );
     expect(completed?.dispatchStatus).toBe("completed");
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 550));
     expect(
       await admitDiscordGatewayMessage(message, configured, state, logger, NOW),
     ).toBeNull();
