@@ -77,6 +77,26 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
     ]
   end
 
+  def build_generic_broker
+    BrokerCredential.create!(
+      foreign_id: "discord-generic-#{SecureRandom.hex(4)}",
+      name: "Generic OAuth broker",
+      token_endpoint: "https://idp.example/token",
+      client_id: "generic-client",
+      refresh_token: "seed",
+      created_by: users(:acme_admin)
+    )
+  end
+
+  def point_oauth_refresh_source_at(broker)
+    source = secret_sources(:oauth_gmail_refresh)
+    SecretSource.where(id: source.id).update_all(
+      source_type: "token_broker",
+      config: { "credential_id" => broker.foreign_id }
+    )
+    source.reload
+  end
+
   test "rejects a custom wrapper around a GitHub App credential" do
     _principal, role, _secret, credential = build_policy_binding
     custom = StaticSecret.new(
@@ -384,6 +404,49 @@ class DiscordGithubRolePolicyTest < ActiveSupport::TestCase
       assert_not grant.valid?, "expected #{credential.class.name} GitHub grant to be rejected"
       assert grant.errors[:base].any? { |message| message.include?("may not grant") }
     end
+  end
+
+  test "rejects a non-static credential that sources a GitHub App installation token" do
+    principal, role, _secret, credential = build_policy_binding
+    oauth = oauth_token_secrets(:acme_gmail_oauth)
+    point_oauth_refresh_source_at(credential)
+    grant = Grant.new(role:, oauth_token_secret: oauth, created_by: users(:acme_admin))
+
+    assert_not grant.valid?
+    assert grant.errors[:base].any? { |message| message.include?("source credentials from GitHub") }
+
+    grant.save!(validate: false)
+    assert_not DiscordGithubRolePolicy.credential_allowed_for_principal?(principal, oauth)
+  end
+
+  test "rejects repointing a granted non-static credential source at a GitHub App broker" do
+    _principal, role, _secret, github_credential = build_policy_binding
+    oauth = oauth_token_secrets(:acme_gmail_oauth)
+    source = point_oauth_refresh_source_at(build_generic_broker)
+    Grant.create!(role:, oauth_token_secret: oauth, created_by: users(:acme_admin))
+
+    source.config = { "credential_id" => github_credential.foreign_id }
+
+    assert_not source.valid?
+    assert source.errors[:base].any? { |message| message.include?("source credentials from GitHub") }
+  end
+
+  test "rejects changing a broker referenced by a granted non-static credential into a GitHub App broker" do
+    _principal, role, _secret, _github_credential = build_policy_binding
+    oauth = oauth_token_secrets(:acme_gmail_oauth)
+    broker = build_generic_broker
+    point_oauth_refresh_source_at(broker)
+    Grant.create!(role:, oauth_token_secret: oauth, created_by: users(:acme_admin))
+
+    broker.assign_attributes(
+      grant: "github_app_installation",
+      client_id: "Iv1.0123456789abcdef",
+      github_installation_id: "12345678",
+      github_repositories: SCOPE
+    )
+
+    assert_not broker.valid?
+    assert broker.errors[:base].any? { |message| message.include?("source credentials from GitHub") }
   end
 
   test "rejects later GitHub rule widening for every non-static credential type" do

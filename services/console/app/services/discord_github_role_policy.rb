@@ -78,22 +78,30 @@ class DiscordGithubRolePolicy
     end
 
     def validate_secret_source(source)
-      secret = source.static_secret
-      return unless secret
+      credential = credential_owner_for_source(source)
+      return unless credential
 
-      policy_roles_granting(secret).each do |role|
-        messages = policy_errors(
-          role,
-          replacement_static_secret: secret,
-          replacement_source: source
-        )
+      policy_roles_granting(credential).each do |role|
+        messages = if credential.is_a?(StaticSecret)
+          policy_errors(
+            role,
+            replacement_static_secret: credential,
+            replacement_source: source
+          )
+        else
+          nonstatic_credential_errors(role, credential, replacement_source: source)
+        end
         add_errors(source, prefix_errors(role, messages))
       end
     end
 
     def validate_broker_credential(credential)
-      policy_roles_referencing(credential).each do |role|
-        messages = policy_errors(role, replacement_broker: credential)
+      policy_credentials_referencing(credential).each do |role, owner|
+        messages = if owner.is_a?(StaticSecret)
+          policy_errors(role, replacement_broker: credential)
+        else
+          nonstatic_credential_errors(role, owner, replacement_broker: credential)
+        end
         add_errors(credential, prefix_errors(role, messages))
       end
     end
@@ -231,15 +239,20 @@ class DiscordGithubRolePolicy
       errors.uniq
     end
 
-    def nonstatic_credential_errors(role, credential)
+    def nonstatic_credential_errors(role, credential, replacement_source: nil, replacement_broker: nil)
       _scope, scope_error = repository_scope(
         role.labels.to_h[REPOSITORY_SCOPE_LABEL],
         "reviewed Discord role repository_scope"
       )
       return [ scope_error ] if scope_error
-      return [] unless github_targetable_credential?(credential)
+      return [] unless github_targetable_credential?(credential) ||
+                       github_app_broker_source?(
+                         credential,
+                         replacement_source: replacement_source,
+                         replacement_broker: replacement_broker
+                       )
 
-      [ "may not grant #{credential.class.model_name.human.downcase} credentials that can target GitHub" ]
+      [ "may not grant #{credential.class.model_name.human.downcase} credentials that can target or source credentials from GitHub" ]
     end
 
     def static_secrets_for_role(role, replacement_static_secret:, extra_static_secret:)
@@ -378,6 +391,41 @@ class DiscordGithubRolePolicy
       credential.respond_to?(:rules) && credential.rules.to_a.any? { |rule| github_targetable_rule?(rule) }
     end
 
+    def github_app_broker_source?(credential, replacement_source:, replacement_broker:)
+      credential_sources(credential, replacement_source: replacement_source).any? do |source|
+        broker_for(source, replacement_broker)&.grant == GITHUB_APP_INSTALLATION_GRANT
+      end
+    end
+
+    def credential_sources(credential, replacement_source:)
+      association = source_owner_association_for(credential)
+      return [] unless association
+
+      sources = credential.persisted? ? SecretSource.where(association => credential).to_a : []
+      return sources unless replacement_source &&
+                            same_record?(credential_owner_for_source(replacement_source), credential)
+
+      replaced = false
+      sources.map! do |source|
+        next source unless same_record?(source, replacement_source)
+
+        replaced = true
+        replacement_source
+      end
+      sources << replacement_source unless replaced
+      sources
+    end
+
+    def credential_owner_for_source(source)
+      SecretSource::OWNER_ASSOCIATIONS.filter_map { |association| source.public_send(association) }.first
+    end
+
+    def source_owner_association_for(credential)
+      SecretSource::OWNER_ASSOCIATIONS.find do |association|
+        SecretSource.reflect_on_association(association).klass == credential.class
+      end
+    end
+
     def credential_for_rule(rule)
       RequestRule::OWNER_ASSOCIATIONS.filter_map { |association| rule.public_send(association) }.first
     end
@@ -396,10 +444,13 @@ class DiscordGithubRolePolicy
         .filter_map(&:role).select { |role| managed_role?(role) }.uniq(&:id)
     end
 
-    def policy_roles_referencing(credential)
-      SecretSource.referencing_broker_credential(credential).includes(static_secret: { grants: :role })
-        .filter_map(&:static_secret).flat_map(&:grants).filter_map(&:role)
-        .select { |role| managed_role?(role) }.uniq(&:id)
+    def policy_credentials_referencing(credential)
+      SecretSource.referencing_broker_credential(credential).flat_map do |source|
+        owner = credential_owner_for_source(source)
+        next [] unless owner
+
+        policy_roles_granting(owner).map { |role| [ role, owner ] }
+      end.uniq { |role, owner| [ role.id, owner.class.name, owner.id ] }
     end
 
     def repository_scope(value, label)
