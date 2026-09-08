@@ -33,6 +33,7 @@ import { extractMessageOverrides } from "./overrides";
 import {
   handleCiEvent,
   handlePullRequestEvent,
+  handleReviewFindingDispositionComment,
   handleReviewEvent,
   isPrOwned,
   managementThreadKey,
@@ -205,6 +206,13 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
         event_type: eventType,
         repository: repositoryFullNameFromRaw(payload) ?? "unknown",
       });
+      return new globalThis.Response("ok", { status: 200 });
+    }
+
+    if (
+      isCommentEvent &&
+      (await handleReviewFindingDispositionComment(prManagerCtx, rawBody))
+    ) {
       return new globalThis.Response("ok", { status: 200 });
     }
 

@@ -173,6 +173,9 @@ const options: GithubbotOptions = {
     "GITHUBBOT_REVIEW_MAX_TOTAL_ROUNDS_PER_EPOCH",
   ),
   reviewMaxEpochs: optionalNumberEnv("GITHUBBOT_REVIEW_MAX_EPOCHS"),
+  reviewMaxSecurityInterruptsPerPr: optionalNumberEnv(
+    "GITHUBBOT_REVIEW_MAX_SECURITY_INTERRUPTS_PER_PR",
+  ),
   reviewMaterialChangeLines: optionalNumberEnv(
     "GITHUBBOT_REVIEW_MATERIAL_CHANGE_LINES",
   ),
