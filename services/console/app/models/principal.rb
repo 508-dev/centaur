@@ -58,7 +58,8 @@ class Principal < ApplicationRecord
   validates :slack_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
                           allow_nil: true, if: :will_save_change_to_slack_email?
   validate :discord_actor_kind_is_immutable
-  validate :discord_actor_sandbox_policy_matches_reviewed_role, on: :update
+  validate :discord_actor_sandbox_policy_matches_reviewed_role,
+           on: :update, if: :sandbox_capabilities_changed?
 
   # Stand-in for an inline secret value in redacted config: operator inspection
   # reports that a control_plane source carries a value without revealing it.
@@ -363,6 +364,14 @@ class Principal < ApplicationRecord
       :base,
       "Discord actor sandbox policy must exactly match its sole reviewed role"
     )
+  end
+
+  def sandbox_capabilities_changed?
+    %w[
+      sandbox_repo_cache sandbox_observability_enabled
+      sandbox_sessions_read_enabled sandbox_workflows_read_enabled
+      sandbox_workflows_write_enabled
+    ].any? { |field| will_save_change_to_attribute?(field) }
   end
 
   def preserve_discord_actor_policy_marker
