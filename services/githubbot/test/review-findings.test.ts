@@ -13,7 +13,7 @@ function finding(overrides: Partial<Parameters<typeof makeReviewFinding>[0]> = {
   return makeReviewFinding({
     body: "The unchecked value can escape the repository policy.",
     commentId: 71,
-    diffHunk: "@@ -1 +1 @@\n-old\n+new",
+    diffHunk: "@@ -14 +14 @@\n-old\n+new",
     line: 14,
     path: "src/policy.ts",
     reviewId: 31,
@@ -27,7 +27,7 @@ describe("review finding fingerprints", () => {
   test("are stable across reviewers, moved hunk coordinates, and URLs", () => {
     const first = fingerprintReviewFinding({
       body: "Check  https://example.test/one  before use",
-      diffHunk: "@@ -1 +1 @@\n-old\n+same implementation",
+      diffHunk: "@@ -1 +10 @@\n-old\n+same implementation",
       line: 10,
       path: "./src/policy.ts",
     });
@@ -90,6 +90,7 @@ describe("review finding ledger", () => {
 
     const repeated = finding({
       commentId: 88,
+      diffHunk: "@@ -40 +40 @@\n-old\n+new",
       line: 40,
       reviewId: 32,
       reviewerKey: "github-user:202",
@@ -120,8 +121,11 @@ describe("review finding ledger", () => {
     );
   });
 
-  test("reconciles one moved rediscovery without collapsing simultaneous sites", () => {
-    const first = finding({ diffHunk: "@@ -1 +1 @@\n-old one\n+new one" });
+  test("distinguishes sites while keeping an unchanged moved hunk stable", () => {
+    const first = finding({
+      diffHunk: "@@ -14,2 +14,2 @@\n first line\n second line",
+      line: 14,
+    });
     const initial = mergeReviewFindings(undefined, [first], 1);
     const accepted = applyReviewFindingDispositionMarkers(
       initial.ledger,
@@ -130,25 +134,35 @@ describe("review finding ledger", () => {
       ),
       { commentId: 72, replyToCommentId: 71 },
     );
-    const moved = finding({
+    const movedUnchanged = finding({
       commentId: 81,
-      diffHunk: "@@ -80 +90 @@\n-partially repaired\n+still unsafe",
+      diffHunk: "@@ -90,2 +90,2 @@\n first line\n second line",
       line: 90,
       reviewId: 32,
     });
-    expect(moved.fingerprint).not.toBe(first.fingerprint);
-    const reconciled = mergeReviewFindings(accepted.ledger, [moved], 2);
+    expect(movedUnchanged.fingerprint).toBe(first.fingerprint);
+    const reconciled = mergeReviewFindings(accepted.ledger, [movedUnchanged], 2);
     expect(reconciled.newFindings).toEqual([]);
     expect(Object.keys(reconciled.ledger)).toEqual([first.fingerprint]);
 
     const otherSite = finding({
       commentId: 82,
-      diffHunk: "@@ -120 +120 @@\n-old other\n+new other",
-      line: 120,
+      diffHunk: first.diffHunk,
+      line: 15,
     });
     const simultaneous = mergeReviewFindings(undefined, [first, otherSite], 1);
     expect(simultaneous.newFindings).toHaveLength(2);
     expect(Object.keys(simultaneous.ledger)).toHaveLength(2);
+
+    const changedSite = finding({
+      commentId: 83,
+      diffHunk: "@@ -14 +14 @@\n-partially repaired\n+still unsafe",
+      line: 14,
+      reviewId: 33,
+    });
+    const reopened = mergeReviewFindings(accepted.ledger, [changedSite], 2);
+    expect(reopened.newFindings).toEqual([changedSite]);
+    expect(Object.keys(reopened.ledger)).toHaveLength(2);
   });
 
   test("preserves the highest severity when a pending finding is rediscovered", () => {

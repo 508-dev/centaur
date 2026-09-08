@@ -750,7 +750,14 @@ describe("bounded review epochs", () => {
       actor: "human",
       reviewFindings: {
         40: [{ ...sharedFinding, id: 400 }],
-        41: [{ ...sharedFinding, id: 410, line: 25 }],
+        41: [
+          {
+            ...sharedFinding,
+            diff_hunk: "@@ -6 +6 @@\n-unchecked\n+checked",
+            id: 410,
+            line: 25,
+          },
+        ],
         42: [
           {
             body: "A new finding after the zero-round epoch was restored.",
@@ -1107,11 +1114,13 @@ describe("bounded review epochs", () => {
     const oldFingerprint = fingerprintReviewFinding({
       body: oldBody,
       diffHunk: "+old();",
+      line: 20,
       path: oldPath,
     });
     const newFingerprint = fingerprintReviewFinding({
       body: newBody,
       diffHunk: "+new();",
+      line: 30,
       path: newPath,
     });
     const state = makeState();
