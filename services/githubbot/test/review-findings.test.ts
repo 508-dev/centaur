@@ -120,6 +120,37 @@ describe("review finding ledger", () => {
     );
   });
 
+  test("reconciles one moved rediscovery without collapsing simultaneous sites", () => {
+    const first = finding({ diffHunk: "@@ -1 +1 @@\n-old one\n+new one" });
+    const initial = mergeReviewFindings(undefined, [first], 1);
+    const accepted = applyReviewFindingDispositionMarkers(
+      initial.ledger,
+      parseReviewFindingDispositionMarkers(
+        `<!-- centaur-review-finding ${first.fingerprint} review:31 accepted -->`,
+      ),
+      { commentId: 72, replyToCommentId: 71 },
+    );
+    const moved = finding({
+      commentId: 81,
+      diffHunk: "@@ -80 +90 @@\n-partially repaired\n+still unsafe",
+      line: 90,
+      reviewId: 32,
+    });
+    expect(moved.fingerprint).not.toBe(first.fingerprint);
+    const reconciled = mergeReviewFindings(accepted.ledger, [moved], 2);
+    expect(reconciled.newFindings).toEqual([]);
+    expect(Object.keys(reconciled.ledger)).toEqual([first.fingerprint]);
+
+    const otherSite = finding({
+      commentId: 82,
+      diffHunk: "@@ -120 +120 @@\n-old other\n+new other",
+      line: 120,
+    });
+    const simultaneous = mergeReviewFindings(undefined, [first, otherSite], 1);
+    expect(simultaneous.newFindings).toHaveLength(2);
+    expect(Object.keys(simultaneous.ledger)).toHaveLength(2);
+  });
+
   test("preserves the highest severity when a pending finding is rediscovered", () => {
     const severe = finding({
       body:

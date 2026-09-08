@@ -75,6 +75,7 @@ const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
 export const DEFAULT_OWNERSHIP_LABEL = "centaur-managed";
+const REVIEW_GITHUB_EVIDENCE_RETRY_DELAYS_MS = [0, 100];
 const REVIEW_STATE_RETRY_DELAYS_MS = [0, 100, 500, 1_000, 5_000, 10_000, 30_000];
 
 // ---------------------------------------------------------------------------
@@ -416,6 +417,36 @@ function isTransientGithubError(error: unknown): boolean {
     status === 429 ||
     status >= 500
   );
+}
+
+async function retryingGithubEvidenceOperation<T>(
+  ctx: PrManagerContext,
+  pr: string,
+  fingerprint: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let failureCount = 0;
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      const delayMs = REVIEW_GITHUB_EVIDENCE_RETRY_DELAYS_MS[failureCount];
+      if (!isTransientGithubError(error) || delayMs === undefined) throw error;
+      failureCount += 1;
+      logger(ctx).warn("githubbot_review_disposition_evidence_retry", {
+        attempt: failureCount,
+        error: errorMessage(error),
+        fingerprint,
+        pr,
+        retry_in_ms: delayMs,
+      });
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        await Promise.resolve();
+      }
+    }
+  }
 }
 
 async function retryingReviewBudgetLoad(
@@ -1096,37 +1127,44 @@ async function hasAcceptedFindingRepairEvidence(
     return false;
   }
   try {
-    const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
-      basehead: `${reviewedHeadSha}...${currentHeadSha}`,
-      owner,
-      per_page: 100,
-      repo,
-    });
-    if (stringValue(data.status)?.toLowerCase() !== "ahead") return false;
-    const commits = Array.isArray(data.commits) ? data.commits : [];
-    const totalCommits =
-      typeof data.total_commits === "number" ? data.total_commits : undefined;
-    if (totalCommits === undefined || totalCommits !== commits.length) return false;
-    const files = Array.isArray(data.files) ? data.files : undefined;
-    // The compare API caps this array at 300 files. Exactly 300 is therefore
-    // ambiguous and cannot prove an exact path was included.
-    if (!files || files.length === 0 || files.length >= 300) return false;
-    const changedFindingPath = files.some(
-      (file) =>
-        file.filename === findingPath ||
-        ("previous_filename" in file &&
-          file.previous_filename === findingPath),
-    );
-    if (!changedFindingPath) return false;
-    for (const commit of commits) {
-      if (!commitCarriesFindingFingerprint(commit, fingerprint)) continue;
-      if (
-        await commitChangesFindingPath(ctx, owner, repo, commit, findingPath)
-      ) {
-        return true;
+    return await retryingGithubEvidenceOperation(
+      ctx,
+      `${owner}/${repo}#${reviewedHeadSha}...${currentHeadSha}`,
+      fingerprint,
+      async () => {
+        const { data } = await ctx.octokit.rest.repos.compareCommitsWithBasehead({
+          basehead: `${reviewedHeadSha}...${currentHeadSha}`,
+          owner,
+          per_page: 100,
+          repo,
+        });
+        if (stringValue(data.status)?.toLowerCase() !== "ahead") return false;
+        const commits = Array.isArray(data.commits) ? data.commits : [];
+        const totalCommits =
+          typeof data.total_commits === "number" ? data.total_commits : undefined;
+        if (totalCommits === undefined || totalCommits !== commits.length) return false;
+        const files = Array.isArray(data.files) ? data.files : undefined;
+        // The compare API caps this array at 300 files. Exactly 300 is therefore
+        // ambiguous and cannot prove an exact path was included.
+        if (!files || files.length === 0 || files.length >= 300) return false;
+        const changedFindingPath = files.some(
+          (file) =>
+            file.filename === findingPath ||
+            ("previous_filename" in file &&
+              file.previous_filename === findingPath),
+        );
+        if (!changedFindingPath) return false;
+        for (const commit of commits) {
+          if (!commitCarriesFindingFingerprint(commit, fingerprint)) continue;
+          if (
+            await commitChangesFindingPath(ctx, owner, repo, commit, findingPath)
+          ) {
+            return true;
+          }
+        }
+        return false;
       }
-    }
-    return false;
+    );
   } catch (error) {
     logger(ctx).warn("githubbot_review_disposition_evidence_failed", {
       error: errorMessage(error),

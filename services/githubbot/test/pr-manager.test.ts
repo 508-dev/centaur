@@ -921,12 +921,25 @@ describe("bounded review epochs", () => {
   test("accepts a finding only after an exact-path repair with its trailer", async () => {
     const state = makeState();
     let fingerprint = "";
+    let comparisonAttempts = 0;
     const ctx = budgetCtx({
       comparisonCommitMessage: () =>
         `fix review\n\nCentaur-Automation: true\nCentaur-Review-Finding: ${fingerprint}`,
       comparisonFile: "src/implementation.ts",
       state,
     });
+    const compare = ctx.octokit.rest.repos.compareCommitsWithBasehead;
+    ctx.octokit.rest.repos.compareCommitsWithBasehead = (async (request: {
+      basehead: string;
+    }) => {
+      comparisonAttempts += 1;
+      if (comparisonAttempts === 1) {
+        throw Object.assign(new Error("temporary GitHub failure"), {
+          status: 503,
+        });
+      }
+      return compare(request as never);
+    }) as unknown as typeof ctx.octokit.rest.repos.compareCommitsWithBasehead;
     await handleReviewEvent(ctx, submittedReview(43, "head-1"));
     const initial = (await state.get(
       "centaur-githubbot:review-budget:base/repo#7",
@@ -961,6 +974,7 @@ describe("bounded review epochs", () => {
         },
       },
     });
+    expect(comparisonAttempts).toBe(2);
   });
 
   test("keeps acceptance pending when the trailer commit did not change the finding path", async () => {

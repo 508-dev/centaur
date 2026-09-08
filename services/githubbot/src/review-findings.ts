@@ -14,6 +14,7 @@ export type ReviewFinding = {
   reviewId: number;
   reviewerKey: string;
   reviewedHeadSha: string;
+  semanticFingerprint: string;
   severity: "normal" | "p0" | "security";
   url?: string;
 };
@@ -27,6 +28,7 @@ export type ReviewFindingRecord = {
   reviewId: number;
   reviewerKey: string;
   reviewedHeadSha: string;
+  semanticFingerprint?: string;
   severity: ReviewFinding["severity"];
 };
 
@@ -67,6 +69,17 @@ export function fingerprintReviewFinding(input: {
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
+function semanticFingerprintReviewFinding(input: {
+  body: string;
+  path?: string;
+}): string {
+  const canonical = JSON.stringify({
+    body: normalizeFindingText(input.body),
+    path: normalizePath(input.path),
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 export function makeReviewFinding(input: {
   body: string;
   commentId?: number;
@@ -92,6 +105,7 @@ export function makeReviewFinding(input: {
     reviewId: input.reviewId,
     reviewerKey: input.reviewerKey,
     reviewedHeadSha: input.reviewedHeadSha,
+    semanticFingerprint: semanticFingerprintReviewFinding({ body, path }),
     severity: findingSeverity({ body, diffHunk, line, path }),
     url: input.url?.trim().slice(0, 2_000) || undefined,
   };
@@ -134,8 +148,30 @@ export function mergeReviewFindings(
 } {
   const next: ReviewFindingLedger = { ...(ledger ?? {}) };
   const actionableFindings: ReviewFinding[] = [];
+  const semanticCounts = new Map<string, number>();
   for (const finding of findings) {
-    const existing = next[finding.fingerprint];
+    semanticCounts.set(
+      finding.semanticFingerprint,
+      (semanticCounts.get(finding.semanticFingerprint) ?? 0) + 1,
+    );
+  }
+  for (const finding of findings) {
+    let fingerprint = finding.fingerprint;
+    if (
+      !next[fingerprint] &&
+      semanticCounts.get(finding.semanticFingerprint) === 1
+    ) {
+      const matching = Object.entries(next).filter(
+        ([, record]) =>
+          record.semanticFingerprint === finding.semanticFingerprint,
+      );
+      if (matching.length === 1) fingerprint = matching[0]![0];
+    }
+    const canonicalFinding =
+      fingerprint === finding.fingerprint
+        ? finding
+        : { ...finding, fingerprint };
+    const existing = next[fingerprint];
     if (
       existing?.disposition === "accepted" ||
       existing?.disposition === "rejected"
@@ -144,20 +180,21 @@ export function mergeReviewFindings(
     }
     // A repeated pending finding remains actionable. Only an evidence-backed
     // accepted/rejected decision suppresses rediscovery.
-    actionableFindings.push(finding);
+    actionableFindings.push(canonicalFinding);
     if (existing) {
-      next[finding.fingerprint] = {
+      next[fingerprint] = {
         ...existing,
         commentId: finding.commentId,
         path: finding.path,
         reviewId: finding.reviewId,
         reviewerKey: finding.reviewerKey,
         reviewedHeadSha: finding.reviewedHeadSha,
+        semanticFingerprint: finding.semanticFingerprint,
         severity: highestSeverity(existing.severity, finding.severity),
       };
       continue;
     }
-    next[finding.fingerprint] = {
+    next[fingerprint] = {
       commentId: finding.commentId,
       disposition: "pending",
       firstSeenEpoch: epoch,
@@ -165,6 +202,7 @@ export function mergeReviewFindings(
       reviewId: finding.reviewId,
       reviewerKey: finding.reviewerKey,
       reviewedHeadSha: finding.reviewedHeadSha,
+      semanticFingerprint: finding.semanticFingerprint,
       severity: finding.severity,
     };
   }
@@ -340,6 +378,8 @@ export function isReviewFindingLedger(
       typeof finding.reviewedHeadSha === "string" &&
       finding.reviewedHeadSha.length > 0 &&
       finding.reviewedHeadSha.length <= 100 &&
+      (finding.semanticFingerprint === undefined ||
+        /^sha256:[0-9a-f]{64}$/.test(finding.semanticFingerprint)) &&
       ["normal", "p0", "security"].includes(finding.severity ?? "") &&
       (finding.commentId === undefined ||
         (Number.isInteger(finding.commentId) && finding.commentId > 0)) &&
